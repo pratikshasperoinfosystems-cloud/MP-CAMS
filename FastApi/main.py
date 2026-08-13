@@ -1132,12 +1132,211 @@ def to_int(val):
 
 #     except Exception as e:
 #         print("RTM Alert Insert Error:", str(e))
+#################################################################################################
+
+# alert_worker_task = None
+
+# async def get_active_thresholds():
+#     """Fetch active thresholds, cached for 30s."""
+#     query = """
+#         SELECT alert_type, amb_area, threshold_seconds, severity, priority
+#         FROM alert_thresholds
+#         WHERE is_active = TRUE
+#         ORDER BY priority ASC;
+#     """
+#     rows = await cached_query(query, fetch="all", ttl=30, db=database2)
+#     return [normalize_row(r) for r in rows]
+
+
+# def resolve_alert(row, thresholds):
+#     inc_dispatch_sec = hhmmss_to_seconds(row.get("inc_dispatch_time"))
+#     acknowledge_sec  = hhmmss_to_seconds(row.get("acknowledge_duration"))
+#     start_base_sec   = hhmmss_to_seconds(row.get("start_from_base_duration"))
+#     at_scene_sec     = hhmmss_to_seconds(row.get("at_scene_duration"))
+#     amb_area         = row.get("amb_working_area")
+
+#     # MDT_NOT_LOGGED_IN check — pilot_login_out column use kiya
+#     pilot_login_out_val = row.get("pilot_login_out")
+#     mdt_not_found = pilot_login_out_val is None or pilot_login_out_val == "No"
+
+#     metric_map = {
+#         "DISPATCH_DELAY": inc_dispatch_sec,
+#         "ACK_DELAY": acknowledge_sec,
+#         "START_DELAY": start_base_sec,
+#         "AT_SCENE_DELAY": at_scene_sec,
+#     }
+
+#     for t in thresholds:
+#         if t["amb_area"] is not None and t["amb_area"] != amb_area:
+#             continue
+
+#         # Boolean-type alert - MDT
+#         if t["alert_type"] == "MDT_NOT_LOGGED_IN":
+#             if mdt_not_found:
+#                 return t["alert_type"], t["severity"]
+#             continue
+
+#         # Numeric-type alerts
+#         metric_value = metric_map.get(t["alert_type"])
+#         threshold_val = int(t["threshold_seconds"])   # fix: string se int conversion
+
+#         if metric_value is not None and metric_value > threshold_val:
+#             return t["alert_type"], t["severity"]
+
+#     return None, None
+
+
+# async def rtm_alert_insert_worker():
+#     print("🚀 RTM Alert Insert Worker STARTED")
+
+#     while True:
+#         try:
+#             query = """
+#                 SELECT *
+#                 FROM rtm_dashboard
+#                 WHERE inc_datetime >= CURRENT_DATE
+#                   AND inc_datetime < CURRENT_DATE + INTERVAL '1 day'
+#                 ORDER BY inc_datetime DESC
+#                 LIMIT 200;
+#             """
+
+#             rows = await cached_query(query, fetch="all", ttl=5, db=database2)
+#             thresholds = await get_active_thresholds()
+
+#             for row in rows:
+#                 try:
+#                     row = normalize_row(row)
+
+#                     alert_type, severity = resolve_alert(row, thresholds)
+#                     if not alert_type:
+#                         continue
+
+#                     params = {
+#                         "alert_type": alert_type,
+#                         "incident_id": row.get("inc_ref_id"),
+#                         "system_type": row.get("inc_system_type"),
+#                         "severity": severity,
+#                         "ambulance_no": row.get("ambulance_no"),
+#                         "remark": f"{alert_type} threshold breached",
+#                         "division": row.get("division_name"),
+#                         "district": row.get("district_name"),
+#                         "inc_latitude": to_float(row.get("inc_lat")),
+#                         "inc_longitude": to_float(row.get("inc_long")),
+#                         "amb_lat": to_float(row.get("gps_amb_lat")),
+#                         "amb_long": to_float(row.get("gps_amb_log")),
+#                         "inc_datetime": to_datetime(row.get("inc_datetime")),
+#                         "pilot_name": row.get("pilot_name"),
+#                         "pilot_mobile": to_int(row.get("pilot_mobile")),
+#                         "paramedic_name": row.get("paramedic_name"),
+#                         "paramedic_mobile": to_int(row.get("paramedic_mobile")),
+#                     }
+
+#                     await database2.execute(
+#                         """
+#                         INSERT INTO central_alerts (
+#                             alert_type, incident_id, system_type, severity,
+#                             ambulance_no, remark, division, district,
+#                             inc_latitude, inc_longitude, amb_lat, amb_long,
+#                             inc_datetime, pilot_name, pilot_mobile,
+#                             paramedic_name, paramedic_mobile
+#                         )
+#                         VALUES (
+#                             :alert_type, :incident_id, :system_type, :severity,
+#                             :ambulance_no, :remark, :division, :district,
+#                             :inc_latitude, :inc_longitude, :amb_lat, :amb_long,
+#                             :inc_datetime, :pilot_name, :pilot_mobile,
+#                             :paramedic_name, :paramedic_mobile
+#                         )
+#                         ON CONFLICT (incident_id, alert_type) DO NOTHING
+#                         """,
+#                         params
+#                     )
+
+#                 except Exception as row_err:
+#                     print(f"⚠️ Row error (incident_id={row.get('inc_ref_id')}):", str(row_err))
+#                     continue
+
+#         except Exception as e:
+#             print("❌ RTM Alert Worker Error:", str(e))
+
+#         await asyncio.sleep(5)
+
         
+
+
         
-        
-        
-alert_worker_task = None      
-        
+      
+alert_worker_task = None
+
+async def get_active_thresholds():
+    """Fetch active thresholds, cached for 30s."""
+    query = """
+        SELECT alert_type, amb_area, threshold_seconds, severity, priority
+        FROM alert_thresholds
+        WHERE is_active = TRUE
+        ORDER BY priority ASC;
+    """
+    rows = await cached_query(query, fetch="all", ttl=30, db=database2)
+    return [normalize_row(r) for r in rows]
+
+
+def resolve_alerts(row, thresholds):
+    acknowledge_sec  = hhmmss_to_seconds(row.get("acknowledge_duration"))
+    start_base_sec   = hhmmss_to_seconds(row.get("start_from_base_duration"))
+    at_scene_sec     = hhmmss_to_seconds(row.get("at_scene_duration"))
+    amb_area         = row.get("amb_working_area")
+
+    ack_raw = row.get("acknowledge_duration")
+    ack_done = ack_raw is not None and str(ack_raw).strip() != ""
+
+    patient_handover_dt = to_datetime(row.get("patient_handover"))
+    back_to_base_dt     = to_datetime(row.get("back_to_base_loc"))
+
+    back_to_base_sec = None
+    if patient_handover_dt and back_to_base_dt:
+        diff = (back_to_base_dt - patient_handover_dt).total_seconds()
+        if diff >= 0:
+            back_to_base_sec = diff
+
+    pilot_login_out_val = row.get("pilot_login_out")
+    mdt_not_found = pilot_login_out_val is None or pilot_login_out_val == "No"
+
+    metric_map = {
+        "ACK_DELAY": acknowledge_sec,
+        "START_DELAY": start_base_sec,
+        "AT_SCENE_DELAY": at_scene_sec,
+        "BACK_TO_BASE_DELAY": back_to_base_sec,
+    }
+
+    matched_alerts = []
+    seen_alert_types = set()
+
+    for t in thresholds:
+        if t["amb_area"] is not None and t["amb_area"] != amb_area:
+            continue
+
+        alert_type = t["alert_type"]
+
+        if alert_type in seen_alert_types:
+            continue
+
+        if alert_type == "MDT_NOT_LOGGED_IN":
+            if ack_done and mdt_not_found:
+                matched_alerts.append((alert_type, t["severity"]))
+                seen_alert_types.add(alert_type)
+            continue
+
+        metric_value = metric_map.get(alert_type)
+        threshold_val = int(t["threshold_seconds"])
+
+        if metric_value is not None and metric_value > threshold_val:
+            matched_alerts.append((alert_type, t["severity"]))
+            seen_alert_types.add(alert_type)
+
+    return matched_alerts
+
+
+
 async def rtm_alert_insert_worker():
     print("🚀 RTM Alert Insert Worker STARTED")
 
@@ -1149,118 +1348,71 @@ async def rtm_alert_insert_worker():
                 WHERE inc_datetime >= CURRENT_DATE
                   AND inc_datetime < CURRENT_DATE + INTERVAL '1 day'
                 ORDER BY inc_datetime DESC
-                LIMIT 200;
+                LIMIT 1000;
             """
 
-            rows = await cached_query(
-                query,
-                fetch="all",
-                ttl=5,
-                db=database2
-            )
+            rows = await cached_query(query, fetch="all", ttl=5, db=database2)
+            thresholds = await get_active_thresholds()
 
             for row in rows:
-                row = normalize_row(row)
+                try:
+                    row = normalize_row(row)
 
-                inc_dispatch_sec = hhmmss_to_seconds(row.get("inc_dispatch_time"))
-                acknowledge_sec = hhmmss_to_seconds(row.get("acknowledge_duration"))
-                start_base_sec = hhmmss_to_seconds(row.get("start_from_base_duration"))
-                at_scene_sec = hhmmss_to_seconds(row.get("at_scene_duration"))
-                amb_area = row.get("amb_working_area")
+                    alerts = resolve_alerts(row, thresholds)
+                    if not alerts:
+                        continue
 
-                alert_type = None
-                severity = None
+                    for alert_type, severity in alerts:
+                        params = {
+                            "alert_type": alert_type,
+                            "incident_id": row.get("inc_ref_id"),
+                            "system_type": row.get("inc_system_type"),
+                            "severity": severity,
+                            "ambulance_no": row.get("ambulance_no"),
+                            "remark": f"{alert_type} threshold breached",
+                            "division": row.get("division_name"),
+                            "district": row.get("district_name"),
+                            "inc_latitude": to_float(row.get("inc_lat")),
+                            "inc_longitude": to_float(row.get("inc_long")),
+                            "amb_lat": to_float(row.get("gps_amb_lat")),
+                            "amb_long": to_float(row.get("gps_amb_log")),
+                            "inc_datetime": to_datetime(row.get("inc_datetime")),
+                            "pilot_name": row.get("pilot_name"),
+                            "pilot_mobile": to_int(row.get("pilot_mobile")),
+                            "paramedic_name": row.get("paramedic_name"),
+                            "paramedic_mobile": to_int(row.get("paramedic_mobile")),
+                        }
 
-                if inc_dispatch_sec > 150:
-                    alert_type = "DISPATCH_DELAY"
-                    severity = "HIGH"
-                elif acknowledge_sec > 30:
-                    alert_type = "ACK_DELAY"
-                    severity = "MEDIUM"
-                elif start_base_sec > 120:
-                    alert_type = "START_DELAY"
-                    severity = "MEDIUM"
-                elif amb_area == "1" and at_scene_sec > 1500:
-                    alert_type = "AT_SCENE_DELAY"
-                    severity = "LOW"
-                elif amb_area == "2" and at_scene_sec > 1080:
-                    alert_type = "AT_SCENE_DELAY"
-                    severity = "LOW"
+                        await database2.execute(
+                            """
+                            INSERT INTO central_alerts (
+                                alert_type, incident_id, system_type, severity,
+                                ambulance_no, remark, division, district,
+                                inc_latitude, inc_longitude, amb_lat, amb_long,
+                                inc_datetime, pilot_name, pilot_mobile,
+                                paramedic_name, paramedic_mobile
+                            )
+                            VALUES (
+                                :alert_type, :incident_id, :system_type, :severity,
+                                :ambulance_no, :remark, :division, :district,
+                                :inc_latitude, :inc_longitude, :amb_lat, :amb_long,
+                                :inc_datetime, :pilot_name, :pilot_mobile,
+                                :paramedic_name, :paramedic_mobile
+                            )
+                            ON CONFLICT (incident_id, alert_type) DO NOTHING
+                            """,
+                            params
+                        )
 
-                if not alert_type:
+                except Exception as row_err:
+                    print(f"⚠️ Row error (incident_id={row.get('inc_ref_id')}):", str(row_err))
                     continue
-
-                params = {
-                    "alert_type": alert_type,
-                    "incident_id": row.get("inc_ref_id"),
-                    "system_type": row.get("inc_system_type"),
-                    "severity": severity,
-                    "ambulance_no": row.get("ambulance_no"),
-                    "remark": f"{alert_type} threshold breached",
-                    "division": row.get("division_name"),
-                    "district": row.get("district_name"),
-                    "inc_latitude": to_float(row.get("inc_lat")),
-                    "inc_longitude": to_float(row.get("inc_long")),
-                    "amb_lat": to_float(row.get("gps_amb_lat")),
-                    "amb_long": to_float(row.get("gps_amb_log")),
-                    "inc_datetime": to_datetime(row.get("inc_datetime")),
-                    "pilot_name": row.get("pilot_name"),
-                    "pilot_mobile": to_int(row.get("pilot_mobile")),
-                    "paramedic_name": row.get("paramedic_name"),
-                    "paramedic_mobile": to_int(row.get("paramedic_mobile")),
-                }
-
-                await database2.execute(
-                    """
-                    INSERT INTO central_alerts (
-                        alert_type,
-                        incident_id,
-                        system_type,
-                        severity,
-                        ambulance_no,
-                        remark,
-                        division,
-                        district,
-                        inc_latitude,
-                        inc_longitude,
-                        amb_lat,
-                        amb_long,
-                        inc_datetime,
-                        pilot_name,
-                        pilot_mobile,
-                        paramedic_name,
-                        paramedic_mobile
-                    )
-                    VALUES (
-                        :alert_type,
-                        :incident_id,
-                        :system_type,
-                        :severity,
-                        :ambulance_no,
-                        :remark,
-                        :division,
-                        :district,
-                        :inc_latitude,
-                        :inc_longitude,
-                        :amb_lat,
-                        :amb_long,
-                        :inc_datetime,
-                        :pilot_name,
-                        :pilot_mobile,
-                        :paramedic_name,
-                        :paramedic_mobile
-                    )
-                    ON CONFLICT (incident_id, alert_type) DO NOTHING
-                    """,
-                    params
-                )
 
         except Exception as e:
             print("❌ RTM Alert Worker Error:", str(e))
 
         await asyncio.sleep(5)
-
-        
+        ##################################################################################
         
 @app.on_event("startup")
 async def start_alert_worker():
@@ -1348,6 +1500,197 @@ manager = ConnectionManager()
 #         manager.disconnect(websocket)
 #         print("❌ WebSocket client disconnected")
 
+# from datetime import datetime, date, timedelta
+
+# today_start = datetime.combine(date.today(), datetime.min.time())
+# today_end = today_start + timedelta(days=1)
+
+# def group_by_severity(rows):
+#     """Group alerts by severity"""
+#     severity_order = ["CRITICAL", "HIGH", "MEDIUM", "LOW"]
+#     grouped = {sev: [] for sev in severity_order}
+
+#     for r in rows:
+#         serialized = serialize_row(r)
+#         sev = (serialized.get("severity") or "").upper()
+
+#         if sev in grouped:
+#             grouped[sev].append(serialized)
+#         else:
+#             grouped["LOW"].append(serialized)
+
+#     return grouped
+
+###mainnnnn
+# class CustomJSONEncoder(json.JSONEncoder):
+#     def default(self, obj):
+#         if isinstance(obj, (datetime, date)):
+#             return obj.isoformat()
+#         elif isinstance(obj, Decimal):
+#             return float(obj)
+#         return super().default(obj)
+
+
+# # ===============================
+# # MAIN WEBSOCKET
+# # ===============================
+
+# @app.websocket("/ws/central_alerts")
+# async def central_alerts_ws(websocket: WebSocket):
+
+#     user_id = await verify_jwt_token(websocket.query_params.get("token"))
+#     if not user_id:
+#         await websocket.accept()
+#         await websocket.send_json({
+#             "type": "ERROR",
+#             "status": 401,
+#             "message": "Invalid or expired token. Please login again."
+#         })
+#         await websocket.close(code=1008)
+#         return
+
+#     await manager.connect(websocket)
+#     print("🔌 WebSocket client connected")
+
+#     try:
+#         # =====================================================
+#         # 1️⃣ SEND DATA ON CONNECT (TODAY DEFAULT)
+#         # =====================================================
+#         rows = await cached_query(
+#             """
+#             SELECT *
+#             FROM central_alerts
+#             WHERE inc_datetime >= CURRENT_DATE
+#               AND inc_datetime < CURRENT_DATE + INTERVAL '1 day'
+#             ORDER BY alert_id DESC
+#             """,
+#             ttl=3,
+#             fetch="all",
+#             db=database2
+#         )
+
+#         today_all = [serialize_row(r) for r in rows]
+#         by_severity = group_by_severity(rows)
+
+#         # ===============================
+#         # COUNTS (108 / 102)
+#         # ===============================
+#         count_rows = await cached_query(
+#             """
+#             SELECT
+#                 system_type,
+#                 severity,
+#                 COUNT(*) AS total
+#             FROM central_alerts
+#             WHERE inc_datetime >= CURRENT_DATE
+#               AND inc_datetime < CURRENT_DATE + INTERVAL '1 day'
+#               AND escalate_status = '1'
+#               AND system_type IN ('108', '102')
+#             GROUP BY system_type, severity
+#             """,
+#             ttl=3,
+#             fetch="all",
+#             db=database2
+#         )
+
+#         counts = {
+#             "total": {"108": 0, "102": 0},
+#             "severity": {"108": {}, "102": {}}
+#         }
+
+#         for r in count_rows:
+#             system = r["system_type"]
+#             severity = r["severity"]
+#             total = r["total"]
+
+#             counts["total"][system] += total
+#             counts["severity"][system][severity] = total
+
+#         await websocket.send_json({
+#             "type": "ALL_ALERTS",
+#             "data": {
+#                 "today_all": today_all,
+#                 "by_severity": by_severity,
+#                 "counts": counts
+#             }
+#         })
+
+#         print("📤 Sent ALL_ALERTS on connect")
+
+#         # =====================================================
+#         # 2️⃣ LISTEN FOR FILTER REQUESTS
+#         # =====================================================
+#         while True:
+#             msg = await websocket.receive_json()
+
+#             incident_id = msg.get("incident_id")
+#             filter_date = msg.get("date")  # YYYY-MM-DD
+
+#             conditions = []
+#             params = {}
+
+#             # incident filter
+#             if incident_id:
+#                 conditions.append("incident_id = :incident_id")
+#                 params["incident_id"] = str(incident_id)
+
+#             # created_date filter
+#             if filter_date:
+#                 start_dt = datetime.strptime(filter_date, "%Y-%m-%d")
+#                 end_dt = start_dt + timedelta(days=1)
+
+#                 conditions.append("""
+#                     created_date >= :start_date
+#                     AND created_date < :end_date
+#                 """)
+
+#                 params["start_date"] = start_dt
+#                 params["end_date"] = end_dt
+#             else:
+#                 # default today logic
+#                 conditions.append("""
+#                     inc_datetime >= CURRENT_DATE
+#                     AND inc_datetime < CURRENT_DATE + INTERVAL '1 day'
+#                 """)
+
+#             where_clause = " AND ".join(conditions)
+
+#             query = f"""
+#                 SELECT *
+#                 FROM central_alerts
+#                 WHERE {where_clause}
+#                 ORDER BY alert_id DESC
+#             """
+
+#             if filter_date:
+#                 rows = await database2.fetch_all(query, params)
+#             else:
+#                 rows = await cached_query(
+#                     query,
+#                     params=params,
+#                     ttl=3,
+#                     fetch="all",
+#                     db=database2
+#                 )
+
+#             today_all = [serialize_row(r) for r in rows]
+#             by_severity = group_by_severity(rows)
+
+#             await websocket.send_json({
+#                 "type": "ALL_ALERTS",
+#                 "data": {
+#                     "today_all": today_all,
+#                     "by_severity": by_severity,
+#                     "counts": counts
+#                 }
+#             })
+
+#             print(f"📤 Sent alerts (incident_id={incident_id}, date={filter_date})")
+
+#     except Exception as e:
+#         manager.disconnect(websocket)
+#         print("❌ WebSocket client disconnected:", e)
+
 from datetime import datetime, date, timedelta
 
 today_start = datetime.combine(date.today(), datetime.min.time())
@@ -1379,13 +1722,170 @@ class CustomJSONEncoder(json.JSONEncoder):
         return super().default(obj)
 
 
-# ===============================
-# MAIN WEBSOCKET
-# ===============================
+# # ===============================
+# # MAIN WEBSOCKET
+# # ===============================
+
+# @app.websocket("/ws/central_alerts")
+# async def central_alerts_ws(websocket: WebSocket):
+
+#     user_id = await verify_jwt_token(websocket.query_params.get("token"))
+#     if not user_id:
+#         await websocket.accept()
+#         await websocket.send_json({
+#             "type": "ERROR",
+#             "status": 401,
+#             "message": "Invalid or expired token. Please login again."
+#         })
+#         await websocket.close(code=1008)
+#         return
+
+#     await manager.connect(websocket)
+#     print("🔌 WebSocket client connected")
+
+#     try:
+#         # =====================================================
+#         # 1️⃣ SEND DATA ON CONNECT (TODAY DEFAULT)
+#         # =====================================================
+#         rows = await cached_query(
+#             """
+#             SELECT *
+#             FROM central_alerts
+#             WHERE inc_datetime >= CURRENT_DATE
+#               AND inc_datetime < CURRENT_DATE + INTERVAL '1 day'
+#             ORDER BY inc_datetime DESC
+#             """,
+#             ttl=3,
+#             fetch="all",
+#             db=database2
+#         )
+
+#         today_all = [serialize_row(r) for r in rows]
+#         by_severity = group_by_severity(rows)
+
+#         # ===============================
+#         # COUNTS (108 / 102)
+#         # ===============================
+#         count_rows = await cached_query(
+#             """
+#             SELECT
+#                 system_type,
+#                 severity,
+#                 COUNT(*) AS total
+#             FROM central_alerts
+#             WHERE inc_datetime >= CURRENT_DATE
+#               AND inc_datetime < CURRENT_DATE + INTERVAL '1 day'
+#               AND escalate_status = '1'
+#               AND system_type IN ('108', '102')
+#             GROUP BY system_type, severity
+#             """,
+#             ttl=3,
+#             fetch="all",
+#             db=database2
+#         )
+
+#         counts = {
+#             "total": {"108": 0, "102": 0},
+#             "severity": {"108": {}, "102": {}}
+#         }
+
+#         for r in count_rows:
+#             system = r["system_type"]
+#             severity = r["severity"]
+#             total = r["total"]
+
+#             counts["total"][system] += total
+#             counts["severity"][system][severity] = total
+
+#         await websocket.send_json({
+#             "type": "ALL_ALERTS",
+#             "data": {
+#                 "today_all": today_all,
+#                 "by_severity": by_severity,
+#                 "counts": counts
+#             }
+#         })
+
+#         print("📤 Sent ALL_ALERTS on connect")
+
+#         # =====================================================
+#         # 2️⃣ LISTEN FOR FILTER REQUESTS
+#         # =====================================================
+#         while True:
+#             msg = await websocket.receive_json()
+
+#             incident_id = msg.get("incident_id")
+#             filter_date = msg.get("date")  # YYYY-MM-DD
+
+#             conditions = []
+#             params = {}
+
+#             # incident filter
+#             if incident_id:
+#                 conditions.append("incident_id = :incident_id")
+#                 params["incident_id"] = str(incident_id)
+
+#             # created_date filter
+#             if filter_date:
+#                 start_dt = datetime.strptime(filter_date, "%Y-%m-%d")
+#                 end_dt = start_dt + timedelta(days=1)
+
+#                 conditions.append("""
+#                     created_date >= :start_date
+#                     AND created_date < :end_date
+#                 """)
+
+#                 params["start_date"] = start_dt
+#                 params["end_date"] = end_dt
+#             else:
+#                 # default today logic
+#                 conditions.append("""
+#                     inc_datetime >= CURRENT_DATE
+#                     AND inc_datetime < CURRENT_DATE + INTERVAL '1 day'
+#                 """)
+
+#             where_clause = " AND ".join(conditions)
+
+#             query = f"""
+#                 SELECT *
+#                 FROM central_alerts
+#                 WHERE {where_clause}
+#                 ORDER BY inc_datetime DESC
+#             """
+
+#             if filter_date:
+#                 rows = await database2.fetch_all(query, params)
+#             else:
+#                 rows = await cached_query(
+#                     query,
+#                     params=params,
+#                     ttl=3,
+#                     fetch="all",
+#                     db=database2
+#                 )
+
+#             today_all = [serialize_row(r) for r in rows]
+#             by_severity = group_by_severity(rows)
+
+#             await websocket.send_json({
+#                 "type": "ALL_ALERTS",
+#                 "data": {
+#                     "today_all": today_all,
+#                     "by_severity": by_severity,
+#                     "counts": counts
+#                 }
+#             })
+
+#             print(f"📤 Sent alerts (incident_id={incident_id}, date={filter_date})")
+
+#     except Exception as e:
+#         manager.disconnect(websocket)
+#         print("❌ WebSocket client disconnected:", e)
+
 
 @app.websocket("/ws/central_alerts")
 async def central_alerts_ws(websocket: WebSocket):
-
+ 
     user_id = await verify_jwt_token(websocket.query_params.get("token"))
     if not user_id:
         await websocket.accept()
@@ -1396,10 +1896,10 @@ async def central_alerts_ws(websocket: WebSocket):
         })
         await websocket.close(code=1008)
         return
-
+ 
     await manager.connect(websocket)
     print("🔌 WebSocket client connected")
-
+ 
     try:
         # =====================================================
         # 1️⃣ SEND DATA ON CONNECT (TODAY DEFAULT)
@@ -1410,16 +1910,16 @@ async def central_alerts_ws(websocket: WebSocket):
             FROM central_alerts
             WHERE inc_datetime >= CURRENT_DATE
               AND inc_datetime < CURRENT_DATE + INTERVAL '1 day'
-            ORDER BY alert_id ASC
+            ORDER BY inc_datetime DESC
             """,
             ttl=3,
             fetch="all",
             db=database2
         )
-
+ 
         today_all = [serialize_row(r) for r in rows]
         by_severity = group_by_severity(rows)
-
+ 
         # ===============================
         # COUNTS (108 / 102)
         # ===============================
@@ -1440,20 +1940,20 @@ async def central_alerts_ws(websocket: WebSocket):
             fetch="all",
             db=database2
         )
-
+ 
         counts = {
             "total": {"108": 0, "102": 0},
             "severity": {"108": {}, "102": {}}
         }
-
+ 
         for r in count_rows:
             system = r["system_type"]
             severity = r["severity"]
             total = r["total"]
-
+ 
             counts["total"][system] += total
             counts["severity"][system][severity] = total
-
+ 
         await websocket.send_json({
             "type": "ALL_ALERTS",
             "data": {
@@ -1462,36 +1962,38 @@ async def central_alerts_ws(websocket: WebSocket):
                 "counts": counts
             }
         })
-
+ 
         print("📤 Sent ALL_ALERTS on connect")
-
+ 
         # =====================================================
         # 2️⃣ LISTEN FOR FILTER REQUESTS
         # =====================================================
         while True:
             msg = await websocket.receive_json()
-
+ 
             incident_id = msg.get("incident_id")
             filter_date = msg.get("date")  # YYYY-MM-DD
-
+ 
             conditions = []
             params = {}
-
-            # incident filter
+ 
+            # incident filter -> incident_id diya toh SIRF isi ID pe filter hoga,
+            # koi date restriction add nahi hogi, isliye us incident ke
+            # jitne bhi alerts hain (kisi bhi date ke) sab return honge
             if incident_id:
                 conditions.append("incident_id = :incident_id")
                 params["incident_id"] = str(incident_id)
-
-            # created_date filter
-            if filter_date:
+ 
+            # created_date filter -> sirf tab lagega jab incident_id na diya ho
+            elif filter_date:
                 start_dt = datetime.strptime(filter_date, "%Y-%m-%d")
                 end_dt = start_dt + timedelta(days=1)
-
+ 
                 conditions.append("""
                     created_date >= :start_date
                     AND created_date < :end_date
                 """)
-
+ 
                 params["start_date"] = start_dt
                 params["end_date"] = end_dt
             else:
@@ -1500,16 +2002,16 @@ async def central_alerts_ws(websocket: WebSocket):
                     inc_datetime >= CURRENT_DATE
                     AND inc_datetime < CURRENT_DATE + INTERVAL '1 day'
                 """)
-
+ 
             where_clause = " AND ".join(conditions)
-
+ 
             query = f"""
                 SELECT *
                 FROM central_alerts
                 WHERE {where_clause}
-                ORDER BY alert_id ASC
+                ORDER BY inc_datetime DESC
             """
-
+ 
             if filter_date:
                 rows = await database2.fetch_all(query, params)
             else:
@@ -1520,10 +2022,10 @@ async def central_alerts_ws(websocket: WebSocket):
                     fetch="all",
                     db=database2
                 )
-
+ 
             today_all = [serialize_row(r) for r in rows]
             by_severity = group_by_severity(rows)
-
+ 
             await websocket.send_json({
                 "type": "ALL_ALERTS",
                 "data": {
@@ -1532,14 +2034,14 @@ async def central_alerts_ws(websocket: WebSocket):
                     "counts": counts
                 }
             })
-
+ 
             print(f"📤 Sent alerts (incident_id={incident_id}, date={filter_date})")
-
+ 
     except Exception as e:
         manager.disconnect(websocket)
         print("❌ WebSocket client disconnected:", e)
 
-
+###################################################################################################
 # ===============================
 # ALERT CHANGE NOTIFIER
 # ===============================
@@ -1630,7 +2132,7 @@ async def escalate_alert(alert_id: int, payload: EscalateRequest):
         """
         UPDATE central_alerts
         SET escalate_status = 2,
-            remark = :remark,
+            escalated_deny_remark = :remark,
             updated_date = NOW(),
             escalated_date = NOW(),
             escalated_by = :escalated_by
@@ -1812,6 +2314,12 @@ async def download_client_report(
             df.drop(columns=["escalate_status"], inplace=True)
 
         # ===============================
+        # DROP UNWANTED COLUMNS
+        # ===============================
+        if "is_deleted" in df.columns:
+            df.drop(columns=["is_deleted"], inplace=True)
+
+        # ===============================
         # INDIA DATE FORMAT
         # ===============================
         date_cols = ["created_date", "updated_date", "cancel_date", "escalated_date"]
@@ -1825,18 +2333,77 @@ async def download_client_report(
         # CLIENT FRIENDLY COLUMN RENAME
         # ===============================
         rename_map = {
-            "alert_id": "Alert ID",
-            "system_type": "System Type",
             "severity": "Severity",
             "created_date": "Created Date & Time",
             "updated_date": "Updated Date & Time",
-            "cancel_date": "Cancel Date",
-            "escalated_date": "Escalated Date",
             "division": "Division",
-            "district": "District"
+            "district": "District",
+            "inc_latitude":"Incidence Latitude",
+            "inc_longitude":"Incidence Longitude",
+            "amb_lat":"Ambulance Lattitude",
+            "amb_long":"Ambulance Longitude",
+            "paramedic_name":"EMT Name",
+            "paramedic_mobile":"EMT Mobile",
+            "inc_datetime":"Incidence Datetime",
+            "alert_type":"Alert Type",
+            "incident_id":"Incident Id",
+            "ambulance_no":"Ambulance Number",
+            "remark":"Remark",
+            "escalated_deny_remark":"Escalated/Deny Remark",
+            "pilot_name":"Pilot Name",
+            "pilot_mobile":"Pilot Mobile",
+            "escalated_date":"Escalated Date",
+            "cancel_date":"Cancel Date",
+            "escalated_by": "Escalated By",
+            "cancel_by":"Cancel By",
+            "Escalation Status":"Escalation Status",
+            "system_type":"System Type",
+            "alert_id":"Alert ID",
+            "Sr No":"Sr No",
+            "alert_type":"Alert Type"
+            
         }
 
         df.rename(columns=rename_map, inplace=True)
+
+        # ===============================
+        # COLUMN ORDER (as per report requirement)
+        # ===============================
+        column_order = [
+            "Sr No",
+            "Alert ID",
+            "Alert Type",
+            "System Type",
+            "Severity",
+            "Incident Id",
+            "Incidence Datetime",
+            "Division",
+            "District",
+            "Incidence Latitude",
+            "Incidence Longitude",
+            "Ambulance Number",
+            "Ambulance Lattitude",
+            "Ambulance Longitude",
+            "Pilot Name",
+            "Pilot Mobile",
+            "EMT Name",
+            "EMT Mobile",
+            "Created Date & Time",
+            "Updated Date & Time",
+            "Escalation Status",
+            "Escalated Date",
+            "Escalated By",
+            "Escalated/Deny Remark",
+            "Cancel Date",
+            "Cancel By",
+            "Remark",
+        ]
+
+       
+        existing_ordered_cols = [c for c in column_order if c in df.columns]
+       
+        remaining_cols = [c for c in df.columns if c not in existing_ordered_cols]
+        df = df[existing_ordered_cols + remaining_cols]
 
     else:
         df = pd.DataFrame([{"Message": "No Data Found"}])
@@ -1848,8 +2415,7 @@ async def download_client_report(
     SELECT
         COUNT(*) as total_alerts,
         COUNT(*) FILTER (WHERE escalate_status='2') as escalated_alerts,
-        COUNT(*) FILTER (WHERE system_type='108') as system_108,
-        COUNT(*) FILTER (WHERE system_type='102') as system_102
+        COUNT(*) FILTER (WHERE system_type='108') as system_108
     FROM public.central_alerts
     WHERE is_deleted = false
     AND {date_filter}
@@ -1857,6 +2423,18 @@ async def download_client_report(
 
     summary_row = await database2.fetch_one(summary_sql)
     df_summary = pd.DataFrame([dict(summary_row)]) if summary_row else pd.DataFrame()
+
+    # ===============================
+    # SUMMARY SHEET COLUMN RENAME
+    # ===============================
+    summary_rename_map = {
+        "total_alerts": "Total Alerts",
+        "escalated_alerts": "Escalated Alerts",
+        "system_108": "System 108"
+    }
+
+    if not df_summary.empty:
+        df_summary.rename(columns=summary_rename_map, inplace=True)
 
     # ===============================
     # WRITE EXCEL
@@ -1884,9 +2462,7 @@ async def download_client_report(
             "Content-Disposition": f"attachment; filename={file_name}"
         }
     )
-
-
-
+#################################################################
 
 class SeverityUpdate(BaseModel):
     alert_id: int
@@ -1956,16 +2532,18 @@ async def ws_top_ambulances(websocket: WebSocket):
                 SELECT
                     ambulance_no,
                     CAST(SUM(total_alerts) AS BIGINT)        AS total_alerts,
-                    CAST(SUM(dispatch_delay) AS BIGINT)      AS dispatch_delay_count,
                     CAST(SUM(start_delay) AS BIGINT)         AS start_delay_count,
                     CAST(SUM(at_scene_delay) AS BIGINT)      AS at_scene_delay_count,
-                    CAST(SUM(ack_delay) AS BIGINT)           AS ack_delay_count
+                    CAST(SUM(ack_delay) AS BIGINT)           AS ack_delay_count,
+                    CAST(SUM(mdt_not_logged_in) AS BIGINT)   AS mdt_not_logged_in_count,
+                    CAST(SUM(back_to_base_delay) AS BIGINT)  AS back_to_base_delay_count
                 FROM alerts_performance_monthly
                 WHERE month = :month
+                  AND ambulance_no IS NOT NULL
                 GROUP BY ambulance_no
                 ORDER BY total_alerts DESC
-                LIMIT 10;
-            """
+                LIMIT 50;
+            """ 
 
             # ✅ ONLY cached_query (Redis + memory)
             rows = await cached_query(
@@ -2021,3 +2599,97 @@ async def ws_top_ambulances(websocket: WebSocket):
         print("❌ WS ERROR:", e)
         await websocket.close()
 
+#####################################################################################
+
+@app.get("/api/alert-thresholds")
+async def get_alert_thresholds():
+    query = """
+        SELECT *
+        FROM alert_thresholds
+        ORDER BY priority ASC;
+    """
+
+    rows = await cached_query(
+        query,
+        fetch="all",
+        ttl=30,
+        db=database2
+    )
+
+    return [dict(r) for r in rows]
+
+#################################################################################
+
+class AlertThresholdUpdate(BaseModel):
+    threshold_seconds: Optional[int] = None
+    severity: Optional[str] = None
+    priority: Optional[int] = None
+
+
+@app.put("/api/update-alert-threshold/update/{id}")
+async def update_alert_threshold(id: int, data: AlertThresholdUpdate):
+
+    # Check if ID exists
+    check_query = """
+        SELECT id
+        FROM alert_thresholds
+        WHERE id = :id
+    """
+
+    row = await database2.fetch_one(
+        query=check_query,
+        values={"id": id}
+    )
+
+    if not row:
+        raise HTTPException(
+            status_code=404,
+            detail="Alert threshold not found."
+        )
+
+    update_fields = []
+    values = {"id": id}
+
+    if data.threshold_seconds is not None:
+        update_fields.append("threshold_seconds = :threshold_seconds")
+        values["threshold_seconds"] = data.threshold_seconds
+
+    if data.severity is not None:
+        update_fields.append("severity = :severity")
+        values["severity"] = data.severity
+
+    if data.priority is not None:
+        update_fields.append("priority = :priority")
+        values["priority"] = data.priority
+
+    if not update_fields:
+        raise HTTPException(
+            status_code=400,
+            detail="Please provide at least one field to update."
+        )
+
+    update_fields.append("updated_at = CURRENT_TIMESTAMP")   # 👈 FIX
+
+    query = f"""
+        UPDATE alert_thresholds
+        SET {', '.join(update_fields)}
+        WHERE id = :id
+    """
+
+    try:
+        await database2.execute(
+            query=query,
+            values=values
+        )
+
+        return {
+            "status": "success",
+            "message": "Alert threshold updated successfully.",
+            "id": id
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
