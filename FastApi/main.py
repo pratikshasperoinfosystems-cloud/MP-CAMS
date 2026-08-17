@@ -2016,13 +2016,13 @@ async def central_alerts_ws(websocket: WebSocket):
     should_stop = asyncio.Event()
 
     try:
-        # ✅ Initial full state (frontend knows ALL_ALERTS)
+        # ✅ Initial full state — frontend ALL_ALERTS handle karega
         payload = await _fetch_alerts_payload()
         if not await manager.safe_send(websocket, payload):
             return
         logger.info(f"📤 Sent ALL_ALERTS on connect (user={user_id})")
 
-        # ============ RECEIVE LOOP — only filter requests ============
+        # ============ RECEIVE LOOP — handles frontend filter requests ============
         async def receive_loop():
             while not should_stop.is_set():
                 try:
@@ -2036,7 +2036,7 @@ async def central_alerts_ws(websocket: WebSocket):
                     should_stop.set()
                     return
 
-                # Handle filter request from frontend
+                # Filter request handle karo
                 incident_id = msg.get("incident_id")
                 filter_date = msg.get("date")
                 try:
@@ -2047,7 +2047,7 @@ async def central_alerts_ws(websocket: WebSocket):
                 except Exception as e:
                     logger.error(f"Filter fetch error: {e}")
 
-        # ============ DRAIN LOOP — only ALERT_CHANGED broadcasts ============
+        # ============ DRAIN LOOP — broadcast queue se data nikal ke client bhej ============
         async def drain_loop():
             while not should_stop.is_set():
                 try:
@@ -2059,7 +2059,7 @@ async def central_alerts_ws(websocket: WebSocket):
                     return
 
         # ❌ NO full_sync_loop — removed (was causing flicker)
-        # ❌ NO keepalive_loop — removed (was causing flicker)
+        # ❌ NO keepalive_loop — removed (NGINX 24h timeout handles it)
         # ❌ NO token_recheck_loop — removed (causing unnecessary disconnects)
 
         # ============ RUN TASKS ============
@@ -2104,14 +2104,14 @@ last_sent_alert_id = None
 
 async def alert_ws_notifier():
     """
-    Poll central_alerts every 1s for ANY change (insert/update/delete).
-    On first run: send nothing (clients get full state on connect).
-    On restart: pick latest as baseline (no history flood).
+    Har 1s me central_alerts me changes check karta hai.
+    Agar change mila to FULL state broadcast karta hai as "ALL_ALERTS" type.
+    Frontend state replace karega → order hamesha correct (inc_datetime DESC).
     """
     global last_sent_updated, last_sent_alert_id
     logger.info("🚀 Alert WS Notifier STARTED")
 
-    # Bootstrap: set baseline to latest so we don't flood on restart
+    # Bootstrap: latest alert as baseline (no flood on restart)
     if last_sent_updated is None:
         row = await database2.fetch_one(
             """
@@ -2127,27 +2127,31 @@ async def alert_ws_notifier():
 
     while True:
         try:
+            # Sirf check karo ki koi change hua ya nahi (lightweight query)
             rows = await database2.fetch_all(
                 """
-                SELECT *
+                SELECT alert_id, updated_date
                 FROM central_alerts
                 WHERE (updated_date > :last_time)
                    OR (updated_date = :last_time AND alert_id > :last_id)
                 ORDER BY updated_date ASC, alert_id ASC
                 """,
-                {"last_time": last_sent_updated, "last_id": last_sent_alert_id}
+                {
+                    "last_time": last_sent_updated,
+                    "last_id": last_sent_alert_id
+                }
             )
 
             if rows:
+                # Update baseline
                 last_sent_updated = rows[-1]["updated_date"]
                 last_sent_alert_id = rows[-1]["alert_id"]
 
-                payload = {
-                    "type": "ALERT_CHANGED",
-                    "data": [serialize_row(r) for r in rows]
-                }
-                manager.broadcast(payload)   # ✅ non-blocking queue push
-                logger.info(f"📡 Broadcast {len(rows)} changed alerts")
+                # ✅ Broadcast FULL state as ALL_ALERTS — frontend state replace karega
+                # Order hamesha correct rahega kyunki SQL me ORDER BY inc_datetime DESC hai
+                full_payload = await _fetch_alerts_payload()
+                manager.broadcast(full_payload)
+                logger.info(f"📡 Broadcast full state ({len(rows)} changes triggered)")
 
         except Exception as e:
             logger.exception(f"❌ Alert WS Notifier error: {e}")
