@@ -27,11 +27,10 @@ import pandas as pd
 import io
 from datetime import datetime
 from openpyxl.styles import Font, PatternFill, Alignment
-
-
 import time, asyncio
 
 from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
 
 import pytz
 from fastapi import FastAPI, Depends, HTTPException, WebSocket
@@ -56,9 +55,45 @@ formatted_time = now.strftime("%Y-%m-%d %H:%M:%S")
 print(formatted_time)
 
 
+
+# ---------- Lifespan (pehle define karo) ----------
+@asynccontextmanager
+async def lifespan(app: FastAPI):           # ✅ type hint sahi
+    # ---------- STARTUP ----------
+    await database.connect()
+    await database2.connect()
+    await init_redis()
+
+    global alert_worker_task, notifier_task
+    alert_worker_task = asyncio.create_task(rtm_alert_insert_worker())
+    notifier_task = asyncio.create_task(alert_ws_notifier())
+    logger.info("✅ App STARTED — workers running")
+
+    yield
+
+    # ---------- SHUTDOWN ----------
+    for t in [alert_worker_task, notifier_task]:
+        if t:
+            t.cancel()
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+
+    if redis_client:
+        await redis_client.aclose()
+    if database.is_connected:
+        await database.disconnect()
+    if database2.is_connected:
+        await database2.disconnect()
+    logger.info("🛑 App STOPPED")
+
+app = FastAPI(lifespan=lifespan)
+
+
 router = APIRouter()
 
-app = FastAPI()
+# app = FastAPI()
 
 class LoginRequest(BaseModel):
     username: str
@@ -79,25 +114,6 @@ app.add_middleware(
 app.include_router(router)
 
 
-@app.on_event("startup")
-async def startup():
-    await database.connect()
-    await database2.connect()
-    # await init_kafka_producer()
-
-@app.on_event("shutdown")
-async def shutdown():
-    global redis_client
-    # if producer:
-    #     await producer.stop()
-
-    if redis_client:
-        await redis_client.aclose()
-    if database.is_connected:
-        await database.disconnect()
-        
-    if database2.is_connected():
-        await database2.disconnect()
         
         
 _cache = {}
@@ -142,6 +158,7 @@ async def init_redis():
 #     _cache[key] = result
 #     _cache_expiry[key] = now + ttl
 #     return result
+MAX_CACHE_ENTRIES = 2000
 
 async def cached_query(sql, params=None, ttl=15, fetch="all", db=database):
     """
@@ -1453,26 +1470,52 @@ def serialize_row(row):
 
 
 
-class ConnectionManager:
-    def __init__(self):
-        self.active_connections: list[WebSocket] = []
+import logging
+logger = logging.getLogger("central_alerts")
+logging.basicConfig(level=logging.INFO)
 
-    async def connect(self, websocket: WebSocket):
+
+class ConnectionManager:
+    """
+    Each connection gets its own asyncio.Queue.
+    Broadcaster pushes to all queues (non-blocking).
+    Each WS worker drains its own queue → slow client doesn't block others.
+    """
+    def __init__(self):
+        self.active_connections: dict[WebSocket, dict] = {}
+
+    async def connect(self, websocket: WebSocket, user_id: str):
         await websocket.accept()
-        self.active_connections.append(websocket)
+        self.active_connections[websocket] = {
+            "user_id": user_id,
+            "queue": asyncio.Queue(maxsize=1000),
+            "last_seen": time.time(),
+        }
+        return self.active_connections[websocket]
 
     def disconnect(self, websocket: WebSocket):
-        if websocket in self.active_connections:
-            self.active_connections.remove(websocket)
+        self.active_connections.pop(websocket, None)
 
-    async def broadcast_text(self, message):
-        safe_message = jsonable_encoder(message)
-        text = json.dumps(safe_message)
-        for connection in self.active_connections[:]:
+    async def safe_send(self, websocket: WebSocket, payload: dict):
+        try:
+            await websocket.send_json(payload)
+            return True
+        except Exception as e:
+            logger.warning(f"Send failed, disconnecting: {e}")
+            self.disconnect(websocket)
+            return False
+
+    def broadcast(self, payload: dict):
+        """Non-blocking broadcast — pushes to every queue."""
+        dead = []
+        for ws, info in self.active_connections.items():
             try:
-                await connection.send_text(text)
-            except Exception:
-                self.disconnect(connection)
+                info["queue"].put_nowait(payload)
+            except asyncio.QueueFull:
+                logger.warning("Queue full, dropping client")
+                dead.append(ws)
+        for ws in dead:
+            self.disconnect(ws)
 
 
 manager = ConnectionManager()
@@ -1883,163 +1926,196 @@ class CustomJSONEncoder(json.JSONEncoder):
 #         print("❌ WebSocket client disconnected:", e)
 
 
+HEARTBEAT_INTERVAL = 25        # server pings every 25s
+HEARTBEAT_TIMEOUT = 60         # if no pong in 60s, kill
+FULL_SYNC_INTERVAL = 15        # safety-net full refresh every 15s
+TOKEN_RECHECK_INTERVAL = 300   # recheck token every 5 min
+
+
+async def _fetch_alerts_payload(incident_id=None, filter_date=None):
+    """Fetch alerts + counts as a single payload. Used both for initial + filter + full-sync."""
+    conditions = []
+    params = {}
+
+    if incident_id:
+        conditions.append("incident_id = :incident_id")
+        params["incident_id"] = str(incident_id)
+    elif filter_date:
+        start_dt = datetime.strptime(filter_date, "%Y-%m-%d")
+        end_dt = start_dt + timedelta(days=1)
+        conditions.append("created_date >= :start_date AND created_date < :end_date")
+        params["start_date"] = start_dt
+        params["end_date"] = end_dt
+    else:
+        conditions.append("inc_datetime >= CURRENT_DATE AND inc_datetime < CURRENT_DATE + INTERVAL '1 day'")
+
+    where_clause = " AND ".join(conditions)
+
+    query = f"""
+        SELECT * FROM central_alerts
+        WHERE {where_clause}
+        ORDER BY inc_datetime DESC
+    """
+
+    if filter_date:
+        rows = await database2.fetch_all(query, params)
+    else:
+        rows = await cached_query(query, params=params, ttl=3, fetch="all", db=database2)
+
+    today_all = [serialize_row(r) for r in rows]
+    by_severity = group_by_severity(rows)
+
+    # ✅ Counts recalculated for EVERY filter (bug fixed)
+    count_rows = await cached_query(
+        f"""
+        SELECT system_type, severity, COUNT(*) AS total
+        FROM central_alerts
+        WHERE {where_clause}
+          AND escalate_status = '1'
+          AND system_type IN ('108', '102')
+        GROUP BY system_type, severity
+        """,
+        params=params,
+        ttl=3,
+        fetch="all",
+        db=database2,
+    ) or []
+
+    counts = {"total": {"108": 0, "102": 0}, "severity": {"108": {}, "102": {}}}
+    for r in count_rows:
+        sys_t = r["system_type"]
+        sev = r["severity"]
+        counts["total"][sys_t] += r["total"]
+        counts["severity"][sys_t][sev] = r["total"]
+
+    return {
+        "type": "ALL_ALERTS",
+        "data": {
+            "today_all": today_all,
+            "by_severity": by_severity,
+            "counts": counts,
+        },
+    }
+
+
 @app.websocket("/ws/central_alerts")
 async def central_alerts_ws(websocket: WebSocket):
- 
+    # 1️⃣ Auth FIRST (before accept)
     user_id = await verify_jwt_token(websocket.query_params.get("token"))
     if not user_id:
         await websocket.accept()
         await websocket.send_json({
-            "type": "ERROR",
-            "status": 401,
+            "type": "ERROR", "status": 401,
             "message": "Invalid or expired token. Please login again."
         })
         await websocket.close(code=1008)
         return
- 
-    await manager.connect(websocket)
-    print("🔌 WebSocket client connected")
- 
+
+    # 2️⃣ Register + send initial full state
+    info = await manager.connect(websocket, user_id)
+    queue: asyncio.Queue = info["queue"]
+
     try:
-        # =====================================================
-        # 1️⃣ SEND DATA ON CONNECT (TODAY DEFAULT)
-        # =====================================================
-        rows = await cached_query(
-            """
-            SELECT *
-            FROM central_alerts
-            WHERE inc_datetime >= CURRENT_DATE
-              AND inc_datetime < CURRENT_DATE + INTERVAL '1 day'
-            ORDER BY inc_datetime DESC
-            """,
-            ttl=3,
-            fetch="all",
-            db=database2
-        )
- 
-        today_all = [serialize_row(r) for r in rows]
-        by_severity = group_by_severity(rows)
- 
-        # ===============================
-        # COUNTS (108 / 102)
-        # ===============================
-        count_rows = await cached_query(
-            """
-            SELECT
-                system_type,
-                severity,
-                COUNT(*) AS total
-            FROM central_alerts
-            WHERE inc_datetime >= CURRENT_DATE
-              AND inc_datetime < CURRENT_DATE + INTERVAL '1 day'
-              AND escalate_status = '1'
-              AND system_type IN ('108', '102')
-            GROUP BY system_type, severity
-            """,
-            ttl=3,
-            fetch="all",
-            db=database2
-        )
- 
-        counts = {
-            "total": {"108": 0, "102": 0},
-            "severity": {"108": {}, "102": {}}
-        }
- 
-        for r in count_rows:
-            system = r["system_type"]
-            severity = r["severity"]
-            total = r["total"]
- 
-            counts["total"][system] += total
-            counts["severity"][system][severity] = total
- 
-        await websocket.send_json({
-            "type": "ALL_ALERTS",
-            "data": {
-                "today_all": today_all,
-                "by_severity": by_severity,
-                "counts": counts
-            }
-        })
- 
-        print("📤 Sent ALL_ALERTS on connect")
- 
-        # =====================================================
-        # 2️⃣ LISTEN FOR FILTER REQUESTS
-        # =====================================================
-        while True:
-            msg = await websocket.receive_json()
- 
-            incident_id = msg.get("incident_id")
-            filter_date = msg.get("date")  # YYYY-MM-DD
- 
-            conditions = []
-            params = {}
- 
-            # incident filter -> incident_id diya toh SIRF isi ID pe filter hoga,
-            # koi date restriction add nahi hogi, isliye us incident ke
-            # jitne bhi alerts hain (kisi bhi date ke) sab return honge
-            if incident_id:
-                conditions.append("incident_id = :incident_id")
-                params["incident_id"] = str(incident_id)
- 
-            # created_date filter -> sirf tab lagega jab incident_id na diya ho
-            elif filter_date:
-                start_dt = datetime.strptime(filter_date, "%Y-%m-%d")
-                end_dt = start_dt + timedelta(days=1)
- 
-                conditions.append("""
-                    created_date >= :start_date
-                    AND created_date < :end_date
-                """)
- 
-                params["start_date"] = start_dt
-                params["end_date"] = end_dt
-            else:
-                # default today logic
-                conditions.append("""
-                    inc_datetime >= CURRENT_DATE
-                    AND inc_datetime < CURRENT_DATE + INTERVAL '1 day'
-                """)
- 
-            where_clause = " AND ".join(conditions)
- 
-            query = f"""
-                SELECT *
-                FROM central_alerts
-                WHERE {where_clause}
-                ORDER BY inc_datetime DESC
-            """
- 
-            if filter_date:
-                rows = await database2.fetch_all(query, params)
-            else:
-                rows = await cached_query(
-                    query,
-                    params=params,
-                    ttl=3,
-                    fetch="all",
-                    db=database2
-                )
- 
-            today_all = [serialize_row(r) for r in rows]
-            by_severity = group_by_severity(rows)
- 
-            await websocket.send_json({
-                "type": "ALL_ALERTS",
-                "data": {
-                    "today_all": today_all,
-                    "by_severity": by_severity,
-                    "counts": counts
-                }
-            })
- 
-            print(f"📤 Sent alerts (incident_id={incident_id}, date={filter_date})")
- 
+        initial_payload = await _fetch_alerts_payload()
+        await manager.safe_send(websocket, initial_payload)
+        logger.info(f"📤 Sent ALL_ALERTS on connect (user={user_id})")
+
+        # 3️⃣ Three concurrent tasks — receive, broadcast-drain, heartbeat
+        async def receive_loop():
+            """Listen for client filter messages + pongs."""
+            while True:
+                try:
+                    msg = await websocket.receive_json()
+                except WebSocketDisconnect:
+                    raise
+                except Exception:
+                    # Could be a ping/pong control frame from starlette; ignore
+                    continue
+
+                # Handle pong (heartbeat ack)
+                if msg.get("type") == "pong":
+                    info["last_seen"] = time.time()
+                    continue
+
+                # Handle filter request
+                incident_id = msg.get("incident_id")
+                filter_date = msg.get("date")
+                try:
+                    payload = await _fetch_alerts_payload(incident_id, filter_date)
+                    await manager.safe_send(websocket, payload)
+                    logger.info(f"📤 Filter sent (inc={incident_id}, date={filter_date})")
+                except Exception as e:
+                    logger.error(f"Filter fetch error: {e}")
+                    await manager.safe_send(websocket, {
+                        "type": "ERROR", "message": "Filter fetch failed"
+                    })
+
+        async def drain_loop():
+            """Drain broadcast queue → send to this client."""
+            while True:
+                payload = await queue.get()
+                if not await manager.safe_send(websocket, payload):
+                    return  # client gone
+
+        async def heartbeat_loop():
+            """Ping client periodically; kill if no response."""
+            while True:
+                await asyncio.sleep(HEARTBEAT_INTERVAL)
+                if time.time() - info["last_seen"] > HEARTBEAT_TIMEOUT:
+                    logger.warning("💔 Heartbeat timeout, closing")
+                    await websocket.close(code=1011)
+                    return
+                try:
+                    await websocket.send_json({"type": "ping"})
+                except Exception:
+                    return
+
+        async def full_sync_loop():
+            """Safety-net: full state every 15s so NOTHING is missed."""
+            while True:
+                await asyncio.sleep(FULL_SYNC_INTERVAL)
+                try:
+                    payload = await _fetch_alerts_payload()
+                    payload["type"] = "FULL_SYNC"
+                    await manager.safe_send(websocket, payload)
+                except Exception as e:
+                    logger.error(f"Full sync error: {e}")
+
+        async def token_recheck_loop():
+            """Re-validate token periodically."""
+            while True:
+                await asyncio.sleep(TOKEN_RECHECK_INTERVAL)
+                ok = await verify_jwt_token(websocket.query_params.get("token"))
+                if not ok:
+                    await manager.safe_send(websocket, {
+                        "type": "ERROR", "status": 401,
+                        "message": "Session expired. Please login again."
+                    })
+                    await websocket.close(code=1008)
+                    return
+
+        # Run all concurrently
+        tasks = [
+            asyncio.create_task(receive_loop()),
+            asyncio.create_task(drain_loop()),
+            asyncio.create_task(heartbeat_loop()),
+            asyncio.create_task(full_sync_loop()),
+            asyncio.create_task(token_recheck_loop()),
+        ]
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for t in pending:
+            t.cancel()
+
+    except WebSocketDisconnect:
+        logger.info("❌ WebSocket client disconnected (client-side)")
     except Exception as e:
+        logger.exception(f"❌ WebSocket error: {e}")
+    finally:
         manager.disconnect(websocket)
-        print("❌ WebSocket client disconnected:", e)
+        try:
+            await websocket.close()
+        except Exception:
+            pass
 
 ###################################################################################################
 # # ===============================
@@ -2051,53 +2127,54 @@ last_sent_alert_id = None
 
 
 async def alert_ws_notifier():
+    """
+    Poll central_alerts every 1s for ANY change (insert/update/delete).
+    On first run: send nothing (clients get full state on connect).
+    On restart: pick latest as baseline (no history flood).
+    """
     global last_sent_updated, last_sent_alert_id
-    print("🚀 Alert WebSocket Notifier STARTED")
+    logger.info("🚀 Alert WS Notifier STARTED")
+
+    # Bootstrap: set baseline to latest so we don't flood on restart
+    if last_sent_updated is None:
+        row = await database2.fetch_one(
+            """
+            SELECT alert_id, updated_date
+            FROM central_alerts
+            ORDER BY updated_date DESC NULLS LAST, alert_id DESC
+            LIMIT 1
+            """
+        )
+        if row:
+            last_sent_updated = row["updated_date"]
+            last_sent_alert_id = row["alert_id"]
 
     while True:
         try:
-            if last_sent_updated is None:
-                row = await database2.fetch_one(
-                    """
-                    SELECT alert_id, updated_date
-                    FROM central_alerts
-                    ORDER BY updated_date DESC, alert_id DESC
-                    LIMIT 1
-                    """
-                )
-                if row:
-                    last_sent_updated = row["updated_date"]
-                    last_sent_alert_id = row["alert_id"]
+            rows = await database2.fetch_all(
+                """
+                SELECT *
+                FROM central_alerts
+                WHERE (updated_date > :last_time)
+                   OR (updated_date = :last_time AND alert_id > :last_id)
+                ORDER BY updated_date ASC, alert_id ASC
+                """,
+                {"last_time": last_sent_updated, "last_id": last_sent_alert_id}
+            )
 
-            else:
-                rows = await database2.fetch_all(
-                    """
-                    SELECT *
-                    FROM central_alerts
-                    WHERE (updated_date > :last_time)
-                       OR (updated_date = :last_time AND alert_id > :last_id)
-                    ORDER BY updated_date ASC, alert_id ASC
-                    """,
-                    {
-                        "last_time": last_sent_updated,
-                        "last_id": last_sent_alert_id
-                    }
-                )
+            if rows:
+                last_sent_updated = rows[-1]["updated_date"]
+                last_sent_alert_id = rows[-1]["alert_id"]
 
-                if rows:
-                    last_sent_updated = rows[-1]["updated_date"]
-                    last_sent_alert_id = rows[-1]["alert_id"]
-
-                    payload = {
-                        "type": "ALERT_CHANGED",
-                        "data": [serialize_row(r) for r in rows]
-                    }
-
-                    await manager.broadcast_text(payload)
-                    print(f"📡 WS sent {len(rows)} changed alerts")
+                payload = {
+                    "type": "ALERT_CHANGED",
+                    "data": [serialize_row(r) for r in rows]
+                }
+                manager.broadcast(payload)   # ✅ non-blocking queue push
+                logger.info(f"📡 Broadcast {len(rows)} changed alerts")
 
         except Exception as e:
-            print("❌ Alert WS Notifier Error:", e)
+            logger.exception(f"❌ Alert WS Notifier error: {e}")
 
         await asyncio.sleep(1)
 
