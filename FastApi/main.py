@@ -50,7 +50,7 @@ ALGORITHM = "HS256"
 
 ALLOWED_ORIGINS = os.getenv(
     "ALLOWED_ORIGINS",
-    "*,http://localhost:5173,http://localhost:3000,http://127.0.0.1:5173,http://127.0.0.1:3000"
+    "http://localhost:5173,http://localhost:3000,http://127.0.0.1:5173,http://127.0.0.1:3000,https://cams.jaesmp.com,http://cams.jaesmp.com"
 ).split(",")
 
 
