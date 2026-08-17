@@ -2046,6 +2046,61 @@ async def central_alerts_ws(websocket: WebSocket):
 # # ALERT CHANGE NOTIFIER
 # # ===============================
 
+last_sent_updated = None
+last_sent_alert_id = None
+
+
+async def alert_ws_notifier():
+    global last_sent_updated, last_sent_alert_id
+    print("🚀 Alert WebSocket Notifier STARTED")
+
+    while True:
+        try:
+            if last_sent_updated is None:
+                row = await database2.fetch_one(
+                    """
+                    SELECT alert_id, updated_date
+                    FROM central_alerts
+                    ORDER BY updated_date DESC, alert_id DESC
+                    LIMIT 1
+                    """
+                )
+                if row:
+                    last_sent_updated = row["updated_date"]
+                    last_sent_alert_id = row["alert_id"]
+
+            else:
+                rows = await database2.fetch_all(
+                    """
+                    SELECT *
+                    FROM central_alerts
+                    WHERE (updated_date > :last_time)
+                       OR (updated_date = :last_time AND alert_id > :last_id)
+                    ORDER BY updated_date ASC, alert_id ASC
+                    """,
+                    {
+                        "last_time": last_sent_updated,
+                        "last_id": last_sent_alert_id
+                    }
+                )
+
+                if rows:
+                    last_sent_updated = rows[-1]["updated_date"]
+                    last_sent_alert_id = rows[-1]["alert_id"]
+
+                    payload = {
+                        "type": "ALERT_CHANGED",
+                        "data": [serialize_row(r) for r in rows]
+                    }
+
+                    await manager.broadcast_text(payload)
+                    print(f"📡 WS sent {len(rows)} changed alerts")
+
+        except Exception as e:
+            print("❌ Alert WS Notifier Error:", e)
+
+        await asyncio.sleep(1)
+
 # last_sent_updated = None
 # last_sent_alert_id = None
 
@@ -2101,94 +2156,7 @@ async def central_alerts_ws(websocket: WebSocket):
 
 #         await asyncio.sleep(1)
 
-last_sent_updated = None
-last_sent_alert_id = None
-
-
-async def alert_ws_notifier():
-    global last_sent_updated, last_sent_alert_id
-    print("🚀 Alert WebSocket Notifier STARTED")
-
-    full_refresh_counter = 0
-
-    while True:
-        try:
-            if last_sent_updated is None:
-                row = await database2.fetch_one(
-                    """
-                    SELECT alert_id, updated_date
-                    FROM central_alerts
-                    ORDER BY updated_date DESC, alert_id DESC
-                    LIMIT 1
-                    """
-                )
-                if row:
-                    last_sent_updated = row["updated_date"]
-                    last_sent_alert_id = row["alert_id"]
-
-            else:
-                rows = await database2.fetch_all(
-                    """
-                    SELECT *
-                    FROM central_alerts
-                    WHERE (updated_date > :last_time)
-                       OR (updated_date = :last_time AND alert_id > :last_id)
-                    ORDER BY updated_date ASC, alert_id ASC
-                    """,
-                    {
-                        "last_time": last_sent_updated,
-                        "last_id": last_sent_alert_id
-                    }
-                )
-
-                if rows:
-                    last_sent_updated = rows[-1]["updated_date"]
-                    last_sent_alert_id = rows[-1]["alert_id"]
-
-                    payload = {
-                        "type": "ALERT_CHANGED",
-                        "data": [serialize_row(r) for r in rows]
-                    }
-
-                    await manager.broadcast_text(payload)
-                    print(f"📡 WS sent {len(rows)} changed alerts")
-
-            # 🔄 Har ~10 second mein poora fresh sorted snapshot bhi
-            # broadcast kar do -> isse frontend ka order apne aap
-            # "refresh jaisa" self-correct ho jaayega, bina user ko
-            # actual page refresh karne ki zaroorat ke
-            full_refresh_counter += 1
-            if full_refresh_counter >= 5:
-                full_refresh_counter = 0
-
-                rows = await database2.fetch_all(
-                    """
-                    SELECT *
-                    FROM central_alerts
-                    WHERE inc_datetime >= CURRENT_DATE
-                      AND inc_datetime < CURRENT_DATE + INTERVAL '1 day'
-                    ORDER BY inc_datetime DESC
-                    """
-                )
-
-                today_all = [serialize_row(r) for r in rows]
-                by_severity = group_by_severity(rows)
-
-                await manager.broadcast_text({
-                    "type": "ALL_ALERTS",
-                    "data": {
-                        "today_all": today_all,
-                        "by_severity": by_severity
-                    }
-                })
-                print("🔄 Periodic full ALL_ALERTS resync sent")
-
-        except Exception as e:
-            print("❌ Alert WS Notifier Error:", e)
-
-        await asyncio.sleep(1)
-        
-        
+    #################################################################
 class EscalateRequest(BaseModel):
     remark: Optional[str] = None
     escalated_by: Optional[str] = None
