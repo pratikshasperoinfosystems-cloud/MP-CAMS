@@ -2016,13 +2016,13 @@ async def central_alerts_ws(websocket: WebSocket):
     should_stop = asyncio.Event()
 
     try:
-        # Initial full state
-        initial_payload = await _fetch_alerts_payload()
-        if not await manager.safe_send(websocket, initial_payload):
+        # ✅ Initial full state (frontend knows ALL_ALERTS)
+        payload = await _fetch_alerts_payload()
+        if not await manager.safe_send(websocket, payload):
             return
         logger.info(f"📤 Sent ALL_ALERTS on connect (user={user_id})")
 
-        # ============ RECEIVE LOOP ============
+        # ============ RECEIVE LOOP — only filter requests ============
         async def receive_loop():
             while not should_stop.is_set():
                 try:
@@ -2036,8 +2036,7 @@ async def central_alerts_ws(websocket: WebSocket):
                     should_stop.set()
                     return
 
-                # ❌ Removed pong handling — frontend can't send it
-                # Only handle filter requests
+                # Handle filter request from frontend
                 incident_id = msg.get("incident_id")
                 filter_date = msg.get("date")
                 try:
@@ -2048,7 +2047,7 @@ async def central_alerts_ws(websocket: WebSocket):
                 except Exception as e:
                     logger.error(f"Filter fetch error: {e}")
 
-        # ============ DRAIN LOOP ============
+        # ============ DRAIN LOOP — only ALERT_CHANGED broadcasts ============
         async def drain_loop():
             while not should_stop.is_set():
                 try:
@@ -2059,59 +2058,14 @@ async def central_alerts_ws(websocket: WebSocket):
                     should_stop.set()
                     return
 
-        # ============ KEEPALIVE LOOP (ONE-WAY, no pong needed) ============
-        async def keepalive_loop():
-            """
-            Sirf server bhejta hai, client se kuch expect nahi.
-            - NGINX/Granian idle timeout (60s) se bachane ke liye
-            - Dead connection detect karne ke liye (send fail = dead)
-            Frontend is message ko silently ignore karega (koi handler nahi to koi dukandari nahi)
-            """
-            while not should_stop.is_set():
-                await asyncio.sleep(KEEPALIVE_INTERVAL)
-                # Frontend ko koi action lena hi nahi — bas keep-alive
-                if not await manager.safe_send(websocket, {"type": "keepalive"}):
-                    logger.info(f"💔 Keepalive send failed — dead connection (user={user_id})")
-                    should_stop.set()
-                    return
+        # ❌ NO full_sync_loop — removed (was causing flicker)
+        # ❌ NO keepalive_loop — removed (was causing flicker)
+        # ❌ NO token_recheck_loop — removed (causing unnecessary disconnects)
 
-        # ============ FULL SYNC LOOP (safety net — 15s) ============
-        async def full_sync_loop():
-            """
-            Har 15s me poora state bhejo — agar koi broadcast miss bhi hua
-            to ye auto-recover kar dega. 'NO MISS' guarantee.
-            """
-            while not should_stop.is_set():
-                await asyncio.sleep(FULL_SYNC_INTERVAL)
-                try:
-                    payload = await _fetch_alerts_payload()
-                    payload["type"] = "FULL_SYNC"
-                    if not await manager.safe_send(websocket, payload):
-                        should_stop.set()
-                        return
-                except Exception as e:
-                    logger.error(f"Full sync error: {e}")
-
-        # ============ TOKEN RECHECK LOOP ============
-        async def token_recheck_loop():
-            while not should_stop.is_set():
-                await asyncio.sleep(TOKEN_RECHECK_INTERVAL)
-                ok = await verify_jwt_token(websocket.query_params.get("token"))
-                if not ok:
-                    await manager.safe_send(websocket, {
-                        "type": "ERROR", "status": 401,
-                        "message": "Session expired. Please login again."
-                    })
-                    should_stop.set()
-                    return
-
-        # ============ RUN ALL ============
+        # ============ RUN TASKS ============
         tasks = [
-            asyncio.create_task(receive_loop(),       name="receive"),
-            asyncio.create_task(drain_loop(),          name="drain"),
-            asyncio.create_task(keepalive_loop(),     name="keepalive"),   # ✅ renamed
-            asyncio.create_task(full_sync_loop(),     name="full_sync"),
-            asyncio.create_task(token_recheck_loop(), name="token_recheck"),
+            asyncio.create_task(receive_loop(), name="receive"),
+            asyncio.create_task(drain_loop(),   name="drain"),
         ]
 
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
@@ -2122,9 +2076,7 @@ async def central_alerts_ws(websocket: WebSocket):
         for t in tasks:
             try:
                 await t
-            except asyncio.CancelledError:
-                pass
-            except WebSocketDisconnect:
+            except (asyncio.CancelledError, WebSocketDisconnect):
                 pass
             except Exception as e:
                 logger.debug(f"Task {t.get_name()} ended: {e}")
