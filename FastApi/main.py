@@ -250,7 +250,7 @@ connected_clients: dict[str, List[WebSocket]] = {}
 def generate_token(user_id: str):
     payload = {
         "sub": user_id,
-        "exp": datetime.utcnow() + timedelta(hours=6)
+        "exp": datetime.utcnow() + timedelta(hours=24)
     }
     return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
 
