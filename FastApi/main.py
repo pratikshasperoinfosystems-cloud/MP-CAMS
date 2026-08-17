@@ -1,18 +1,7 @@
 # ============================================================
 # Central Alert Management System (CAMS) — FastAPI Application
 # Production-ready with real-time WebSocket syncing
-#
-# Features:
-#   - Real-time WebSocket alerts with Redis pub/sub (cross-worker)
-#   - Auto-restart workers on crash
-#   - Bounded memory cache with eviction
-#   - Health check endpoint
-#   - JWT authentication
-#   - Excel report generation
 # ============================================================
-
-# python -m uvicorn main:app --host 0.0.0.0 --port 8000
-# granian main:app --interface asgi --host 0.0.0.0 --port 8000 --workers 2
 
 import os
 import time
@@ -63,6 +52,7 @@ ALLOWED_ORIGINS = os.getenv(
     "ALLOWED_ORIGINS",
     "*,http://localhost:5173,http://localhost:3000,http://127.0.0.1:5173,http://127.0.0.1:3000"
 ).split(",")
+
 
 # ============================================================
 # Logging Configuration
@@ -135,7 +125,7 @@ async def publish_to_redis(channel: str, payload: dict):
 async def redis_subscriber():
     """
     Subscribe to Redis channels and broadcast received messages to local clients.
-    This runs in every worker process to enable cross-worker WebSocket broadcasts.
+    Runs in every worker process to enable cross-worker WebSocket broadcasts.
     """
     logger.info("Redis Subscriber STARTED")
     try:
@@ -167,13 +157,7 @@ async def cached_query(sql, params=None, ttl=15, fetch="all", db=database):
     """
     await init_redis()
 
-    # Compact and stable cache key
-    key_data = {
-        "db": id(db),
-        "sql": sql,
-        "params": params,
-        "fetch": fetch,
-    }
+    key_data = {"db": id(db), "sql": sql, "params": params, "fetch": fetch}
     raw_key = json.dumps(key_data, sort_keys=True)
     cache_key = "cache_query:" + hashlib.md5(raw_key.encode()).hexdigest()
 
@@ -217,11 +201,7 @@ async def cached_query(sql, params=None, ttl=15, fetch="all", db=database):
 
     # Save to Redis (best effort)
     try:
-        await redis_client.set(
-            cache_key,
-            json.dumps(result, default=str),
-            ex=ttl,
-        )
+        await redis_client.set(cache_key, json.dumps(result, default=str), ex=ttl)
     except Exception:
         pass
 
@@ -241,11 +221,7 @@ def generate_token(user_id: str) -> str:
 
 def verify_token(creds: HTTPAuthorizationCredentials = Depends(security)):
     try:
-        payload = jwt.decode(
-            creds.credentials,
-            SECRET_KEY,
-            algorithms=[ALGORITHM]
-        )
+        payload = jwt.decode(creds.credentials, SECRET_KEY, algorithms=[ALGORITHM])
         return payload["sub"]
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
@@ -286,13 +262,9 @@ def format_seconds_to_hhmmss(total_seconds):
 
 
 def normalize_row(row):
-    """
-    Convert a DB row (Record, tuple, or dict) into a plain dictionary.
-    Handles datetime/date conversion for JSON serialization.
-    """
+    """Convert a DB row into a plain dictionary with datetime handling."""
     if not row:
         return {}
-
     try:
         data = dict(row._mapping)
     except AttributeError:
@@ -374,7 +346,6 @@ def group_by_severity(rows):
     for r in rows:
         serialized = serialize_row(r)
         sev = (serialized.get("severity") or "").upper()
-
         if sev in grouped:
             grouped[sev].append(serialized)
         else:
@@ -469,319 +440,6 @@ class AlertThresholdUpdate(BaseModel):
 
 
 # ============================================================
-# Login / Logout APIs
-# ============================================================
-@app.post("/login")
-async def login_user(data: LoginRequest):
-    username = data.username
-    password = data.password
-    password_md5 = hashlib.md5(password.encode()).hexdigest()
-
-    query = """
-        SELECT clg_group, clg_is_login
-        FROM ems_colleague
-        WHERE clg_ref_id = :username AND clg_password = :password
-    """
-    result = await database.fetch_one(query, {"username": username, "password": password_md5})
-
-    if not result:
-        raise HTTPException(status_code=401, detail="Invalid username or password")
-
-    update_query = """
-        UPDATE ems_colleague SET clg_is_login = 'yes' WHERE clg_ref_id = :username
-    """
-    await database.execute(update_query, {"username": username})
-    token = generate_token(username)
-
-    return {"message": "Login successful", "status": "success", "username": username, "token": token}
-
-
-@app.post("/logout")
-async def logout_user(user_id: str = Depends(verify_token)):
-    update_query = """
-        UPDATE ems_colleague
-        SET clg_is_login = 'no'
-        WHERE clg_ref_id = :username
-    """
-    await database.execute(update_query, {"username": user_id})
-
-    return {"message": "Logout successful", "status": "success"}
-
-
-# ============================================================
-# Districts / Division / Ambulance APIs
-# ============================================================
-@app.get("/api/districts", response_model=List[DistrictOut])
-async def get_districts(division_id: Optional[int] = Query(None)):
-    if division_id is not None:
-        query = """
-            SELECT dst_code, dst_name
-            FROM ems_mas_districts
-            WHERE div_id = :division_id
-            AND dst_state='MH'
-            AND dstis_deleted = '0'
-            ORDER BY dst_name
-        """
-        rows = await cached_query(query, {"division_id": division_id}, ttl=10)
-    else:
-        query = """
-            SELECT dst_code, dst_name
-            FROM ems_mas_districts
-            WHERE dst_state='MH'
-            AND dstis_deleted = '0'
-            ORDER BY dst_name
-        """
-        rows = await cached_query(query, ttl=10)
-
-    districts = [
-        DistrictOut(district_id=row["dst_code"], district_name=row["dst_name"])
-        for row in rows
-    ]
-    return districts
-
-
-@app.get("/api/division", response_model=List[DivisionOut])
-async def get_divisions():
-    query = """
-        SELECT div_code, div_name
-        FROM ems_mas_division
-        ORDER BY div_name
-    """
-    rows = await database.fetch_all(query)
-
-    division = [
-        DivisionOut(division_id=row["div_code"], division_name=row["div_name"])
-        for row in rows
-    ]
-    return division
-
-
-@app.get("/api/ambulance-list")
-async def get_ambulance_list():
-    query = """
-        SELECT
-            a.amb_rto_register_no AS ambulance_number,
-            d.dst_name AS district_name,
-            a.amb_district AS dst_code
-        FROM ems_ambulance a
-        LEFT JOIN ems_mas_districts d
-            ON a.amb_district = d.dst_code
-        WHERE a.amb_rto_register_no IS NOT NULL
-        ORDER BY d.dst_name, a.amb_rto_register_no;
-    """
-
-    rows = await cached_query(query, ttl=30, fetch="all")
-    if not rows:
-        return {"status": "error", "message": "No ambulances found"}
-
-    result = [
-        {
-            "ambulance_number": row["ambulance_number"],
-            "district_name": row["district_name"],
-            "dst_code": row["dst_code"]
-        }
-        for row in rows
-    ]
-
-    return {"status": "success", "count": len(result), "data": result}
-
-
-# ============================================================
-# RTM Dashboard WebSocket
-# ============================================================
-@app.websocket("/ws/rtm_dashboard")
-async def rtm_dashboard_ws(websocket: WebSocket):
-    user_id = await verify_jwt_token(websocket.query_params.get("token"))
-    if not user_id:
-        logger.warning("RTM Dashboard WS rejected: invalid or missing token")
-        await websocket.close(code=1008)
-        return
-    await websocket.accept()
-
-    prev_data = None
-    last_filter = {}
-    last_filter_hash = None
-
-    try:
-        while True:
-            try:
-                msg = await asyncio.wait_for(
-                    websocket.receive_json(), timeout=0.5
-                )
-                if msg:
-                    last_filter = msg
-            except asyncio.TimeoutError:
-                pass
-
-            if not last_filter:
-                await asyncio.sleep(0.2)
-                continue
-
-            inc_ref_id = last_filter.get("inc_ref_id")
-            if not inc_ref_id:
-                continue
-
-            current_filter_hash = hash_filter(last_filter)
-            if current_filter_hash == last_filter_hash:
-                await asyncio.sleep(0.2)
-                continue
-
-            last_filter_hash = current_filter_hash
-
-            # Build safe WHERE clause
-            where_sql = "WHERE 1=1"
-            params = {}
-
-            where_sql += " AND inc_ref_id = :inc_ref_id"
-            params["inc_ref_id"] = inc_ref_id
-
-            if last_filter.get("dst_code"):
-                where_sql += " AND dst_code = :dst_code"
-                params["dst_code"] = last_filter["dst_code"]
-
-            if last_filter.get("ambulance_no"):
-                where_sql += " AND ambulance_no = :ambulance_no"
-                params["ambulance_no"] = last_filter["ambulance_no"]
-
-            query = f"""
-                SELECT
-                    inc_ref_id,
-                    ambulance_no,
-                    dst_code,
-                    district_name,
-                    base_location_name,
-                    call_type,
-                    caller_mobile,
-                    pilot_name,
-                    pilot_mobile,
-                    paramedic_name,
-                    paramedic_mobile,
-                    assigned_time,
-                    parameter_count,
-                    inc_dispatch_time,
-                    inc_recive_time,
-                    inc_datetime,
-                    acknowledge,
-                    start_from_base_loc,
-                    acknowledge_duration,
-                    start_from_base_duration,
-                    at_scene,
-                    at_scene_duration,
-                    wait_time_at_scene_duration,
-                    from_scene,
-                    start_from_scene_duration,
-                    enroute_to_hospital_duration,
-                    at_hospital,
-                    at_hospital_duration,
-                    patient_handover,
-                    handover_duration,
-                    back_to_base_loc,
-                    back_to_base_duration,
-                    inc_pcr_status,
-                    clg_is_login,
-                    destination_hospital_id,
-                    rec_hospital_name,
-                    hospital_id,
-                    amb_working_area,
-                    pilot_parameters,
-                    is_validate,
-                    trip,
-                    remark,
-                    pilot_login_out,
-                    emso_login_out,
-                    amb_type
-                FROM rtm_dashboard
-                {where_sql}
-                ORDER BY inc_datetime::timestamp DESC
-                LIMIT 1
-            """
-
-            rows = await cached_query(
-                query,
-                params=params,
-                fetch="all",
-                ttl=2,
-                db=database2
-            )
-
-            data = [normalize_row(r) for r in rows] if rows else []
-
-            if data != prev_data:
-                await websocket.send_json({"latest_records": data})
-                prev_data = data
-
-    except WebSocketDisconnect:
-        logger.info("RTM Dashboard WebSocket disconnected")
-
-
-# ============================================================
-# RTM Alerts WebSocket
-# ============================================================
-@app.websocket("/ws/rtm_alerts")
-async def rtm_alerts_ws(websocket: WebSocket):
-    await websocket.accept()
-    prev_alerts = None
-
-    try:
-        while True:
-            query = """
-                SELECT *
-                FROM rtm_dashboard
-                WHERE EXTRACT(YEAR FROM inc_datetime) = 2026
-                ORDER BY inc_datetime DESC
-                LIMIT 200
-            """
-
-            rows = await cached_query(
-                query,
-                fetch="all",
-                ttl=5,
-                db=database2
-            )
-
-            alerts = []
-
-            for row in rows:
-                row = normalize_row(row)
-
-                inc_dispatch_sec = hhmmss_to_seconds(row.get("inc_dispatch_time"))
-                acknowledge_sec = hhmmss_to_seconds(row.get("acknowledge_duration"))
-                start_base_sec = hhmmss_to_seconds(row.get("start_from_base_duration"))
-                at_scene_sec = hhmmss_to_seconds(row.get("at_scene_duration"))
-
-                amb_area = row.get("amb_working_area")
-
-                is_alert = False
-
-                if inc_dispatch_sec > 150:
-                    is_alert = True
-                elif acknowledge_sec > 30:
-                    is_alert = True
-                elif start_base_sec > 120:
-                    is_alert = True
-                elif amb_area == "1" and at_scene_sec > 1500:
-                    is_alert = True
-                elif amb_area == "2" and at_scene_sec > 1080:
-                    is_alert = True
-
-                if is_alert:
-                    alerts.append(row)
-
-            if alerts != prev_alerts:
-                await websocket.send_json({
-                    "year": 2026,
-                    "alert_count": len(alerts),
-                    "alerts": alerts
-                })
-                prev_alerts = alerts
-
-            await asyncio.sleep(3)
-
-    except WebSocketDisconnect:
-        logger.info("RTM Alert WebSocket disconnected")
-
-
-# ============================================================
 # Alert Thresholds & Worker
 # ============================================================
 async def get_active_thresholds():
@@ -873,7 +531,6 @@ async def rtm_alert_insert_worker():
             for row in rows:
                 try:
                     row = normalize_row(row)
-
                     alerts = resolve_alerts(row, thresholds)
                     if not alerts:
                         continue
@@ -1053,8 +710,473 @@ async def _fetch_alerts_payload(incident_id=None, filter_date=None):
 
 
 # ============================================================
-# Central Alerts WebSocket (Main Real-Time Channel)
+# Alert WebSocket Notifier (with Redis pub/sub)
 # ============================================================
+async def alert_ws_notifier():
+    """
+    Polls central_alerts every 1s for changes.
+    On change: fetches full state and publishes via Redis pub/sub
+    so ALL workers receive the update (cross-worker broadcast).
+    Baseline is updated AFTER successful publish to prevent data loss.
+    """
+    global last_sent_updated, last_sent_alert_id
+    logger.info("Alert WS Notifier STARTED")
+
+    # Bootstrap: set baseline to latest alert (no flood on restart)
+    if last_sent_updated is None:
+        row = await database2.fetch_one(
+            """
+            SELECT alert_id, updated_date
+            FROM central_alerts
+            ORDER BY updated_date DESC NULLS LAST, alert_id DESC
+            LIMIT 1
+            """
+        )
+        if row:
+            last_sent_updated = row["updated_date"]
+            last_sent_alert_id = row["alert_id"]
+
+    while True:
+        try:
+            rows = await database2.fetch_all(
+                """
+                SELECT alert_id, updated_date
+                FROM central_alerts
+                WHERE (updated_date > :last_time)
+                   OR (updated_date = :last_time AND alert_id > :last_id)
+                ORDER BY updated_date ASC, alert_id ASC
+                """,
+                {
+                    "last_time": last_sent_updated,
+                    "last_id": last_sent_alert_id
+                }
+            )
+
+            if rows:
+                # Save new baseline BEFORE fetch (to detect next changes)
+                new_last_time = rows[-1]["updated_date"]
+                new_last_id = rows[-1]["alert_id"]
+
+                # Fetch full state (sorted by inc_datetime DESC)
+                full_payload = await _fetch_alerts_payload()
+
+                # Publish to Redis — all workers receive via redis_subscriber
+                await publish_to_redis("central_alerts_channel", full_payload)
+
+                # Also broadcast to local clients (instant delivery)
+                manager.broadcast(full_payload)
+
+                # Update baseline AFTER successful publish
+                last_sent_updated = new_last_time
+                last_sent_alert_id = new_last_id
+
+                logger.info(f"Broadcast full state ({len(rows)} changes triggered)")
+
+        except Exception as e:
+            logger.exception(f"Alert WS Notifier error: {e}")
+
+        await asyncio.sleep(1)
+
+
+# ============================================================
+# Auto-Restart Wrappers (crash recovery)
+# ============================================================
+async def run_notifier_with_restart():
+    """Wrapper that restarts alert_ws_notifier if it crashes."""
+    while True:
+        try:
+            logger.info("Starting alert_ws_notifier...")
+            await alert_ws_notifier()
+        except asyncio.CancelledError:
+            logger.info("Notifier cancelled, exiting wrapper")
+            break
+        except Exception as e:
+            logger.exception(f"Notifier CRASHED — restarting in 5s: {e}")
+            await asyncio.sleep(5)
+
+
+async def run_worker_with_restart():
+    """Wrapper that restarts rtm_alert_insert_worker if it crashes."""
+    while True:
+        try:
+            logger.info("Starting rtm_alert_insert_worker...")
+            await rtm_alert_insert_worker()
+        except asyncio.CancelledError:
+            logger.info("Worker cancelled, exiting wrapper")
+            break
+        except Exception as e:
+            logger.exception(f"Worker CRASHED — restarting in 5s: {e}")
+            await asyncio.sleep(5)
+
+
+# ============================================================
+# Lifespan (Startup & Shutdown)
+# ============================================================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global alert_worker_task, notifier_task, redis_sub_task
+
+    # --- STARTUP ---
+    await database.connect()
+    await database2.connect()
+    await init_redis()
+
+    alert_worker_task = asyncio.create_task(run_worker_with_restart())
+    notifier_task = asyncio.create_task(run_notifier_with_restart())
+    redis_sub_task = asyncio.create_task(redis_subscriber())
+
+    logger.info("Application STARTED — all workers running")
+
+    yield
+
+    # --- SHUTDOWN ---
+    for t in [alert_worker_task, notifier_task, redis_sub_task]:
+        if t:
+            t.cancel()
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+
+    if redis_client:
+        await redis_client.aclose()
+    if database.is_connected:
+        await database.disconnect()
+    if database2.is_connected:
+        await database2.disconnect()
+
+    logger.info("Application STOPPED")
+
+
+# ============================================================
+# FastAPI App Creation (MUST be before any @app routes)
+# ============================================================
+app = FastAPI(lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[o.strip() for o in ALLOWED_ORIGINS],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+router = APIRouter()
+app.include_router(router)
+
+
+# ============================================================
+# ALL API ROUTES & WEBSOCKETS BELOW
+# ============================================================
+
+# -------------------- Login API --------------------
+@app.post("/login")
+async def login_user(data: LoginRequest):
+    username = data.username
+    password = data.password
+    password_md5 = hashlib.md5(password.encode()).hexdigest()
+
+    query = """
+        SELECT clg_group, clg_is_login
+        FROM ems_colleague
+        WHERE clg_ref_id = :username AND clg_password = :password
+    """
+    result = await database.fetch_one(query, {"username": username, "password": password_md5})
+
+    if not result:
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    update_query = """
+        UPDATE ems_colleague SET clg_is_login = 'yes' WHERE clg_ref_id = :username
+    """
+    await database.execute(update_query, {"username": username})
+    token = generate_token(username)
+
+    return {"message": "Login successful", "status": "success", "username": username, "token": token}
+
+
+# -------------------- Logout API --------------------
+@app.post("/logout")
+async def logout_user(user_id: str = Depends(verify_token)):
+    update_query = """
+        UPDATE ems_colleague
+        SET clg_is_login = 'no'
+        WHERE clg_ref_id = :username
+    """
+    await database.execute(update_query, {"username": user_id})
+
+    return {"message": "Logout successful", "status": "success"}
+
+
+# -------------------- Districts API --------------------
+@app.get("/api/districts", response_model=List[DistrictOut])
+async def get_districts(division_id: Optional[int] = Query(None)):
+    if division_id is not None:
+        query = """
+            SELECT dst_code, dst_name
+            FROM ems_mas_districts
+            WHERE div_id = :division_id
+            AND dst_state='MH'
+            AND dstis_deleted = '0'
+            ORDER BY dst_name
+        """
+        rows = await cached_query(query, {"division_id": division_id}, ttl=10)
+    else:
+        query = """
+            SELECT dst_code, dst_name
+            FROM ems_mas_districts
+            WHERE dst_state='MH'
+            AND dstis_deleted = '0'
+            ORDER BY dst_name
+        """
+        rows = await cached_query(query, ttl=10)
+
+    districts = [
+        DistrictOut(district_id=row["dst_code"], district_name=row["dst_name"])
+        for row in rows
+    ]
+    return districts
+
+
+# -------------------- Division API --------------------
+@app.get("/api/division", response_model=List[DivisionOut])
+async def get_divisions():
+    query = """
+        SELECT div_code, div_name
+        FROM ems_mas_division
+        ORDER BY div_name
+    """
+    rows = await database.fetch_all(query)
+
+    division = [
+        DivisionOut(division_id=row["div_code"], division_name=row["div_name"])
+        for row in rows
+    ]
+    return division
+
+
+# -------------------- Ambulance List API --------------------
+@app.get("/api/ambulance-list")
+async def get_ambulance_list():
+    query = """
+        SELECT
+            a.amb_rto_register_no AS ambulance_number,
+            d.dst_name AS district_name,
+            a.amb_district AS dst_code
+        FROM ems_ambulance a
+        LEFT JOIN ems_mas_districts d
+            ON a.amb_district = d.dst_code
+        WHERE a.amb_rto_register_no IS NOT NULL
+        ORDER BY d.dst_name, a.amb_rto_register_no;
+    """
+
+    rows = await cached_query(query, ttl=30, fetch="all")
+    if not rows:
+        return {"status": "error", "message": "No ambulances found"}
+
+    result = [
+        {
+            "ambulance_number": row["ambulance_number"],
+            "district_name": row["district_name"],
+            "dst_code": row["dst_code"]
+        }
+        for row in rows
+    ]
+
+    return {"status": "success", "count": len(result), "data": result}
+
+
+# -------------------- RTM Dashboard WebSocket --------------------
+@app.websocket("/ws/rtm_dashboard")
+async def rtm_dashboard_ws(websocket: WebSocket):
+    user_id = await verify_jwt_token(websocket.query_params.get("token"))
+    if not user_id:
+        logger.warning("RTM Dashboard WS rejected: invalid or missing token")
+        await websocket.close(code=1008)
+        return
+    await websocket.accept()
+
+    prev_data = None
+    last_filter = {}
+    last_filter_hash = None
+
+    try:
+        while True:
+            try:
+                msg = await asyncio.wait_for(
+                    websocket.receive_json(), timeout=0.5
+                )
+                if msg:
+                    last_filter = msg
+            except asyncio.TimeoutError:
+                pass
+
+            if not last_filter:
+                await asyncio.sleep(0.2)
+                continue
+
+            inc_ref_id = last_filter.get("inc_ref_id")
+            if not inc_ref_id:
+                continue
+
+            current_filter_hash = hash_filter(last_filter)
+            if current_filter_hash == last_filter_hash:
+                await asyncio.sleep(0.2)
+                continue
+
+            last_filter_hash = current_filter_hash
+
+            where_sql = "WHERE 1=1"
+            params = {}
+
+            where_sql += " AND inc_ref_id = :inc_ref_id"
+            params["inc_ref_id"] = inc_ref_id
+
+            if last_filter.get("dst_code"):
+                where_sql += " AND dst_code = :dst_code"
+                params["dst_code"] = last_filter["dst_code"]
+
+            if last_filter.get("ambulance_no"):
+                where_sql += " AND ambulance_no = :ambulance_no"
+                params["ambulance_no"] = last_filter["ambulance_no"]
+
+            query = f"""
+                SELECT
+                    inc_ref_id,
+                    ambulance_no,
+                    dst_code,
+                    district_name,
+                    base_location_name,
+                    call_type,
+                    caller_mobile,
+                    pilot_name,
+                    pilot_mobile,
+                    paramedic_name,
+                    paramedic_mobile,
+                    assigned_time,
+                    parameter_count,
+                    inc_dispatch_time,
+                    inc_recive_time,
+                    inc_datetime,
+                    acknowledge,
+                    start_from_base_loc,
+                    acknowledge_duration,
+                    start_from_base_duration,
+                    at_scene,
+                    at_scene_duration,
+                    wait_time_at_scene_duration,
+                    from_scene,
+                    start_from_scene_duration,
+                    enroute_to_hospital_duration,
+                    at_hospital,
+                    at_hospital_duration,
+                    patient_handover,
+                    handover_duration,
+                    back_to_base_loc,
+                    back_to_base_duration,
+                    inc_pcr_status,
+                    clg_is_login,
+                    destination_hospital_id,
+                    rec_hospital_name,
+                    hospital_id,
+                    amb_working_area,
+                    pilot_parameters,
+                    is_validate,
+                    trip,
+                    remark,
+                    pilot_login_out,
+                    emso_login_out,
+                    amb_type
+                FROM rtm_dashboard
+                {where_sql}
+                ORDER BY inc_datetime::timestamp DESC
+                LIMIT 1
+            """
+
+            rows = await cached_query(
+                query,
+                params=params,
+                fetch="all",
+                ttl=2,
+                db=database2
+            )
+
+            data = [normalize_row(r) for r in rows] if rows else []
+
+            if data != prev_data:
+                await websocket.send_json({"latest_records": data})
+                prev_data = data
+
+    except WebSocketDisconnect:
+        logger.info("RTM Dashboard WebSocket disconnected")
+
+
+# -------------------- RTM Alerts WebSocket --------------------
+@app.websocket("/ws/rtm_alerts")
+async def rtm_alerts_ws(websocket: WebSocket):
+    await websocket.accept()
+    prev_alerts = None
+
+    try:
+        while True:
+            query = """
+                SELECT *
+                FROM rtm_dashboard
+                WHERE EXTRACT(YEAR FROM inc_datetime) = 2026
+                ORDER BY inc_datetime DESC
+                LIMIT 200
+            """
+
+            rows = await cached_query(
+                query,
+                fetch="all",
+                ttl=5,
+                db=database2
+            )
+
+            alerts = []
+
+            for row in rows:
+                row = normalize_row(row)
+
+                inc_dispatch_sec = hhmmss_to_seconds(row.get("inc_dispatch_time"))
+                acknowledge_sec = hhmmss_to_seconds(row.get("acknowledge_duration"))
+                start_base_sec = hhmmss_to_seconds(row.get("start_from_base_duration"))
+                at_scene_sec = hhmmss_to_seconds(row.get("at_scene_duration"))
+
+                amb_area = row.get("amb_working_area")
+
+                is_alert = False
+
+                if inc_dispatch_sec > 150:
+                    is_alert = True
+                elif acknowledge_sec > 30:
+                    is_alert = True
+                elif start_base_sec > 120:
+                    is_alert = True
+                elif amb_area == "1" and at_scene_sec > 1500:
+                    is_alert = True
+                elif amb_area == "2" and at_scene_sec > 1080:
+                    is_alert = True
+
+                if is_alert:
+                    alerts.append(row)
+
+            if alerts != prev_alerts:
+                await websocket.send_json({
+                    "year": 2026,
+                    "alert_count": len(alerts),
+                    "alerts": alerts
+                })
+                prev_alerts = alerts
+
+            await asyncio.sleep(3)
+
+    except WebSocketDisconnect:
+        logger.info("RTM Alert WebSocket disconnected")
+
+
+# -------------------- Central Alerts WebSocket --------------------
 @app.websocket("/ws/central_alerts")
 async def central_alerts_ws(websocket: WebSocket):
     user_id = await verify_jwt_token(websocket.query_params.get("token"))
@@ -1145,166 +1267,7 @@ async def central_alerts_ws(websocket: WebSocket):
         logger.info(f"Cleaned up connection (user={user_id})")
 
 
-# ============================================================
-# Alert WebSocket Notifier (with Redis pub/sub)
-# ============================================================
-async def alert_ws_notifier():
-    """
-    Polls central_alerts every 1s for changes.
-    On change: fetches full state and publishes via Redis pub/sub
-    so ALL workers receive the update (cross-worker broadcast).
-    Baseline is updated AFTER successful publish to prevent data loss.
-    """
-    global last_sent_updated, last_sent_alert_id
-    logger.info("Alert WS Notifier STARTED")
-
-    # Bootstrap: set baseline to latest alert (no flood on restart)
-    if last_sent_updated is None:
-        row = await database2.fetch_one(
-            """
-            SELECT alert_id, updated_date
-            FROM central_alerts
-            ORDER BY updated_date DESC NULLS LAST, alert_id DESC
-            LIMIT 1
-            """
-        )
-        if row:
-            last_sent_updated = row["updated_date"]
-            last_sent_alert_id = row["alert_id"]
-
-    while True:
-        try:
-            # Lightweight check for changes since last baseline
-            rows = await database2.fetch_all(
-                """
-                SELECT alert_id, updated_date
-                FROM central_alerts
-                WHERE (updated_date > :last_time)
-                   OR (updated_date = :last_time AND alert_id > :last_id)
-                ORDER BY updated_date ASC, alert_id ASC
-                """,
-                {
-                    "last_time": last_sent_updated,
-                    "last_id": last_sent_alert_id
-                }
-            )
-
-            if rows:
-                # Save new baseline values BEFORE fetch (to detect next changes)
-                new_last_time = rows[-1]["updated_date"]
-                new_last_id = rows[-1]["alert_id"]
-
-                # Fetch full state (sorted by inc_datetime DESC)
-                full_payload = await _fetch_alerts_payload()
-
-                # Publish to Redis — all workers receive via redis_subscriber
-                await publish_to_redis("central_alerts_channel", full_payload)
-
-                # Also broadcast to local clients (instant delivery)
-                manager.broadcast(full_payload)
-
-                # Update baseline AFTER successful publish (prevents data loss)
-                last_sent_updated = new_last_time
-                last_sent_alert_id = new_last_id
-
-                logger.info(f"Broadcast full state ({len(rows)} changes triggered)")
-
-        except Exception as e:
-            logger.exception(f"Alert WS Notifier error: {e}")
-
-        await asyncio.sleep(1)
-
-
-# ============================================================
-# Auto-Restart Wrappers (crash recovery)
-# ============================================================
-async def run_notifier_with_restart():
-    """Wrapper that restarts alert_ws_notifier if it crashes."""
-    while True:
-        try:
-            logger.info("Starting alert_ws_notifier...")
-            await alert_ws_notifier()
-        except asyncio.CancelledError:
-            logger.info("Notifier cancelled, exiting wrapper")
-            break
-        except Exception as e:
-            logger.exception(f"Notifier CRASHED — restarting in 5s: {e}")
-            await asyncio.sleep(5)
-
-
-async def run_worker_with_restart():
-    """Wrapper that restarts rtm_alert_insert_worker if it crashes."""
-    while True:
-        try:
-            logger.info("Starting rtm_alert_insert_worker...")
-            await rtm_alert_insert_worker()
-        except asyncio.CancelledError:
-            logger.info("Worker cancelled, exiting wrapper")
-            break
-        except Exception as e:
-            logger.exception(f"Worker CRASHED — restarting in 5s: {e}")
-            await asyncio.sleep(5)
-
-
-# ============================================================
-# Lifespan (Startup & Shutdown)
-# ============================================================
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global alert_worker_task, notifier_task, redis_sub_task
-
-    # --- STARTUP ---
-    await database.connect()
-    await database2.connect()
-    await init_redis()
-
-    alert_worker_task = asyncio.create_task(run_worker_with_restart())
-    notifier_task = asyncio.create_task(run_notifier_with_restart())
-    redis_sub_task = asyncio.create_task(redis_subscriber())
-
-    logger.info("Application STARTED — all workers running")
-
-    yield
-
-    # --- SHUTDOWN ---
-    for t in [alert_worker_task, notifier_task, redis_sub_task]:
-        if t:
-            t.cancel()
-            try:
-                await t
-            except asyncio.CancelledError:
-                pass
-
-    if redis_client:
-        await redis_client.aclose()
-    if database.is_connected:
-        await database.disconnect()
-    if database2.is_connected:
-        await database2.disconnect()
-
-    logger.info("Application STOPPED")
-
-
-# ============================================================
-# FastAPI App Creation
-# ============================================================
-app = FastAPI(lifespan=lifespan)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[o.strip() for o in ALLOWED_ORIGINS],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-router = APIRouter()
-app.include_router(router)
-
-
-# ============================================================
-# Escalate API
-# ============================================================
+# -------------------- Escalate API --------------------
 @app.put("/api/escalate/{alert_id}")
 async def escalate_alert(alert_id: int, payload: EscalateRequest):
     """Escalate alert: escalate_status 1 -> 2, update remark and timestamps."""
@@ -1347,9 +1310,7 @@ async def escalate_alert(alert_id: int, payload: EscalateRequest):
     }
 
 
-# ============================================================
-# Dashboard Overview API
-# ============================================================
+# -------------------- Dashboard Overview API --------------------
 @app.get("/api/dashboard")
 async def dashboard_alerts_overview(
     range: Optional[str] = Query("today", enum=["today", "month", "all"])
@@ -1408,9 +1369,7 @@ async def dashboard_alerts_overview(
     }
 
 
-# ============================================================
-# Excel Report Download API
-# ============================================================
+# -------------------- Excel Report Download API --------------------
 @app.get("/api/dashboard/download-client-report")
 async def download_client_report(
     range_type: str = Query("today", enum=["today", "month", "all"])
@@ -1537,9 +1496,7 @@ async def download_client_report(
     )
 
 
-# ============================================================
-# Severity / Cancel APIs
-# ============================================================
+# -------------------- Severity Update API --------------------
 @app.put("/api/severity")
 async def update_severity(data: SeverityUpdate):
     await database2.execute(
@@ -1554,6 +1511,7 @@ async def update_severity(data: SeverityUpdate):
     return {"message": "updated"}
 
 
+# -------------------- Cancel Alert API --------------------
 @app.put("/api/cancel")
 async def cancel_alert(data: CancelUpdate):
     await database2.execute(
@@ -1575,9 +1533,7 @@ async def cancel_alert(data: CancelUpdate):
     return {"message": "Alert cancelled successfully"}
 
 
-# ============================================================
-# Top Ambulances WebSocket
-# ============================================================
+# -------------------- Top Ambulances WebSocket --------------------
 @app.websocket("/ws/top-ambulances")
 async def ws_top_ambulances(websocket: WebSocket):
     await websocket.accept()
@@ -1650,9 +1606,7 @@ async def ws_top_ambulances(websocket: WebSocket):
         await websocket.close()
 
 
-# ============================================================
-# Alert Thresholds APIs
-# ============================================================
+# -------------------- Alert Thresholds API --------------------
 @app.get("/api/alert-thresholds")
 async def get_alert_thresholds():
     query = """
@@ -1716,9 +1670,7 @@ async def update_alert_threshold(id: int, data: AlertThresholdUpdate):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ============================================================
-# Health Check Endpoint
-# ============================================================
+# -------------------- Health Check Endpoint --------------------
 @app.get("/health")
 async def health_check():
     """Health check for load balancers and monitoring."""
