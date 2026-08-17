@@ -158,7 +158,7 @@ async def cached_query(sql, params=None, ttl=15, fetch="all", db=database):
     await init_redis()
 
     key_data = {"db": id(db), "sql": sql, "params": params, "fetch": fetch}
-    raw_key = json.dumps(key_data, sort_keys=True)
+    raw_key = json.dumps(key_data, sort_keys=True, default=str)
     cache_key = "cache_query:" + hashlib.md5(raw_key.encode()).hexdigest()
 
     now = time.time()
