@@ -2000,10 +2000,10 @@ async def _fetch_alerts_payload(incident_id=None, filter_date=None):
 
 @app.websocket("/ws/central_alerts")
 async def central_alerts_ws(websocket: WebSocket):
-    # 1️⃣ Auth FIRST (before accept)
     user_id = await verify_jwt_token(websocket.query_params.get("token"))
     if not user_id:
         await websocket.accept()
+        await websocket.safe_send(...) if hasattr(websocket, "safe_send") else None
         await websocket.send_json({
             "type": "ERROR", "status": 401,
             "message": "Invalid or expired token. Please login again."
@@ -2011,79 +2011,86 @@ async def central_alerts_ws(websocket: WebSocket):
         await websocket.close(code=1008)
         return
 
-    # 2️⃣ Register + send initial full state
     info = await manager.connect(websocket, user_id)
     queue: asyncio.Queue = info["queue"]
+
+    # 🔑 Shared flag — koi bhi task disconnect trigger kare to sab band
+    should_stop = asyncio.Event()
 
     try:
         initial_payload = await _fetch_alerts_payload()
         await manager.safe_send(websocket, initial_payload)
         logger.info(f"📤 Sent ALL_ALERTS on connect (user={user_id})")
 
-        # 3️⃣ Three concurrent tasks — receive, broadcast-drain, heartbeat
+        # ============ RECEIVE LOOP (catch disconnect INSIDE) ============
         async def receive_loop():
-            """Listen for client filter messages + pongs."""
-            while True:
+            while not should_stop.is_set():
                 try:
                     msg = await websocket.receive_json()
                 except WebSocketDisconnect:
-                    raise
-                except Exception:
-                    # Could be a ping/pong control frame from starlette; ignore
-                    continue
+                    logger.info("👋 Client disconnected (receive_loop)")
+                    should_stop.set()           # 🔑 signal others to stop
+                    return
+                except Exception as e:
+                    logger.warning(f"receive_loop error: {e}")
+                    should_stop.set()
+                    return
 
-                # Handle pong (heartbeat ack)
+                # Heartbeat pong
                 if msg.get("type") == "pong":
                     info["last_seen"] = time.time()
                     continue
 
-                # Handle filter request
+                # Filter request
                 incident_id = msg.get("incident_id")
                 filter_date = msg.get("date")
                 try:
                     payload = await _fetch_alerts_payload(incident_id, filter_date)
                     await manager.safe_send(websocket, payload)
-                    logger.info(f"📤 Filter sent (inc={incident_id}, date={filter_date})")
                 except Exception as e:
                     logger.error(f"Filter fetch error: {e}")
-                    await manager.safe_send(websocket, {
-                        "type": "ERROR", "message": "Filter fetch failed"
-                    })
 
+        # ============ DRAIN LOOP (broadcast queue → client) ============
         async def drain_loop():
-            """Drain broadcast queue → send to this client."""
-            while True:
-                payload = await queue.get()
+            while not should_stop.is_set():
+                try:
+                    payload = await asyncio.wait_for(queue.get(), timeout=2)
+                except asyncio.TimeoutError:
+                    continue
                 if not await manager.safe_send(websocket, payload):
-                    return  # client gone
+                    should_stop.set()
+                    return
 
+        # ============ HEARTBEAT LOOP ============
         async def heartbeat_loop():
-            """Ping client periodically; kill if no response."""
-            while True:
+            while not should_stop.is_set():
                 await asyncio.sleep(HEARTBEAT_INTERVAL)
                 if time.time() - info["last_seen"] > HEARTBEAT_TIMEOUT:
-                    logger.warning("💔 Heartbeat timeout, closing")
-                    await websocket.close(code=1011)
+                    logger.warning("💔 Heartbeat timeout")
+                    should_stop.set()
                     return
                 try:
                     await websocket.send_json({"type": "ping"})
                 except Exception:
+                    should_stop.set()
                     return
 
+        # ============ FULL SYNC LOOP (safety net) ============
         async def full_sync_loop():
-            """Safety-net: full state every 15s so NOTHING is missed."""
-            while True:
+            while not should_stop.is_set():
                 await asyncio.sleep(FULL_SYNC_INTERVAL)
                 try:
                     payload = await _fetch_alerts_payload()
                     payload["type"] = "FULL_SYNC"
-                    await manager.safe_send(websocket, payload)
+                    if not await manager.safe_send(websocket, payload):
+                        should_stop.set()
+                        return
                 except Exception as e:
                     logger.error(f"Full sync error: {e}")
 
+        # ============ TOKEN RECHECK LOOP ============
         async def token_recheck_loop():
-            """Re-validate token periodically."""
-            while True:
+            while not should_stop.is_set():
                 await asyncio.sleep(TOKEN_RECHECK_INTERVAL)
                 ok = await verify_jwt_token(websocket.query_params.get("token"))
                 if not ok:
@@ -2091,23 +2098,45 @@ async def central_alerts_ws(websocket: WebSocket):
                         "type": "ERROR", "status": 401,
                         "message": "Session expired. Please login again."
                     })
-                    await websocket.close(code=1008)
+                    should_stop.set()
                     return
 
-        # Run all concurrently
+        # ============ RUN ALL TASKS — wait until ANY stops ============
         tasks = [
-            asyncio.create_task(receive_loop()),
-            asyncio.create_task(drain_loop()),
-            asyncio.create_task(heartbeat_loop()),
-            asyncio.create_task(full_sync_loop()),
-            asyncio.create_task(token_recheck_loop()),
+            asyncio.create_task(receive_loop(),     name="receive"),
+            asyncio.create_task(drain_loop(),       name="drain"),
+            asyncio.create_task(heartbeat_loop(),   name="heartbeat"),
+            asyncio.create_task(full_sync_loop(),  name="full_sync"),
+            asyncio.create_task(token_recheck_loop(), name="token_recheck"),
         ]
-        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+
+        # Wait until first task finishes (or all stop)
+        done, pending = await asyncio.wait(
+            tasks,
+            return_when=asyncio.FIRST_COMPLETED
+        )
+
+        # 🔑 Signal all to stop
+        should_stop.set()
+
+        # Cancel pending tasks
         for t in pending:
             t.cancel()
 
+        # 🔑 Properly await ALL tasks to retrieve exceptions (prevents "never retrieved")
+        for t in tasks:
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+            except WebSocketDisconnect:
+                # Already handled inside, just suppress
+                pass
+            except Exception as e:
+                logger.debug(f"Task {t.get_name()} ended with: {e}")
+
     except WebSocketDisconnect:
-        logger.info("❌ WebSocket client disconnected (client-side)")
+        logger.info("❌ WebSocket client disconnected (outer)")
     except Exception as e:
         logger.exception(f"❌ WebSocket error: {e}")
     finally:
@@ -2116,6 +2145,7 @@ async def central_alerts_ws(websocket: WebSocket):
             await websocket.close()
         except Exception:
             pass
+        logger.info(f"🔌 Cleaned up connection (user={user_id})")
 
 ###################################################################################################
 # # ===============================
