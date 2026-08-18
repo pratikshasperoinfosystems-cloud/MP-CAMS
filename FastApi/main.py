@@ -2,7 +2,7 @@
 # Central Alert Management System (CAMS) — FastAPI Application
 # Production-ready with real-time WebSocket syncing
 # ============================================================
-
+import uuid
 import os
 import time
 import json
@@ -91,6 +91,7 @@ connected_clients: dict[str, List[WebSocket]] = {}
 alert_worker_task = None
 notifier_task = None
 redis_sub_task = None
+denial_worker_task = None
 
 last_sent_updated = None
 last_sent_alert_id = None
@@ -585,6 +586,198 @@ async def rtm_alert_insert_worker():
             logger.error(f"RTM Alert Worker Error: {e}")
 
         await asyncio.sleep(5)
+    ######################################################################################
+
+import uuid
+
+# Columns jo hum MySQL se map kar rahe hain
+MAPPED_COLUMNS = {
+    "inc_ref_id", "amb_no", "amb_default_mobile", "caller_no",
+    "hp_name", "challenge_val", "meaning", "denial_remark",
+    "added_by", "added_date"
+}
+
+# Cache — table ke NOT NULL (bina default) columns ek baar nikaal ke store kar lenge
+_required_defaults_cache = None
+
+# 🔒 Redis leader lock config — sirf EK process actual kaam kare,
+# baaki multi-worker (granian/gunicorn) processes idle rahein
+DENIAL_WORKER_LOCK_KEY = "denial_worker_leader_lock"
+DENIAL_WORKER_LOCK_TTL_MS = 15000   # 15 second lease
+_worker_instance_id = str(uuid.uuid4())   # is process ki unique identity
+
+
+async def try_acquire_denial_worker_leadership() -> bool:
+    """
+    Redis ke through decide karta hai ki is process ko leader
+    banna hai ya nahi. Sirf leader hi MySQL->Postgres sync ka kaam
+    karega. Agar leader crash ho jaaye, TTL expire hone ke baad
+    koi doosra process leadership le lega.
+    """
+    acquired = await redis_client.set(
+        DENIAL_WORKER_LOCK_KEY,
+        _worker_instance_id,
+        nx=True,
+        px=DENIAL_WORKER_LOCK_TTL_MS
+    )
+    if acquired:
+        return True
+
+    current_holder = await redis_client.get(DENIAL_WORKER_LOCK_KEY)
+    if isinstance(current_holder, bytes):
+        current_holder = current_holder.decode()
+
+    if current_holder == _worker_instance_id:
+        # Hum hi leader hain -> lease renew karo
+        await redis_client.pexpire(DENIAL_WORKER_LOCK_KEY, DENIAL_WORKER_LOCK_TTL_MS)
+        return True
+
+    return False
+
+
+async def get_required_default_columns():
+    """
+    denial_escalation_master mein jo columns NOT NULL hain aur unka
+    koi DEFAULT bhi nahi hai (aur jo humare MAPPED_COLUMNS mein nahi
+    hain), unke liye safe default value decide karta hai — taaki
+    insert kabhi NOT NULL violation se fail na ho.
+    """
+    global _required_defaults_cache
+
+    if _required_defaults_cache is not None:
+        return _required_defaults_cache
+
+    rows = await database2.fetch_all(
+        """
+        SELECT column_name, data_type
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'denial_escalation_master'
+          AND is_nullable = 'NO'
+          AND column_default IS NULL
+        """
+    )
+
+    defaults = {}
+    for r in rows:
+        col = r["column_name"]
+        dtype = r["data_type"]
+
+        if col in MAPPED_COLUMNS or col == "id":
+            continue
+
+        if dtype in ("integer", "bigint", "smallint", "numeric"):
+            defaults[col] = 0
+        elif dtype == "boolean":
+            defaults[col] = False
+        elif dtype in ("character varying", "text", "varchar", "char"):
+            defaults[col] = ""
+        elif dtype in ("timestamp without time zone", "timestamp with time zone", "date"):
+            defaults[col] = datetime.utcnow()
+        else:
+            defaults[col] = None
+
+    _required_defaults_cache = defaults
+    logger.info(f"Denial worker: required NOT NULL defaults resolved -> {defaults}")
+    return defaults
+
+
+async def denial_complaints_insert_worker():
+    """Background worker that reads from MySQL (ems_denial_complaints)
+    and inserts new rows into Postgres (denial_escalation_master).
+    Redis leader-lock se protected hai taaki multi-process deployment
+    mein sirf ek instance hi actual kaam kare."""
+    logger.info(f"Denial Complaints Insert Worker STARTED (instance={_worker_instance_id})")
+
+    while True:
+        try:
+            is_leader = await try_acquire_denial_worker_leadership()
+
+            if not is_leader:
+                # Ye process leader nahi hai -> kuch mat karo, sirf wait karo
+                await asyncio.sleep(5)
+                continue
+
+            required_defaults = await get_required_default_columns()
+
+            query = """
+                SELECT
+                    inc_ref_id, amb_no, amb_default_mobile, caller_no,
+                    hp_name, challenge_val, meaning, denial_remark,
+                    added_by, added_date
+                FROM ems_denial_complaints
+                WHERE YEAR(added_date) = YEAR(NOW())
+                  AND MONTH(added_date) = MONTH(NOW())
+                ORDER BY added_date DESC
+                LIMIT 1000;
+            """
+
+            rows = await database.fetch_all(query)   # MySQL connection
+
+            inserted_count = 0
+
+            for row in rows:
+                try:
+                    row = dict(row)
+                    inc_ref_id = row.get("inc_ref_id")
+
+                    if not inc_ref_id:
+                        continue
+
+                    existing = await database2.fetch_one(
+                        """
+                        SELECT id
+                        FROM denial_escalation_master
+                        WHERE inc_ref_id = :inc_ref_id
+                        """,
+                        {"inc_ref_id": inc_ref_id}
+                    )
+
+                    if existing:
+                        continue
+
+                    params = {
+                        "inc_ref_id": inc_ref_id,
+                        "amb_no": row.get("amb_no"),
+                        "amb_default_mobile": row.get("amb_default_mobile"),
+                        "caller_no": row.get("caller_no"),
+                        "hp_name": row.get("hp_name"),
+                        "challenge_val": row.get("challenge_val"),
+                        "meaning": row.get("meaning"),
+                        "denial_remark": row.get("denial_remark"),
+                        "added_by": row.get("added_by"),
+                        "added_date": row.get("added_date"),
+                    }
+                    params.update(required_defaults)
+
+                    columns = ", ".join(params.keys())
+                    placeholders = ", ".join(f":{k}" for k in params.keys())
+
+                    await database2.execute(
+                        f"""
+                        INSERT INTO denial_escalation_master (
+                            {columns}
+                        )
+                        VALUES (
+                            {placeholders}
+                        )
+                        """,
+                        params
+                    )
+                    inserted_count += 1
+
+                except Exception as row_err:
+                    logger.warning(f"Row error (inc_ref_id={row.get('inc_ref_id')}): {row_err}")
+                    continue
+
+            if inserted_count:
+                logger.info(f"Denial worker: inserted {inserted_count} new rows")
+
+        except Exception as e:
+            logger.error(f"Denial Complaints Insert Worker Error: {e}")
+
+        await asyncio.sleep(5)
+    ##################################################################################
 
 
 # ============================================================
@@ -814,7 +1007,7 @@ async def run_worker_with_restart():
 # ============================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global alert_worker_task, notifier_task, redis_sub_task
+    global alert_worker_task, notifier_task, redis_sub_task, denial_worker_task
 
     # --- STARTUP ---
     await database.connect()
@@ -824,13 +1017,14 @@ async def lifespan(app: FastAPI):
     alert_worker_task = asyncio.create_task(run_worker_with_restart())
     notifier_task = asyncio.create_task(run_notifier_with_restart())
     redis_sub_task = asyncio.create_task(redis_subscriber())
+    denial_worker_task = asyncio.create_task(denial_complaints_insert_worker())
 
     logger.info("Application STARTED — all workers running")
 
     yield
 
     # --- SHUTDOWN ---
-    for t in [alert_worker_task, notifier_task, redis_sub_task]:
+    for t in [alert_worker_task, notifier_task, redis_sub_task, denial_worker_task]:
         if t:
             t.cancel()
             try:
