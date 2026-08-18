@@ -592,28 +592,20 @@ import uuid
 
 # Columns jo hum MySQL se map kar rahe hain
 MAPPED_COLUMNS = {
-    "inc_ref_id", "amb_no", "amb_default_mobile", "caller_no",
+    "amb_no", "amb_default_mobile", "caller_no",
     "hp_name", "challenge_val", "meaning", "denial_remark",
-    "added_by", "added_date"
+    "added_by", "added_date", "call_id"        # 👈 call_id add kiya
 }
 
-# Cache — table ke NOT NULL (bina default) columns ek baar nikaal ke store kar lenge
 _required_defaults_cache = None
 
-# 🔒 Redis leader lock config — sirf EK process actual kaam kare,
-# baaki multi-worker (granian/gunicorn) processes idle rahein
 DENIAL_WORKER_LOCK_KEY = "denial_worker_leader_lock"
-DENIAL_WORKER_LOCK_TTL_MS = 15000   # 15 second lease
-_worker_instance_id = str(uuid.uuid4())   # is process ki unique identity
+DENIAL_WORKER_LOCK_TTL_MS = 15000
+_worker_instance_id = str(uuid.uuid4())
 
 
 async def try_acquire_denial_worker_leadership() -> bool:
-    """
-    Redis ke through decide karta hai ki is process ko leader
-    banna hai ya nahi. Sirf leader hi MySQL->Postgres sync ka kaam
-    karega. Agar leader crash ho jaaye, TTL expire hone ke baad
-    koi doosra process leadership le lega.
-    """
+    """Redis leader lock — sirf ek process actual kaam kare."""
     acquired = await redis_client.set(
         DENIAL_WORKER_LOCK_KEY,
         _worker_instance_id,
@@ -628,7 +620,6 @@ async def try_acquire_denial_worker_leadership() -> bool:
         current_holder = current_holder.decode()
 
     if current_holder == _worker_instance_id:
-        # Hum hi leader hain -> lease renew karo
         await redis_client.pexpire(DENIAL_WORKER_LOCK_KEY, DENIAL_WORKER_LOCK_TTL_MS)
         return True
 
@@ -636,12 +627,7 @@ async def try_acquire_denial_worker_leadership() -> bool:
 
 
 async def get_required_default_columns():
-    """
-    denial_escalation_master mein jo columns NOT NULL hain aur unka
-    koi DEFAULT bhi nahi hai (aur jo humare MAPPED_COLUMNS mein nahi
-    hain), unke liye safe default value decide karta hai — taaki
-    insert kabhi NOT NULL violation se fail na ho.
-    """
+    """Postgres ke NOT NULL (bina default) columns ke liye safe defaults."""
     global _required_defaults_cache
 
     if _required_defaults_cache is not None:
@@ -663,7 +649,8 @@ async def get_required_default_columns():
         col = r["column_name"]
         dtype = r["data_type"]
 
-        if col in MAPPED_COLUMNS or col == "id":
+        # in columns ko hum khud fill karte hain
+        if col in MAPPED_COLUMNS or col in ("id", "mysql_id"):
             continue
 
         if dtype in ("integer", "bigint", "smallint", "numeric"):
@@ -683,10 +670,11 @@ async def get_required_default_columns():
 
 
 async def denial_complaints_insert_worker():
-    """Background worker that reads from MySQL (ems_denial_complaints)
-    and inserts new rows into Postgres (denial_escalation_master).
-    Redis leader-lock se protected hai taaki multi-process deployment
-    mein sirf ek instance hi actual kaam kare."""
+    """
+    Background worker: MySQL (ems_denial_complaints) -> Postgres (denial_escalation_master).
+    Current month only. Uses MySQL `id` for uniqueness check.
+    inc_ref_id is intentionally SKIPPED. call_id is included.
+    """
     logger.info(f"Denial Complaints Insert Worker STARTED (instance={_worker_instance_id})")
 
     while True:
@@ -694,15 +682,17 @@ async def denial_complaints_insert_worker():
             is_leader = await try_acquire_denial_worker_leadership()
 
             if not is_leader:
-                # Ye process leader nahi hai -> kuch mat karo, sirf wait karo
                 await asyncio.sleep(5)
                 continue
 
             required_defaults = await get_required_default_columns()
 
+            # ------------------------------------------------
+            # STEP 1: MySQL se current month rows lao
+            # ------------------------------------------------
             query = """
                 SELECT
-                    inc_ref_id, amb_no, amb_default_mobile, caller_no,
+                    id, call_id, amb_no, amb_default_mobile, caller_no,
                     hp_name, challenge_val, meaning, denial_remark,
                     added_by, added_date
                 FROM ems_denial_complaints
@@ -712,41 +702,95 @@ async def denial_complaints_insert_worker():
                 LIMIT 1000;
             """
 
-            rows = await database.fetch_all(query)   # MySQL connection
+            rows = await database.fetch_all(query)
 
+            logger.info("=" * 60)
+            logger.info(f"Denial worker: MySQL returned {len(rows)} rows (current month filter)")
+
+            if len(rows) == 0:
+                try:
+                    sample = await database.fetch_one(
+                        "SELECT MIN(added_date) AS min_dt, MAX(added_date) AS max_dt, "
+                        "COUNT(*) AS total FROM ems_denial_complaints"
+                    )
+                    if sample:
+                        logger.warning(
+                            f"Denial worker: 0 rows for current month! "
+                            f"Table has min_date={sample['min_dt']}, "
+                            f"max_date={sample['max_dt']}, total_rows={sample['total']}"
+                        )
+                except Exception as e:
+                    logger.error(f"Denial worker: sample date check failed: {e}")
+                await asyncio.sleep(10)
+                continue
+
+            # ------------------------------------------------
+            # STEP 2: Sample 3 rows ka data log karo
+            # ------------------------------------------------
+            for idx, r in enumerate(rows[:3]):
+                try:
+                    d = dict(r)
+                    logger.info(
+                        f"Denial worker: sample row {idx} -> "
+                        f"id={d.get('id')!r}, "
+                        f"call_id={d.get('call_id')!r}, "
+                        f"amb_no={d.get('amb_no')!r}, "
+                        f"challenge_val={d.get('challenge_val')!r}, "
+                        f"added_date={d.get('added_date')!r}"
+                    )
+                except Exception as e:
+                    logger.error(f"Denial worker: sample log error: {e}")
+
+            # ------------------------------------------------
+            # STEP 3: Per-row processing
+            # ------------------------------------------------
             inserted_count = 0
+            skipped_existing = 0
+            skipped_no_id = 0
+            failed_insert = 0
+            failed_examples = []
 
             for row in rows:
                 try:
-                    row = dict(row)
-                    inc_ref_id = row.get("inc_ref_id")
+                    d = dict(row)
+                    mysql_id = d.get("id")
 
-                    if not inc_ref_id:
+                    if not mysql_id:
+                        skipped_no_id += 1
                         continue
 
+                    # ------------------------------------------------
+                    # Check karo: ye mysql_id pehle se Postgres mein hai?
+                    # ------------------------------------------------
                     existing = await database2.fetch_one(
                         """
                         SELECT id
                         FROM denial_escalation_master
-                        WHERE inc_ref_id = :inc_ref_id
+                        WHERE mysql_id = :mysql_id
                         """,
-                        {"inc_ref_id": inc_ref_id}
+                        {"mysql_id": mysql_id}
                     )
 
                     if existing:
+                        skipped_existing += 1
                         continue
 
+                    # ------------------------------------------------
+                    # Insert karlo
+                    # ------------------------------------------------
                     params = {
-                        "inc_ref_id": inc_ref_id,
-                        "amb_no": row.get("amb_no"),
-                        "amb_default_mobile": row.get("amb_default_mobile"),
-                        "caller_no": row.get("caller_no"),
-                        "hp_name": row.get("hp_name"),
-                        "challenge_val": row.get("challenge_val"),
-                        "meaning": row.get("meaning"),
-                        "denial_remark": row.get("denial_remark"),
-                        "added_by": row.get("added_by"),
-                        "added_date": row.get("added_date"),
+                        "id": mysql_id,
+                        "mysql_id": mysql_id,
+                        "call_id": d.get("call_id"),                       # 👈 call_id add kiya
+                        "amb_no": d.get("amb_no"),
+                        "amb_default_mobile": d.get("amb_default_mobile"),
+                        "caller_no": d.get("caller_no"),
+                        "hp_name": d.get("hp_name"),
+                        "challenge_val": d.get("challenge_val"),
+                        "meaning": d.get("meaning"),
+                        "denial_remark": d.get("denial_remark"),
+                        "added_by": d.get("added_by"),
+                        "added_date": d.get("added_date"),
                     }
                     params.update(required_defaults)
 
@@ -755,28 +799,52 @@ async def denial_complaints_insert_worker():
 
                     await database2.execute(
                         f"""
-                        INSERT INTO denial_escalation_master (
-                            {columns}
-                        )
-                        VALUES (
-                            {placeholders}
-                        )
+                        INSERT INTO denial_escalation_master ({columns})
+                        VALUES ({placeholders})
                         """,
                         params
                     )
                     inserted_count += 1
 
                 except Exception as row_err:
-                    logger.warning(f"Row error (inc_ref_id={row.get('inc_ref_id')}): {row_err}")
+                    failed_insert += 1
+                    if len(failed_examples) < 5:
+                        try:
+                            d_err = dict(row)
+                            failed_examples.append({
+                                "id": d_err.get("id"),
+                                "call_id": d_err.get("call_id"),
+                                "amb_no": d_err.get("amb_no"),
+                                "error": str(row_err),
+                            })
+                        except Exception:
+                            failed_examples.append({"error": str(row_err)})
                     continue
 
+            # ------------------------------------------------
+            # STEP 4: Final summary
+            # ------------------------------------------------
+            logger.info(
+                f"Denial worker SUMMARY: "
+                f"fetched={len(rows)}, "
+                f"inserted={inserted_count}, "
+                f"existing={skipped_existing}, "
+                f"no_id={skipped_no_id}, "
+                f"failed={failed_insert}"
+            )
+
+            if failed_examples:
+                logger.warning(
+                    f"Denial worker: failed insert examples -> {failed_examples}"
+                )
+
             if inserted_count:
-                logger.info(f"Denial worker: inserted {inserted_count} new rows")
+                logger.info(f"Denial worker: ✅ inserted {inserted_count} new rows")
 
         except Exception as e:
-            logger.error(f"Denial Complaints Insert Worker Error: {e}")
+            logger.error(f"Denial Complaints Insert Worker Error: {e}", exc_info=True)
 
-        await asyncio.sleep(5)
+        await asyncio.sleep(10)
     ##################################################################################
 
 
