@@ -853,85 +853,12 @@ async def rtm_alert_insert_worker():
 MAPPED_COLUMNS = {
     "amb_no", "amb_default_mobile", "caller_no",
     "hp_name", "challenge_val", "meaning", "denial_remark",
-    "added_by", "added_date", "call_id"
+    "added_by", "added_date", "call_id",
+    "dst_name"  # 👈 district column, required-defaults se skip hoga
 }
 
-# Forced defaults — ye columns hamesha isi value se bharenge
-FORCED_DEFAULTS = {
-    "alert_type": "incident denial",
-}
-
-_required_defaults_cache = None
-
-DENIAL_WORKER_LOCK_KEY = "denial_worker_leader_lock"
-DENIAL_WORKER_LOCK_TTL_MS = 15000
-_worker_instance_id = str(uuid.uuid4())
-
-
-async def try_acquire_denial_worker_leadership() -> bool:
-    """Redis leader lock — sirf ek process actual kaam kare."""
-    acquired = await redis_client.set(
-        DENIAL_WORKER_LOCK_KEY,
-        _worker_instance_id,
-        nx=True,
-        px=DENIAL_WORKER_LOCK_TTL_MS
-    )
-    if acquired:
-        return True
-
-    current_holder = await redis_client.get(DENIAL_WORKER_LOCK_KEY)
-    if isinstance(current_holder, bytes):
-        current_holder = current_holder.decode()
-
-    if current_holder == _worker_instance_id:
-        await redis_client.pexpire(DENIAL_WORKER_LOCK_KEY, DENIAL_WORKER_LOCK_TTL_MS)
-        return True
-
-    return False
-
-
-async def get_required_default_columns():
-    """Postgres ke NOT NULL (bina default) columns ke liye safe defaults."""
-    global _required_defaults_cache
-
-    if _required_defaults_cache is not None:
-        return _required_defaults_cache
-
-    rows = await database2.fetch_all(
-        """
-        SELECT column_name, data_type
-        FROM information_schema.columns
-        WHERE table_schema = 'public'
-          AND table_name = 'denial_escalation_master'
-          AND is_nullable = 'NO'
-          AND column_default IS NULL
-        """
-    )
-
-    defaults = {}
-    for r in rows:
-        col = r["column_name"]
-        dtype = r["data_type"]
-
-        # in columns ko hum khud fill karte hain
-        # FORCED_DEFAULTS bhi skip — warna alert_type ko "" mil jata
-        if col in MAPPED_COLUMNS or col in ("id", "mysql_id") or col in FORCED_DEFAULTS:
-            continue
-
-        if dtype in ("integer", "bigint", "smallint", "numeric"):
-            defaults[col] = 0
-        elif dtype == "boolean":
-            defaults[col] = False
-        elif dtype in ("character varying", "text", "varchar", "char"):
-            defaults[col] = ""
-        elif dtype in ("timestamp without time zone", "timestamp with time zone", "date"):
-            defaults[col] = datetime.utcnow()
-        else:
-            defaults[col] = None
-
-    _required_defaults_cache = defaults
-    logger.info(f"Denial worker: required NOT NULL defaults resolved -> {defaults}")
-    return defaults
+# FORCED_DEFAULTS = {...}  -> same rahega jaisa pehle tha
+# _required_defaults_cache, DENIAL_WORKER_LOCK_KEY, etc. -> sab same rahega
 
 
 async def denial_complaints_insert_worker():
@@ -940,6 +867,9 @@ async def denial_complaints_insert_worker():
     Current month only. Uses MySQL `id` for uniqueness check.
     inc_ref_id is intentionally SKIPPED. call_id is included.
     alert_type is force-set to "incident denial".
+
+    NAYA: dst_name (via ems_mas_districts join on amb_district = dst_id)
+    NAYA: meaning ab raw id nahi, ems_denial_reason join se resolved text hai
     """
     logger.info(f"Denial Complaints Insert Worker STARTED (instance={_worker_instance_id})")
 
@@ -954,17 +884,23 @@ async def denial_complaints_insert_worker():
             required_defaults = await get_required_default_columns()
 
             # ------------------------------------------------
-            # STEP 1: MySQL se current month rows lao
+            # STEP 1: MySQL se current month rows lao (with joins)
             # ------------------------------------------------
             query = """
                 SELECT
-                    id, call_id, amb_no, amb_default_mobile, caller_no,
-                    hp_name, challenge_val, meaning, denial_remark,
-                    added_by, added_date
-                FROM ems_denial_complaints
-                WHERE YEAR(added_date) = YEAR(NOW())
-                  AND MONTH(added_date) = MONTH(NOW())
-                ORDER BY added_date DESC
+                    edc.id, edc.call_id, edc.amb_no, edc.amb_default_mobile, edc.caller_no,
+                    edc.hp_name, edc.challenge_val, edc.denial_remark,
+                    edc.added_by, edc.added_date,
+                    dr.meaning        AS reason_meaning,
+                    dist.dst_name     AS dst_name
+                FROM ems_denial_complaints edc
+                LEFT JOIN ems_denial_reason dr
+                    ON edc.meaning = dr.id
+                LEFT JOIN ems_mas_districts dist
+                    ON edc.amb_district = dist.dst_id
+                WHERE YEAR(edc.added_date) = YEAR(NOW())
+                  AND MONTH(edc.added_date) = MONTH(NOW())
+                ORDER BY edc.added_date DESC
                 LIMIT 1000;
             """
 
@@ -1002,6 +938,8 @@ async def denial_complaints_insert_worker():
                         f"call_id={d.get('call_id')!r}, "
                         f"amb_no={d.get('amb_no')!r}, "
                         f"challenge_val={d.get('challenge_val')!r}, "
+                        f"dst_name={d.get('dst_name')!r}, "
+                        f"reason_meaning={d.get('reason_meaning')!r}, "
                         f"added_date={d.get('added_date')!r}"
                     )
                 except Exception as e:
@@ -1025,7 +963,6 @@ async def denial_complaints_insert_worker():
                         skipped_no_id += 1
                         continue
 
-                    # Check karo: ye mysql_id pehle se Postgres mein hai?
                     existing = await database2.fetch_one(
                         """
                         SELECT id
@@ -1049,16 +986,17 @@ async def denial_complaints_insert_worker():
                         "caller_no": d.get("caller_no"),
                         "hp_name": d.get("hp_name"),
                         "challenge_val": d.get("challenge_val"),
-                        "meaning": d.get("meaning"),
+                        "meaning": d.get("reason_meaning"),   # 👈 join se resolved text
+                        "dst_name": d.get("dst_name"),        # 👈 district name
                         "denial_remark": d.get("denial_remark"),
                         "added_by": d.get("added_by"),
                         "added_date": d.get("added_date"),
                     }
 
-                    # pehle NOT NULL defaults lagao
+                    # pehle NOT NULL defaults lagao (MAPPED_COLUMNS wale skip honge)
                     params.update(required_defaults)
 
-                    # ab forced defaults — alert_type = "incident deny" hamesha
+                    # ab forced defaults
                     params.update(FORCED_DEFAULTS)
 
                     columns = ", ".join(params.keys())
@@ -1073,9 +1011,6 @@ async def denial_complaints_insert_worker():
                     )
                     inserted_count += 1
 
-
-
-                # 👈 Separate try/except — broadcast fail ho to insert count disturb na ho
                     try:
                         await broadcast_new_escalation(
                             call_id=d.get("call_id"),
@@ -1088,7 +1023,8 @@ async def denial_complaints_insert_worker():
                                 "caller_no":         d.get("caller_no"),
                                 "hp_name":           d.get("hp_name"),
                                 "challenge_val":     d.get("challenge_val"),
-                                "meaning":           d.get("meaning"),
+                                "meaning":           d.get("reason_meaning"),
+                                "dst_name":          d.get("dst_name"),
                                 "denial_remark":     d.get("denial_remark"),
                                 "alert_type":        "incident denial",
                                 "added_by":          d.get("added_by"),
@@ -1097,7 +1033,6 @@ async def denial_complaints_insert_worker():
                         )
                     except Exception as b_err:
                         logger.error(f"Denial worker: broadcast failed for id={mysql_id}: {b_err}")
-
 
                 except Exception as row_err:
                     failed_insert += 1
@@ -1138,7 +1073,6 @@ async def denial_complaints_insert_worker():
             logger.error(f"Denial Complaints Insert Worker Error: {e}", exc_info=True)
 
         await asyncio.sleep(10)
-
     
     ##################################################################################
 
@@ -2264,85 +2198,403 @@ async def health_check():
     }
 
 ####################################################################################################
+# def group_by_call_id(records: list[dict]) -> list[dict]:
+#     """Same call_id wale records ko ek hi group/array mein daal deta hai."""
+#     grouped = {}
+#     for r in records:
+#         cid = r.get("call_id")
+#         grouped.setdefault(cid, []).append(r)
+
+#     return [{"call_id": cid, "records": recs} for cid, recs in grouped.items()]
+
+
+# @app.websocket("/ws/denial_alerts")
+# async def websocket_escalation_alerts(websocket: WebSocket):
+#     """Sirf naya record add hone par hit hoga."""
+
+#     await websocket.accept()
+
+#     active_ids = set()
+
+#     try:
+#         query = """
+#             SELECT *
+#             FROM denial_escalation_master
+#             WHERE escalate_status = '1' 
+#             AND (is_deleted = FALSE OR is_deleted IS NULL)
+#             ORDER BY added_date DESC;
+#         """
+
+#         rows = await database2.fetch_all(query)
+#         initial_data = []
+
+#         for row in rows:
+#             d = dict(row)
+#             for k, v in d.items():
+#                 if isinstance(v, datetime):
+#                     d[k] = v.isoformat()
+#             initial_data.append(d)
+#             active_ids.add(d["id"])  # Current IDs track kar lo
+
+#         if initial_data:
+#             grouped_initial = group_by_call_id(initial_data)
+#             await websocket.send_json({
+#                 "type": "INITIAL_LOAD",
+#                 "data": grouped_initial
+#             })
+
+#         # ---------------------------------------------------------
+#         # STEP 2: Loop to check for NEW records
+#         # ---------------------------------------------------------
+#         while True:
+#             await asyncio.sleep(5)  # Har 5 second mein DB check karo
+
+#             current_rows = await database2.fetch_all(query)
+#             current_data = []
+#             current_ids = set()
+
+#             for row in current_rows:
+#                 d = dict(row)
+#                 for k, v in d.items():
+#                     if isinstance(v, datetime):
+#                         d[k] = v.isoformat()
+#                 current_data.append(d)
+#                 current_ids.add(d["id"])
+
+#             # Naye records find karo (jo active_ids mein nahi the)
+#             new_records = [d for d in current_data if d["id"] not in active_ids]
+
+#             # Agar naya record add hua hai tohi WS hit karo — call_id se group karke bhejo
+#             if new_records:
+#                 grouped_new = group_by_call_id(new_records)
+#                 await websocket.send_json(grouped_new)
+
+#             # Active IDs ko update karo
+#             active_ids = current_ids
+
+#     except WebSocketDisconnect:
+#         print("Frontend disconnected from WebSocket")
+#     except Exception as e:
+#         print(f"WebSocket Error: {e}")
+#         await websocket.close()
+
+
+# def group_by_call_id(records: list[dict]) -> list[dict]:
+#     """Same call_id wale records ko ek hi group/array mein daal deta hai,
+#     aur added_date ke hisaab se sabse latest sabse upar rakhta hai."""
+
+#     def parse_date(rec):
+#         val = rec.get("added_date")
+#         if isinstance(val, str):
+#             try:
+#                 return datetime.fromisoformat(val)
+#             except (ValueError, TypeError):
+#                 return datetime.min
+#         elif isinstance(val, datetime):
+#             return val
+#         return datetime.min
+
+#     grouped = {}
+#     for r in records:
+#         cid = r.get("call_id")
+#         grouped.setdefault(cid, []).append(r)
+
+#     result = []
+#     for cid, recs in grouped.items():
+#         recs_sorted = sorted(recs, key=parse_date, reverse=True)
+#         result.append({"call_id": cid, "records": recs_sorted})
+
+#     result.sort(key=lambda g: parse_date(g["records"][0]), reverse=True)
+
+#     return result
+
+
+# async def fetch_current_data(query) -> list[dict]:
+#     """DB se current active (status=1, not deleted, aaj ke) records nikaal kar
+#     JSON-safe dict list return karta hai."""
+#     rows = await database2.fetch_all(query)
+#     data = []
+#     for row in rows:
+#         d = dict(row)
+#         for k, v in d.items():
+#             if isinstance(v, datetime):
+#                 d[k] = v.isoformat()
+#         data.append(d)
+#     return data
+
+
+# @app.websocket("/ws/denial_alerts")
+# async def websocket_escalation_alerts(websocket: WebSocket):
+#     """Har baar poori current list (status=1, not deleted, aaj ke) bhejta hai,
+#     latest added_date sabse upar. Status 2 hote hi record apne aap
+#     list se hat jata hai kyunki wo query mein aata hi nahi.
+#     DB mein koi bhi change hote hi (LISTEN/NOTIFY) turant push hoga.
+#     Existing database2 pool se hi connection liya ja raha hai."""
+
+#     await websocket.accept()
+
+#     last_sent_ids: set = set()
+#     notify_event = asyncio.Event()
+#     db_connection = None   # databases.Connection wrapper
+#     raw_conn = None        # underlying asyncpg connection (LISTEN ke liye)
+
+#     query = """
+#         SELECT *
+#         FROM denial_escalation_master
+#         WHERE escalate_status = '1' 
+#         AND (is_deleted = FALSE OR is_deleted IS NULL)
+#         AND added_date::date = CURRENT_DATE
+#         ORDER BY added_date DESC;
+#     """
+
+#     async def send_if_changed():
+#         """Latest data nikaal kar bhejta hai, sirf agar kuch change hua ho."""
+#         nonlocal last_sent_ids
+#         current_data = await fetch_current_data(query)
+#         current_ids = {d["id"] for d in current_data}
+
+#         if current_ids != last_sent_ids:
+#             grouped_current = group_by_call_id(current_data)
+#             await websocket.send_json({
+#                 "type": "INITIAL_LOAD",
+#                 "data": grouped_current
+#             })
+#             last_sent_ids = current_ids
+
+#     def on_notify(conn, pid, channel, payload):
+#         # DB se turant signal aata hai idhar (INSERT/UPDATE/DELETE hote hi)
+#         notify_event.set()
+
+#     try:
+#         # ---------------------------------------------------------
+#         # STEP 1: Initial load
+#         # ---------------------------------------------------------
+#         initial_data = await fetch_current_data(query)
+#         last_sent_ids = {d["id"] for d in initial_data}
+
+#         grouped_initial = group_by_call_id(initial_data)
+#         await websocket.send_json({
+#             "type": "INITIAL_LOAD",
+#             "data": grouped_initial
+#         })
+
+#         # ---------------------------------------------------------
+#         # STEP 2: database2 ke pool se hi ek connection nikaalo
+#         # aur uska raw asyncpg connection le kar LISTEN lagao
+#         # ---------------------------------------------------------
+#         db_connection = database2.connection()
+#         await db_connection.__aenter__()          # connection open karo (pool se)
+#         raw_conn = db_connection.raw_connection    # underlying asyncpg.Connection
+#         await raw_conn.add_listener("denial_escalation_channel", on_notify)
+
+#         # ---------------------------------------------------------
+#         # STEP 3: Jab bhi DB mein change ho (ya safety-net timeout),
+#         # turant fresh data check karke bhejo
+#         # ---------------------------------------------------------
+#         while True:
+#             try:
+#                 # Notify ka wait — DB change hote hi ye turant trigger hoga
+#                 await asyncio.wait_for(notify_event.wait(), timeout=30)
+#             except asyncio.TimeoutError:
+#                 pass  # 30 sec safety-net poll, agar kabhi notify miss ho jaye
+
+#             notify_event.clear()
+#             await send_if_changed()
+
+#     except WebSocketDisconnect:
+#         print("Frontend disconnected from WebSocket")
+#     except Exception as e:
+#         print(f"WebSocket Error: {e}")
+#         import traceback
+#         traceback.print_exc()
+#         await websocket.close()
+#     finally:
+#         if raw_conn:
+#             try:
+#                 await raw_conn.remove_listener("denial_escalation_channel", on_notify)
+#             except Exception:
+#                 pass
+#         if db_connection:
+#             await db_connection.__aexit__(None, None, None)   # connection pool ko wapas
+
 def group_by_call_id(records: list[dict]) -> list[dict]:
-    """Same call_id wale records ko ek hi group/array mein daal deta hai."""
+    """Same call_id wale records ko ek hi group/array mein daal deta hai,
+    aur added_date ke hisaab se sabse latest sabse upar rakhta hai."""
+
+    def parse_date(rec):
+        val = rec.get("added_date")
+        if isinstance(val, str):
+            try:
+                return datetime.fromisoformat(val)
+            except (ValueError, TypeError):
+                return datetime.min
+        elif isinstance(val, datetime):
+            return val
+        return datetime.min
+
     grouped = {}
     for r in records:
         cid = r.get("call_id")
         grouped.setdefault(cid, []).append(r)
 
-    return [{"call_id": cid, "records": recs} for cid, recs in grouped.items()]
+    result = []
+    for cid, recs in grouped.items():
+        recs_sorted = sorted(recs, key=parse_date, reverse=True)
+        result.append({"call_id": cid, "records": recs_sorted})
+
+    result.sort(key=lambda g: parse_date(g["records"][0]), reverse=True)
+
+    return result
+
+
+async def fetch_current_data(query) -> list[dict]:
+    """DB se current active (status=1, not deleted, aaj ke) records nikaal kar
+    JSON-safe dict list return karta hai."""
+    rows = await database2.fetch_all(query)
+    data = []
+    for row in rows:
+        d = dict(row)
+        for k, v in d.items():
+            if isinstance(v, datetime):
+                d[k] = v.isoformat()
+        data.append(d)
+    return data
+
+
+async def attach_level_info_to_groups(grouped_data: list[dict]) -> list[dict]:
+    """Har call_id group ke liye escalation level/role/severity attach karta hai.
+    Denial records hamesha Level 2 (DM) se start hote hain (is_denial=True).
+    Agar action already liya ja chuka hai (closed), to closed_level use hota hai."""
+
+    for group in grouped_data:
+        call_id = group.get("call_id")
+        records = group.get("records", [])
+        latest_record = records[0] if records else {}
+
+        if await is_closed(call_id):
+            action_details = await get_closed_details(call_id)
+            current_level = to_int(action_details.get("action_by_level")) or 1
+            group["is_closed"] = True
+            group["action_details"] = action_details
+        else:
+            current_level = await get_or_init_escalation_level(
+                call_id, latest_record.get("added_date"), is_denial=True
+            )
+            group["is_closed"] = False
+
+        level_info = get_level_info_for_level(current_level)
+        group["current_level"] = current_level
+        group["current_role"] = level_info["role"]
+        group["current_level_minutes"] = level_info["minutes"]
+        group["severity"] = SEVERITY_BY_LEVEL.get(current_level, "LOW")
+
+    return grouped_data
 
 
 @app.websocket("/ws/denial_alerts")
-async def websocket_escalation_alerts(websocket: WebSocket):
-    """Sirf naya record add hone par hit hoga."""
+async def websocket_denial_alerts(websocket: WebSocket):
+    """Har baar poori current list (status=1, not deleted, aaj ke) bhejta hai,
+    latest added_date sabse upar. Status 2 hote hi record apne aap
+    list se hat jata hai kyunki wo query mein aata hi nahi.
+    DB mein koi bhi change hote hi (LISTEN/NOTIFY) turant push hoga.
+    Existing database2 pool se hi connection liya ja raha hai.
+    Har call_id group ke saath escalation level/role/severity bhi attach hota hai
+    (denial records hamesha Level 2 — DM — se start hote hain)."""
 
     await websocket.accept()
 
-    active_ids = set()
+    last_sent_ids: set = set()
+    notify_event = asyncio.Event()
+    db_connection = None   # databases.Connection wrapper
+    raw_conn = None        # underlying asyncpg connection (LISTEN ke liye)
 
-    try:
-        query = """
-            SELECT *
-            FROM denial_escalation_master
-            WHERE escalate_status = '1' 
-            AND (is_deleted = FALSE OR is_deleted IS NULL)
-            ORDER BY added_date DESC;
-        """
+    query = """
+        SELECT *
+        FROM denial_escalation_master
+        WHERE escalate_status = '1' 
+        AND (is_deleted = FALSE OR is_deleted IS NULL)
+        AND added_date::date = CURRENT_DATE
+        ORDER BY added_date DESC;
+    """
 
-        rows = await database2.fetch_all(query)
-        initial_data = []
+    async def send_if_changed():
+        """Latest data nikaal kar bhejta hai, sirf agar kuch change hua ho.
+        Level/role/severity bhi har group ke saath attach karta hai."""
+        nonlocal last_sent_ids
+        current_data = await fetch_current_data(query)
+        current_ids = {d["id"] for d in current_data}
 
-        for row in rows:
-            d = dict(row)
-            for k, v in d.items():
-                if isinstance(v, datetime):
-                    d[k] = v.isoformat()
-            initial_data.append(d)
-            active_ids.add(d["id"])  # Current IDs track kar lo
-
-        if initial_data:
-            grouped_initial = group_by_call_id(initial_data)
+        if current_ids != last_sent_ids:
+            grouped_current = group_by_call_id(current_data)
+            grouped_current = await attach_level_info_to_groups(grouped_current)
             await websocket.send_json({
                 "type": "INITIAL_LOAD",
-                "data": grouped_initial
+                "count": len(grouped_current),
+                "data": grouped_current
             })
+            last_sent_ids = current_ids
+
+    def on_notify(conn, pid, channel, payload):
+        # DB se turant signal aata hai idhar (INSERT/UPDATE/DELETE hote hi)
+        notify_event.set()
+
+    try:
+        # ---------------------------------------------------------
+        # STEP 1: Initial load
+        # ---------------------------------------------------------
+        initial_data = await fetch_current_data(query)
+        last_sent_ids = {d["id"] for d in initial_data}
+
+        grouped_initial = group_by_call_id(initial_data)
+        grouped_initial = await attach_level_info_to_groups(grouped_initial)
+
+        await websocket.send_json({
+            "type": "INITIAL_LOAD",
+            "count": len(grouped_initial),
+            "data": grouped_initial
+        })
 
         # ---------------------------------------------------------
-        # STEP 2: Loop to check for NEW records
+        # STEP 2: database2 ke pool se hi ek connection nikaalo
+        # aur uska raw asyncpg connection le kar LISTEN lagao
+        # ---------------------------------------------------------
+        db_connection = database2.connection()
+        await db_connection.__aenter__()          # connection open karo (pool se)
+        raw_conn = db_connection.raw_connection    # underlying asyncpg.Connection
+        await raw_conn.add_listener("denial_escalation_channel", on_notify)
+
+        # ---------------------------------------------------------
+        # STEP 3: Jab bhi DB mein change ho (ya safety-net timeout),
+        # turant fresh data check karke bhejo
         # ---------------------------------------------------------
         while True:
-            await asyncio.sleep(5)  # Har 5 second mein DB check karo
+            try:
+                # Notify ka wait — DB change hote hi ye turant trigger hoga
+                await asyncio.wait_for(notify_event.wait(), timeout=30)
+            except asyncio.TimeoutError:
+                pass  # 30 sec safety-net poll, agar kabhi notify miss ho jaye
 
-            current_rows = await database2.fetch_all(query)
-            current_data = []
-            current_ids = set()
-
-            for row in current_rows:
-                d = dict(row)
-                for k, v in d.items():
-                    if isinstance(v, datetime):
-                        d[k] = v.isoformat()
-                current_data.append(d)
-                current_ids.add(d["id"])
-
-            # Naye records find karo (jo active_ids mein nahi the)
-            new_records = [d for d in current_data if d["id"] not in active_ids]
-
-            # Agar naya record add hua hai tohi WS hit karo — call_id se group karke bhejo
-            if new_records:
-                grouped_new = group_by_call_id(new_records)
-                await websocket.send_json(grouped_new)
-
-            # Active IDs ko update karo
-            active_ids = current_ids
+            notify_event.clear()
+            await send_if_changed()
 
     except WebSocketDisconnect:
         print("Frontend disconnected from WebSocket")
     except Exception as e:
         print(f"WebSocket Error: {e}")
+        import traceback
+        traceback.print_exc()
         await websocket.close()
+    finally:
+        if raw_conn:
+            try:
+                await raw_conn.remove_listener("denial_escalation_channel", on_notify)
+            except Exception:
+                pass
+        if db_connection:
+            await db_connection.__aexit__(None, None, None)   # connection pool ko wapas
+
+
+
 
 ##########################################################################################
 # ------------------------------------------------------------------
@@ -2398,17 +2650,28 @@ def get_level_info_for_level(level: int) -> dict:
 
 def elapsed_minutes_since(added_date) -> int:
     """Uses existing to_datetime() helper."""
+    if isinstance(added_date, str):
+        # 'T' ko space se replace karo aur microseconds (.) ke baad ka part hata do
+        added_date = added_date.replace("T", " ").split(".")[0]
+    
     dt = to_datetime(added_date)
     if not dt:
         return 0
-    now = datetime.now(dt.tzinfo) if dt.tzinfo else datetime.now()
+    
+    # 👇 Timezone fix: Agar datetime par timezone nahi hai, to use IST do
+    if dt.tzinfo is None:
+        dt = ist.localize(dt)
+        
+    # 👇 Ab current time aur DB time dono timezone-aware hain
+    now = datetime.now(pytz.UTC)
+    
     return max(0, int((now - dt).total_seconds() // 60))
 
 
 # ===========================================================================
 # FETCHES (use existing serialize_row)
 # ===========================================================================
-async def fetch_central_alerts(call_id: str) -> list:
+async def fetch_central_alerts(call_id) -> list:
     rows = await database2.fetch_all(
         """
         SELECT alert_id, alert_type, incident_id, system_type, severity,
@@ -2420,9 +2683,9 @@ async def fetch_central_alerts(call_id: str) -> list:
                escalated_date, cancel_date, escalated_by,
                cancel_by, remark
         FROM public.central_alerts
-        WHERE alert_id = :call_id
+        WHERE CAST(alert_id AS text) = CAST(:call_id AS text)
         """,
-        {"call_id": call_id},
+        {"call_id": str(call_id)},   # 👈 yahan explicitly string banaya
     )
     return [serialize_row(r) for r in rows]
 
@@ -2434,15 +2697,14 @@ async def fetch_denial_record(call_id: str) -> dict:
                hp_name, challenge_val, meaning, denial_remark,
                alert_type, added_by, added_date
         FROM public.denial_escalation_master
-        WHERE call_id = :call_id
+        WHERE CAST(call_id AS text) = :call_id   -- 👈 Yahan CAST lagaya
         """,
-        {"call_id": call_id},
+        {"call_id": str(call_id)},
     )
     return serialize_row(row) if row else {}
 
-
 # ===========================================================================
-# PAYLOAD BUILDER
+# PAYLOAD BUILDER — single call_id ke liye combined payload (dono tables)
 # ===========================================================================
 async def build_escalation_payload(
     call_id: str,
@@ -2450,43 +2712,159 @@ async def build_escalation_payload(
     current_level: int,
     event_type: str = "new_escalation_alert",
     extra: dict = None,
+    central_alerts_data: list = None  # 👈 Yeh add kiya
 ) -> dict:
-    central_alerts = await fetch_central_alerts(call_id)
+    # 👇 Agar data pass hua to wahi use karo, warna DB se fetch karo
+    if central_alerts_data is not None:
+        central_alerts = central_alerts_data
+    else:
+        central_alerts = await fetch_central_alerts(call_id)
+        
     level_info = get_level_info_for_level(current_level)
-    severity = SEVERITY_BY_LEVEL.get(current_level, "LOW")   # 👈 NEW
+    severity = SEVERITY_BY_LEVEL.get(current_level, "LOW")
 
     payload = {
         "type": event_type,
         "call_id": call_id,
         "denial_record": denial_record,
         "central_alerts": central_alerts,
-        "level_info": LEVEL_INFO_CENTRAL,
         "current_level": current_level,
         "current_role": level_info["role"],
         "current_level_minutes": level_info["minutes"],
-        "severity": severity,                                  # 👈 NEW
+        "severity": severity,
         "escalated_at": datetime.utcnow().isoformat(),
     }
     if extra:
         payload.update(extra)
     return payload
 
+# ===========================================================================
+# ===========================================================================
+# PAYLOAD BUILDER
+# ===========================================================================
+async def build_all_escalation_payloads(requested_level: int = None) -> list:
+    """Saare alerts (central + denial) ko ek hi list mein laata hai,
+    unhe time ke hisaab se DESC (latest upar) sort karta hai."""
+    
+    # Fetch denial records (sirf un case mein lao jab level 1 na ho)
+    denial_rows = []
+    if requested_level is None or requested_level != 1:
+        denial_rows = await database2.fetch_all(
+            """
+            SELECT id, mysql_id, call_id, amb_no, amb_default_mobile, caller_no,
+                   hp_name, challenge_val, meaning, denial_remark,
+                   alert_type, added_by, added_date
+            FROM public.denial_escalation_master
+            WHERE added_date::date = CURRENT_DATE
+            ORDER BY added_date DESC
+            LIMIT 100
+            """
+        )
 
+    # Fetch central alerts (hamesha laao)
+    central_rows = await database2.fetch_all(
+        """
+        SELECT *
+        FROM public.central_alerts
+        WHERE created_date::date = CURRENT_DATE
+        AND escalate_status = '1'
+        AND is_deleted = false
+        ORDER BY created_date DESC
+        LIMIT 100
+        """
+    )
+
+    unified_alerts = []
+
+    # 1. Denial records ko unified list mein daalo
+    for record in denial_rows:
+        d = serialize_row(record)
+        d["record_source"] = "denial"
+        d["sort_time"] = d.get("added_date")
+        unified_alerts.append(d)
+
+    # 2. Central alerts ko unified list mein daalo
+    for record in central_rows:
+        c = serialize_row(record)
+        c["record_source"] = "central"
+        c["sort_time"] = c.get("created_date")
+        unified_alerts.append(c)
+
+    # 3. Saare alerts ko time ke hisaab se DESC (latest upar) sort karo
+    unified_alerts.sort(key=lambda x: x.get("sort_time") or "", reverse=True)
+
+    # 4. Level info attach karo aur filter lagao
+    filtered_alerts = []
+    for alert in unified_alerts:
+        # Call_id ya incident_id ko as a unique key use karo
+        call_id = str(alert.get("call_id") or alert.get("incident_id") or "")
+        if not call_id or call_id == "0":
+            continue
+
+        # Check if closed or action taken
+        if await is_closed(call_id):
+            action_details = await get_closed_details(call_id)
+            current_level = to_int(action_details.get("action_by_level")) or 1
+            alert["is_closed"] = True
+            alert["action_details"] = action_details
+            
+            if requested_level is not None and current_level != requested_level:
+                continue
+        else:
+            is_denial = (alert.get("record_source") == "denial")
+            current_level = await get_or_init_escalation_level(call_id, alert.get("sort_time"))
+            alert["is_closed"] = False
+            
+            if requested_level is not None and current_level != requested_level:
+                continue
+
+        # Level info add karo
+        level_info = get_level_info_for_level(current_level)
+        alert["current_level"] = current_level
+        alert["current_role"] = level_info["role"]
+        alert["current_level_minutes"] = level_info["minutes"]
+        alert["severity"] = SEVERITY_BY_LEVEL.get(current_level, "LOW")
+        alert["type"] = "current_escalation"
+        
+        # Timezone fix: Ab IST time aayega (DB ke time ke hisaab se), UTC nahi
+        alert["escalated_at"] = datetime.now(ist).isoformat()
+
+        filtered_alerts.append(alert)
+
+    return filtered_alerts
 # ===========================================================================
 # REDIS STATE — per call_id current level + closed flag
 # ===========================================================================
-async def get_or_init_escalation_level(call_id: str, added_date) -> int:
+async def get_or_init_escalation_level(call_id: str, added_date, is_denial: bool = False) -> int:
     key = f"{ESC_LEVEL_REDIS_PREFIX}{call_id}"
     raw = await redis_client.get(key)
 
+    current_level = None
     if raw is not None:
         val = raw if isinstance(raw, str) else raw.decode()
-        parsed = to_int(val)
-        if parsed is not None:
-            return parsed
+        current_level = to_int(val)
 
+    # 👇 FIX: Agar denial record hai aur level 1 (ya None) hai, toh FORCIBLY Level 2 bana do
+    if is_denial and (current_level is None or current_level < 2):
+        current_level = 2
+        await redis_client.set(key, str(current_level))
+        await redis_client.set(
+            f"{ESC_ESCALATED_AT_PREFIX}{call_id}",
+            datetime.utcnow().isoformat()
+        )
+        return current_level
+
+    # Agar Redis mein level hai aur wo 2 ya usse zyada hai, toh wahi return karo
+    if current_level is not None:
+        return current_level
+
+    # Agar Redis mein level hai hi nahi, toh time calculate karo
     elapsed = elapsed_minutes_since(added_date)
     level = get_level_for_elapsed_minutes(elapsed)
+
+    # Agar denial record hai aur time ke hisaab se level 1 aaya, toh usko bhi 2 bana do
+    if is_denial and level < 2:
+        level = 2
 
     await redis_client.set(key, str(level))
     await redis_client.set(
@@ -2627,14 +3005,23 @@ async def _handle_escalation_ws(websocket: WebSocket, requested_level: int, user
             """Queue se messages nikal ke client pe bhejo — level filter lagao."""
             while True:
                 payload = await queue.get()
+                
+                # 👇 1. ALL_ALERTS wala spam yahi drop kar do
+                msg_type = payload.get("type")
+                if msg_type == "ALL_ALERTS":
+                    continue
+                
+                # 👇 2. Sirf Escalation wale messages hi frontend pe jayenge
+                if msg_type not in ["current_escalation", "new_escalation_alert", "escalation_level_changed", "escalation_closed"]:
+                    continue
 
                 # Closed incidents hamesha bhejo (filter se exclude nahi)
-                if payload.get("type") == "escalation_closed":
+                if msg_type == "escalation_closed":
                     if not await manager.safe_send(websocket, payload):
                         break
                     continue
 
-                # Level filter check
+                # Level filter check (sirf uss level ka data bhejo jo user ne manga hai)
                 payload_level = payload.get("current_level")
                 if requested_level is None or payload_level == requested_level:
                     if not await manager.safe_send(websocket, payload):
@@ -2671,69 +3058,30 @@ async def _handle_escalation_ws(websocket: WebSocket, requested_level: int, user
         manager.disconnect(websocket)
 
 
-# ===========================================================================
-# INITIAL LOAD — level filter support ke saath
-# ===========================================================================
 async def send_current_escalations(websocket: WebSocket, requested_level: int = None):
+    """Ek hi combined message bhejta hai — saare records ek array mein,
+    har record mein denial_record + central_alerts dono maujood."""
     try:
-        records = await database2.fetch_all(
-            """
-            SELECT id, mysql_id, call_id, amb_no, amb_default_mobile, caller_no,
-                   hp_name, challenge_val, meaning, denial_remark,
-                   alert_type, added_by, added_date
-            FROM public.denial_escalation_master
-            WHERE call_id IS NOT NULL AND call_id != ''
-            ORDER BY id DESC
-            LIMIT 50
-            """
-        )
+        payloads = await build_all_escalation_payloads(requested_level)
 
-        sent_count = 0
-        for record in records:
-            d = serialize_row(record)
-            call_id = d.get("call_id")
-            if not call_id:
-                continue
-
-            if await is_closed(call_id):
-                action_details = await get_closed_details(call_id)
-                closed_level = to_int(action_details.get("action_by_level")) or 1
-
-                if requested_level is not None and closed_level != requested_level:
-                    continue
-
-                payload = await build_escalation_payload(
-                    call_id=call_id,
-                    denial_record=d,
-                    current_level=closed_level,
-                    event_type="escalation_closed",
-                    extra={"closed": True, **action_details},
-                )
-            else:
-                current_level = await get_or_init_escalation_level(call_id, d.get("added_date"))
-
-                if requested_level is not None and current_level != requested_level:
-                    continue
-
-                payload = await build_escalation_payload(
-                    call_id=call_id,
-                    denial_record=d,
-                    current_level=current_level,
-                    event_type="current_escalation",
-                )
-
-            await websocket.send_json(payload)
-            sent_count += 1
+        await websocket.send_json({
+            "type": "INITIAL_LOAD",
+            "count": len(payloads),
+            "data": payloads
+        })
 
         filter_name = (
             LEVEL_INFO_CENTRAL[requested_level]["role"]
             if requested_level else "ALL"
         )
-        logger.info(f"Escalation WS: sent {sent_count} records (filter: {filter_name})")
+        logger.info(f"Escalation WS: sent {len(payloads)} records in ONE message (filter: {filter_name})")
 
     except Exception as e:
         logger.exception(f"send_current_escalations FAILED: {e}")
-
+        try:
+            await websocket.send_json({"type": "ERROR", "message": str(e)})
+        except Exception:
+            pass
 
 # ===========================================================================
 # WATCHER: TIME-BASED LEVEL BUMP (MDT → DM → ZM → OM → SH → COO → CBO)
@@ -2775,11 +3123,28 @@ async def escalation_level_bump_watcher():
                 if current_level >= 7:
                     continue
 
+                # 👇 FIX: Agar denial record nahi hai, to central_alerts se time uthao
                 d = await fetch_denial_record(call_id)
+                is_denial_rec = True
+                
                 if not d:
-                    continue
+                    is_denial_rec = False
+                    # Central alerts table se latest record uthao
+                                        # Central alerts table se latest record uthao
+                    central_row = await database2.fetch_one(
+                        """SELECT * FROM public.central_alerts 
+                          WHERE CAST(incident_id AS text) = :inc_id   -- 👈 Yahan CAST lagaya
+                          ORDER BY created_date DESC LIMIT 1""",
+                        {"inc_id": str(call_id)}
+                    )
+                    if not central_row:
+                        continue
+                    d = serialize_row(central_row)
 
-                elapsed = elapsed_minutes_since(d.get("added_date"))
+                # Time calculate karo (denial ka added_date ya central ka created_date)
+                check_date = d.get("added_date") if is_denial_rec else d.get("created_date")
+                elapsed = elapsed_minutes_since(check_date)
+                
                 next_level = current_level + 1
                 next_level_minutes = LEVEL_INFO_CENTRAL[next_level]["minutes"]
 
@@ -2796,16 +3161,31 @@ async def escalation_level_bump_watcher():
 
                     await set_escalation_level(call_id, next_level)
 
-                    payload = await build_escalation_payload(
-                        call_id=call_id,
-                        denial_record=d,
-                        current_level=next_level,
-                        event_type="escalation_level_changed",
-                        extra={
-                            "previous_level": current_level,
-                            "previous_role":  LEVEL_INFO_CENTRAL[current_level]["role"],
-                        },
-                    )
+                    # Agar denial record hai, to denial_payload banao, warna central
+                    if is_denial_rec:
+                        payload = await build_escalation_payload(
+                            call_id=call_id,
+                            denial_record=d,
+                            current_level=next_level,
+                            event_type="escalation_level_changed",
+                            extra={
+                                "previous_level": current_level,
+                                "previous_role":  LEVEL_INFO_CENTRAL[current_level]["role"],
+                            },
+                        )
+                    else:
+                        payload = await build_escalation_payload(
+                            call_id=call_id,
+                            denial_record={},
+                            central_alerts_data=[d],
+                            current_level=next_level,
+                            event_type="escalation_level_changed",
+                            extra={
+                                "previous_level": current_level,
+                                "previous_role":  LEVEL_INFO_CENTRAL[current_level]["role"],
+                            },
+                        )
+                        
                     manager.broadcast(payload)
 
                     logger.info(
@@ -2835,7 +3215,8 @@ async def broadcast_new_escalation(call_id: str, denial_record: dict):
         if await is_closed(call_id):
             return
 
-        current_level = await get_or_init_escalation_level(call_id, denial_record.get("added_date"))
+        # 👈 Yahan is_denial=True pass kar rahe hain
+        current_level = await get_or_init_escalation_level(call_id, denial_record.get("added_date"), is_denial=True)
 
         payload = await build_escalation_payload(
             call_id=call_id,
