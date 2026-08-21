@@ -94,8 +94,8 @@ redis_sub_task = None
 denial_worker_task = None
 esc_bump_task = None
 
-last_sent_updated = None
-last_sent_alert_id = None
+# last_sent_updated = None
+# last_sent_alert_id = None
 
 security = HTTPBearer()
 
@@ -558,7 +558,8 @@ async def rtm_alert_insert_worker():
                             "paramedic_mobile": to_int(row.get("paramedic_mobile")),
                         }
 
-                        await database2.execute(
+                        # 👇 NAYA: fetch_one + RETURNING use karo taaki pata chale insert hua ya nahi
+                        inserted_row = await database2.fetch_one(
                             """
                             INSERT INTO central_alerts (
                                 alert_type, incident_id, system_type, severity,
@@ -575,9 +576,20 @@ async def rtm_alert_insert_worker():
                                 :paramedic_name, :paramedic_mobile
                             )
                             ON CONFLICT (incident_id, alert_type) DO NOTHING
+                            RETURNING *
                             """,
                             params
                         )
+
+                        # 👇 Agar insert hua (conflict nahi hua) → broadcast karo
+                        if inserted_row:
+                            inserted_dict = serialize_row(inserted_row)
+                            try:
+                                await broadcast_new_central_alert(inserted_dict)
+                            except Exception as b_err:
+                                logger.error(
+                                    f"Broadcast failed for incident_id={params.get('incident_id')}: {b_err}"
+                                )
 
                 except Exception as row_err:
                     logger.warning(f"Row error (incident_id={row.get('inc_ref_id')}): {row_err}")
@@ -1202,68 +1214,63 @@ async def _fetch_alerts_payload(incident_id=None, filter_date=None):
 # ============================================================
 # Alert WebSocket Notifier (with Redis pub/sub)
 # ============================================================
-async def alert_ws_notifier():
-    """
-    Polls central_alerts every 1s for changes.
-    On change: fetches full state and publishes via Redis pub/sub
-    so ALL workers receive the update (cross-worker broadcast).
-    Baseline is updated AFTER successful publish to prevent data loss.
-    """
-    global last_sent_updated, last_sent_alert_id
-    logger.info("Alert WS Notifier STARTED")
+# ===============================
+# ALERT CHANGE NOTIFIER
+# ===============================
 
-    # Bootstrap: set baseline to latest alert (no flood on restart)
-    if last_sent_updated is None:
-        row = await database2.fetch_one(
-            """
-            SELECT alert_id, updated_date
-            FROM central_alerts
-            ORDER BY updated_date DESC NULLS LAST, alert_id DESC
-            LIMIT 1
-            """
-        )
-        if row:
-            last_sent_updated = row["updated_date"]
-            last_sent_alert_id = row["alert_id"]
+last_sent_updated = None
+last_sent_alert_id = None
+
+
+async def alert_ws_notifier():
+    global last_sent_updated, last_sent_alert_id
+    print("🚀 Alert WebSocket Notifier STARTED")
 
     while True:
         try:
-            rows = await database2.fetch_all(
-                """
-                SELECT alert_id, updated_date
-                FROM central_alerts
-                WHERE (updated_date > :last_time)
-                   OR (updated_date = :last_time AND alert_id > :last_id)
-                ORDER BY updated_date ASC, alert_id ASC
-                """,
-                {
-                    "last_time": last_sent_updated,
-                    "last_id": last_sent_alert_id
-                }
-            )
+            if last_sent_updated is None:
+                # 👇 COALESCE use karo — agar updated_date NULL hai to created_date se lo
+                row = await database2.fetch_one(
+                    """
+                    SELECT alert_id, COALESCE(updated_date, created_date) AS last_time
+                    FROM central_alerts
+                    ORDER BY COALESCE(updated_date, created_date) DESC, alert_id DESC
+                    LIMIT 1
+                    """
+                )
+                if row:
+                    last_sent_updated = row["last_time"]
+                    last_sent_alert_id = row["alert_id"]
 
-            if rows:
-                # Save new baseline BEFORE fetch (to detect next changes)
-                new_last_time = rows[-1]["updated_date"]
-                new_last_id = rows[-1]["alert_id"]
+            else:
+                rows = await database2.fetch_all(
+                    """
+                    SELECT *
+                    FROM central_alerts
+                    WHERE (COALESCE(updated_date, created_date) > :last_time)
+                       OR (COALESCE(updated_date, created_date) = :last_time AND alert_id > :last_id)
+                    ORDER BY COALESCE(updated_date, created_date) ASC, alert_id ASC
+                    """,
+                    {
+                        "last_time": last_sent_updated,
+                        "last_id": last_sent_alert_id
+                    }
+                )
 
-                # Fetch full state (sorted by inc_datetime DESC)
-                full_payload = await _fetch_alerts_payload()
+                if rows:
+                    last_row = rows[-1]
+                    last_sent_updated = last_row["updated_date"] if last_row["updated_date"] else last_row["created_date"]
+                    last_sent_alert_id = last_row["alert_id"]
 
-                # Publish to Redis — all workers receive via redis_subscriber
-                await publish_to_redis("central_alerts_channel", full_payload)
-
-                # Also broadcast to local clients (instant delivery)
-                manager.broadcast(full_payload)
-
-                # Update baseline AFTER successful publish
-                last_sent_updated = new_last_time
-                last_sent_alert_id = new_last_id
-
-                logger.info(f"Broadcast full state ({len(rows)} changes triggered)")
+                    # 👇 FULL payload bhejo ALL_ALERTS format me (same as initial load)
+                    # _fetch_alerts_payload() already ALL_ALERTS format me return karta hai
+                    # with today_all + by_severity + counts — bilkul same structure
+                    full_payload = await _fetch_alerts_payload()
+                    manager.broadcast(full_payload)
+                    print(f"📡 WS sent ALL_ALERTS update ({len(rows)} changes detected)")
 
         except Exception as e:
-            logger.exception(f"Alert WS Notifier error: {e}")
+            print("❌ Alert WS Notifier Error:", e)
 
         await asyncio.sleep(1)
 
@@ -1670,95 +1677,210 @@ async def rtm_alerts_ws(websocket: WebSocket):
 
 
 # -------------------- Central Alerts WebSocket --------------------
+
+ 
+# ---- tuning knobs ----
+MAX_CONSECUTIVE_RECV_ERRORS = 5  # only bail if the socket is TRULY broken (not for one bad message)
+RECV_ERROR_WINDOW = 10           # errors must cluster within this many seconds to count as "truly broken"
+ 
+ 
+def _bump_error(consecutive_errors: int, first_error_ts):
+    """Track error bursts so a single stray error never kills a healthy connection,
+    but a genuinely dead socket (many errors back-to-back) still gets cleaned up."""
+    now = time.monotonic()
+    if first_error_ts is None or now - first_error_ts > RECV_ERROR_WINDOW:
+        return 1, now
+    return consecutive_errors + 1, first_error_ts
+ 
+ 
 @app.websocket("/ws/central_alerts")
 async def central_alerts_ws(websocket: WebSocket):
+
     user_id = await verify_jwt_token(websocket.query_params.get("token"))
     if not user_id:
         await websocket.accept()
         await websocket.send_json({
-            "type": "ERROR", "status": 401,
+            "type": "ERROR",
+            "status": 401,
             "message": "Invalid or expired token. Please login again."
         })
         await websocket.close(code=1008)
         return
 
-    info = await manager.connect(websocket, user_id)
-    queue: asyncio.Queue = info["queue"]
-    should_stop = asyncio.Event()
+    conn_info = await manager.connect(websocket, user_id)
+    queue = conn_info["queue"]
+
+    print("🔌 WebSocket client connected")
 
     try:
-        # Send initial full state
-        payload = await _fetch_alerts_payload()
-        if not await manager.safe_send(websocket, payload):
-            return
-        logger.info(f"Sent ALL_ALERTS on connect (user={user_id})")
+        # =====================================================
+        # 1️⃣ SEND DATA ON CONNECT (TODAY DEFAULT)
+        # =====================================================
+        rows = await cached_query(
+            """
+            SELECT *
+            FROM central_alerts
+            WHERE inc_datetime >= CURRENT_DATE
+              AND inc_datetime < CURRENT_DATE + INTERVAL '1 day'
+            ORDER BY inc_datetime DESC, alert_id DESC
+            """,
+            ttl=3,
+            fetch="all",
+            db=database2
+        )
 
-        # --- RECEIVE LOOP: handles frontend filter requests ---
-        async def receive_loop():
-            while not should_stop.is_set():
-                try:
-                    msg = await websocket.receive_json()
-                except WebSocketDisconnect:
-                    logger.info(f"Client disconnected (user={user_id})")
-                    should_stop.set()
-                    return
-                except Exception as e:
-                    logger.warning(f"receive_loop error: {e}")
-                    should_stop.set()
-                    return
+        today_all = [serialize_row(r) for r in rows]
+        by_severity = group_by_severity(rows)
+
+        # ===============================
+        # COUNTS (108 / 102)
+        # ===============================
+        count_rows = await cached_query(
+            """
+            SELECT
+                system_type,
+                severity,
+                COUNT(*) AS total
+            FROM central_alerts
+            WHERE inc_datetime >= CURRENT_DATE
+              AND inc_datetime < CURRENT_DATE + INTERVAL '1 day'
+              AND escalate_status = '1'
+              AND system_type IN ('108', '102')
+            GROUP BY system_type, severity
+            """,
+            ttl=3,
+            fetch="all",
+            db=database2
+        )
+
+        counts = {
+            "total": {"108": 0, "102": 0},
+            "severity": {"108": {}, "102": {}}
+        }
+
+        for r in count_rows:
+            system = r["system_type"]
+            severity = r["severity"]
+            total = r["total"]
+
+            counts["total"][system] += total
+            counts["severity"][system][severity] = total
+
+        await websocket.send_json({
+            "type": "ALL_ALERTS",
+            "data": {
+                "today_all": today_all,
+                "by_severity": by_severity,
+                "counts": counts
+            }
+        })
+
+        print("📤 Sent ALL_ALERTS on connect")
+
+        # =====================================================
+        # 2️⃣ TWO CONCURRENT LOOPS — real-time updates ke liye
+        # =====================================================
+
+        async def drain_loop():
+            """Queue se broadcast messages nikal ke client pe bhejo."""
+            while True:
+                payload = await queue.get()
+                msg_type = payload.get("type")
+
+                # 👇 Sirf ALL_ALERTS type bhejo — bilkul same format as initial load
+                # Frontend ko kuch nahi badalna padega
+                if msg_type == "ALL_ALERTS":
+                    if not await manager.safe_send(websocket, payload):
+                        break
+
+        async def client_listener():
+            """Client se filter requests receive karo."""
+            while True:
+                msg = await websocket.receive_json()
 
                 incident_id = msg.get("incident_id")
-                filter_date = msg.get("date")
-                try:
-                    payload = await _fetch_alerts_payload(incident_id, filter_date)
-                    if not await manager.safe_send(websocket, payload):
-                        should_stop.set()
-                        return
-                except Exception as e:
-                    logger.error(f"Filter fetch error: {e}")
+                filter_date = msg.get("date")  # YYYY-MM-DD
 
-        # --- DRAIN LOOP: processes broadcast queue ---
-        async def drain_loop():
-            while not should_stop.is_set():
-                try:
-                    payload = await asyncio.wait_for(queue.get(), timeout=2)
-                except asyncio.TimeoutError:
-                    continue
-                if not await manager.safe_send(websocket, payload):
-                    should_stop.set()
-                    return
+                conditions = []
+                params = {}
 
-        # Run both loops concurrently
-        tasks = [
-            asyncio.create_task(receive_loop(), name="receive"),
-            asyncio.create_task(drain_loop(),   name="drain"),
-        ]
+                # incident filter
+                if incident_id:
+                    conditions.append("incident_id = :incident_id")
+                    params["incident_id"] = str(incident_id)
 
-        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-        should_stop.set()
+                # created_date filter
+                if filter_date:
+                    start_dt = datetime.strptime(filter_date, "%Y-%m-%d")
+                    end_dt = start_dt + timedelta(days=1)
 
+                    conditions.append("""
+                        created_date >= :start_date
+                        AND created_date < :end_date
+                    """)
+
+                    params["start_date"] = start_dt
+                    params["end_date"] = end_dt
+                else:
+                    # default today logic
+                    conditions.append("""
+                        inc_datetime >= CURRENT_DATE
+                        AND inc_datetime < CURRENT_DATE + INTERVAL '1 day'
+                    """)
+
+                where_clause = " AND ".join(conditions)
+
+                query = f"""
+                    SELECT *
+                    FROM central_alerts
+                    WHERE {where_clause}
+                    ORDER BY inc_datetime DESC, alert_id DESC
+                """
+
+                if filter_date:
+                    rows = await database2.fetch_all(query, params)
+                else:
+                    rows = await cached_query(
+                        query,
+                        params=params,
+                        ttl=3,
+                        fetch="all",
+                        db=database2
+                    )
+
+                today_all = [serialize_row(r) for r in rows]
+                by_severity = group_by_severity(rows)
+
+                await manager.safe_send(websocket, {
+                    "type": "ALL_ALERTS",
+                    "data": {
+                        "today_all": today_all,
+                        "by_severity": by_severity,
+                        "counts": counts
+                    }
+                })
+
+                print(f"📤 Sent alerts (incident_id={incident_id}, date={filter_date})")
+
+        # 👇 Dono loops concurrently chalao
+        sender = asyncio.create_task(drain_loop())
+        receiver = asyncio.create_task(client_listener())
+
+        done, pending = await asyncio.wait(
+            [sender, receiver], return_when=asyncio.FIRST_COMPLETED
+        )
         for t in pending:
             t.cancel()
-        for t in tasks:
-            try:
-                await t
-            except (asyncio.CancelledError, WebSocketDisconnect):
-                pass
-            except Exception as e:
-                logger.debug(f"Task {t.get_name()} ended: {e}")
+        for t in done:
+            if t.exception():
+                logger.exception(f"central_alerts WS task FAILED: {t.exception()}")
 
     except WebSocketDisconnect:
-        logger.info(f"WebSocket disconnected (user={user_id})")
+        print("❌ WebSocket client disconnected")
     except Exception as e:
-        logger.exception(f"WebSocket error: {e}")
+        print(f"❌ WebSocket Error: {e}")
     finally:
         manager.disconnect(websocket)
-        try:
-            await websocket.close()
-        except Exception:
-            pass
-        logger.info(f"Cleaned up connection (user={user_id})")
-
 
 # -------------------- Escalate API --------------------
 @app.put("/api/escalate/{alert_id}")
@@ -2632,6 +2754,81 @@ ESC_BUMP_LOCK_KEY           = "esc_bump_leader_lock"
 ESC_BUMP_LOCK_TTL_MS        = 30000
 _esc_bump_instance_id       = str(uuid.uuid4())
 
+def normalize_vehicle_number(v) -> str:
+    """
+    Vehicle number ko ek standard format me laata hai.
+    'TT 00 MP 0001' → 'TT00MP0001'
+    'TT-00-MP-0001' → 'TT00MP0001'
+    'tt00mp0001'    → 'TT00MP0001'
+    
+    Saare spaces, hyphens, dots, underscores hata ke uppercase kar deta hai.
+    """
+    if not v:
+        return ""
+    # String me convert, then saari special chars hata do, uppercase karo
+    s = str(v).upper()
+    for ch in [" ", "-", ".", "_", "/"]:
+        s = s.replace(ch, "")
+    return s.strip()
+
+
+def extract_ambulance_number_from_payload(payload: dict) -> str:
+    """
+    Kisi bhi escalation payload se ambulance number nikalta hai
+    aur normalize karke return karta hai.
+    """
+    # Direct fields
+    amb = (
+        payload.get("ambulance_no")
+        or payload.get("amb_no")
+        or payload.get("vehicleNumber")
+    )
+
+    # denial_record ke andar
+    if not amb:
+        dr = payload.get("denial_record") or {}
+        amb = dr.get("amb_no") or dr.get("ambulance_no")
+
+    # central_alerts list ke andar
+    if not amb:
+        for ca in (payload.get("central_alerts") or []):
+            amb = ca.get("ambulance_no") or ca.get("amb_no")
+            if amb:
+                break
+
+    # 👇 Normalize karke return karo
+    return normalize_vehicle_number(amb)
+
+
+import httpx
+
+FCM_SERVER_KEY = "AAAAdHbcA2w:APA91bGpaFIHWqD35tEQR0suCf_IRdOysTOvMsObjFgeIzGS_G2daBJjmRJrNyzQ13R5wrqBI9iVUTm-Ns_pIcs2R__m1s48RBNl__1FkFoQWAyUMZ4OPsDHNFg0a_rd2F9lXhHfInQB"   # 👈 yahan apni FCM key daalo
+
+async def send_fcm_push(token: str, title: str, body: str, data: dict = None):
+    """Firebase Cloud Messaging push notification bhejo."""
+    if not token:
+        return
+    try:
+        message = {
+            "to": token,
+            "notification": {"title": title, "body": body},
+            "data": data or {},
+            "android": {"priority": "high"},
+            "apns": {"payload": {"aps": {"sound": "default"}}}
+        }
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                "https://fcm.googleapis.com/fcm/send",
+                json=message,
+                headers={
+                    "Authorization": f"key={FCM_SERVER_KEY}",
+                    "Content-Type": "application/json"
+                }
+            )
+            logger.info(f"FCM push sent to {token[:15]}... status={resp.status_code}")
+    except Exception as e:
+        logger.exception(f"send_fcm_push FAILED: {e}")
+
 
 # ===========================================================================
 # HELPERS (time → level)
@@ -2663,7 +2860,7 @@ def elapsed_minutes_since(added_date) -> int:
         dt = ist.localize(dt)
         
     # 👇 Ab current time aur DB time dono timezone-aware hain
-    now = datetime.now(pytz.UTC)
+    now = datetime.now(ist)
     
     return max(0, int((now - dt).total_seconds() // 60))
 
@@ -2745,7 +2942,7 @@ async def build_escalation_payload(
 async def build_all_escalation_payloads(requested_level: int = None) -> list:
     """Saare alerts (central + denial) ko ek hi list mein laata hai,
     unhe time ke hisaab se DESC (latest upar) sort karta hai."""
-    
+
     # Fetch denial records (sirf un case mein lao jab level 1 na ho)
     denial_rows = []
     if requested_level is None or requested_level != 1:
@@ -2793,6 +2990,12 @@ async def build_all_escalation_payloads(requested_level: int = None) -> list:
     # 3. Saare alerts ko time ke hisaab se DESC (latest upar) sort karo
     unified_alerts.sort(key=lambda x: x.get("sort_time") or "", reverse=True)
 
+    # 👇 DEBUG LOG
+    logger.info(
+        f"BUILD PAYLOADS: fetched denial={len(denial_rows)}, "
+        f"central={len(central_rows)}, requested_level={requested_level}"
+    )
+
     # 4. Level info attach karo aur filter lagao
     filtered_alerts = []
     for alert in unified_alerts:
@@ -2807,14 +3010,19 @@ async def build_all_escalation_payloads(requested_level: int = None) -> list:
             current_level = to_int(action_details.get("action_by_level")) or 1
             alert["is_closed"] = True
             alert["action_details"] = action_details
-            
+
             if requested_level is not None and current_level != requested_level:
                 continue
         else:
             is_denial = (alert.get("record_source") == "denial")
-            current_level = await get_or_init_escalation_level(call_id, alert.get("sort_time"))
+            # 👇 FIX: is_denial parameter ab sahi se pass ho raha hai
+            current_level = await get_or_init_escalation_level(
+                call_id,
+                alert.get("sort_time"),
+                is_denial=is_denial
+            )
             alert["is_closed"] = False
-            
+
             if requested_level is not None and current_level != requested_level:
                 continue
 
@@ -2825,11 +3033,24 @@ async def build_all_escalation_payloads(requested_level: int = None) -> list:
         alert["current_level_minutes"] = level_info["minutes"]
         alert["severity"] = SEVERITY_BY_LEVEL.get(current_level, "LOW")
         alert["type"] = "current_escalation"
-        
+
         # Timezone fix: Ab IST time aayega (DB ke time ke hisaab se), UTC nahi
         alert["escalated_at"] = datetime.now(ist).isoformat()
 
+        # 👇 DEBUG LOG
+        amb = alert.get("ambulance_no") or alert.get("amb_no")
+        logger.info(
+            f"  ALERT PASSED FILTER: call_id={call_id}, amb={amb}, "
+            f"level={current_level}, source={alert.get('record_source')}, "
+            f"closed={alert.get('is_closed')}"
+        )
+
         filtered_alerts.append(alert)
+
+    logger.info(
+        f"BUILD PAYLOADS: returning {len(filtered_alerts)} alerts "
+        f"for level={requested_level}"
+    )
 
     return filtered_alerts
 # ===========================================================================
@@ -2844,7 +3065,7 @@ async def get_or_init_escalation_level(call_id: str, added_date, is_denial: bool
         val = raw if isinstance(raw, str) else raw.decode()
         current_level = to_int(val)
 
-    # 👇 FIX: Agar denial record hai aur level 1 (ya None) hai, toh FORCIBLY Level 2 bana do
+    # Denial records hamesha level 2 se start hote hain
     if is_denial and (current_level is None or current_level < 2):
         current_level = 2
         await redis_client.set(key, str(current_level))
@@ -2854,25 +3075,39 @@ async def get_or_init_escalation_level(call_id: str, added_date, is_denial: bool
         )
         return current_level
 
-    # Agar Redis mein level hai aur wo 2 ya usse zyada hai, toh wahi return karo
-    if current_level is not None:
+    # 👇 HAMESHA time-based level calculate karo (sticky hone ka fix)
+    elapsed = elapsed_minutes_since(added_date)
+    time_based_level = get_level_for_elapsed_minutes(elapsed)
+    if is_denial and time_based_level < 2:
+        time_based_level = 2
+    # Cap at 7
+    time_based_level = min(time_based_level, 7)
+
+    # 👇 Agar Redis me level hai hi nahi → time-based use karo + set karo
+    if current_level is None:
+        current_level = time_based_level
+        await redis_client.set(key, str(current_level))
+        await redis_client.set(
+            f"{ESC_ESCALATED_AT_PREFIX}{call_id}",
+            datetime.utcnow().isoformat()
+        )
         return current_level
 
-    # Agar Redis mein level hai hi nahi, toh time calculate karo
-    elapsed = elapsed_minutes_since(added_date)
-    level = get_level_for_elapsed_minutes(elapsed)
+    # 👇 Agar Redis me level hai but time-based level ZYADA hai → upgrade kar do
+    #    (Lekin kabhi downgrade mat karo — agar manually level 7 set kiya hai to rehne do)
+    if time_based_level > current_level:
+        current_level = time_based_level
+        await redis_client.set(key, str(current_level))
+        await redis_client.set(
+            f"{ESC_ESCALATED_AT_PREFIX}{call_id}",
+            datetime.utcnow().isoformat()
+        )
+        logger.info(
+            f"LEVEL RECALC: call_id={call_id} upgraded to {current_level} "
+            f"({LEVEL_INFO_CENTRAL[current_level]['role']}, elapsed={elapsed} min)"
+        )
 
-    # Agar denial record hai aur time ke hisaab se level 1 aaya, toh usko bhi 2 bana do
-    if is_denial and level < 2:
-        level = 2
-
-    await redis_client.set(key, str(level))
-    await redis_client.set(
-        f"{ESC_ESCALATED_AT_PREFIX}{call_id}",
-        datetime.utcnow().isoformat()
-    )
-    return level
-
+    return current_level
 
 async def set_escalation_level(call_id: str, level: int):
     await redis_client.set(f"{ESC_LEVEL_REDIS_PREFIX}{call_id}", str(level))
@@ -2998,38 +3233,130 @@ async def _handle_escalation_ws(websocket: WebSocket, requested_level: int, user
     conn_info = await manager.connect(websocket, user_id)
     queue = conn_info["queue"]
 
+    # Level 1 (MDT) ke liye: pehle vehicleNumber + token lo
+    vehicle_number = None       # 👈 normalized value yahan rahegi
+    vehicle_number_raw = None   # 👈 display ke liye raw value
+    fcm_token = None
+
+    if requested_level == 1:
+        try:
+            await websocket.send_json({
+                "type": "REGISTRATION_REQUIRED",
+                "message": "Please send JSON with vehicleNumber and token"
+            })
+
+            raw = await asyncio.wait_for(websocket.receive_text(), timeout=60)
+            data = json.loads(raw)
+
+            # 👇 Raw value (frontend format - spaces wagarah ke saath)
+            vehicle_number_raw = (
+                data.get("vehicleNumber")
+                or data.get("ambulance_no")
+                or data.get("ambulanceNumber")
+            )
+            fcm_token = data.get("token") or data.get("fcm_token")
+
+            # 👇 NORMALIZE karo — spaces/hyphens hata ke uppercase
+            vehicle_number = normalize_vehicle_number(vehicle_number_raw)
+
+            if not vehicle_number or not fcm_token:
+                await websocket.send_json({
+                    "type": "ERROR",
+                    "message": "vehicleNumber and token are required for level=1"
+                })
+                await websocket.close(code=1008)
+                return
+
+            await websocket.send_json({
+                "type": "REGISTRATION_SUCCESS",
+                "vehicleNumber": vehicle_number_raw,   # raw value user ko dikhao
+                "normalized": vehicle_number,          # 👈 normalized bhi bhej do (debug ke liye)
+                "message": f"You will now receive alerts for ambulance {vehicle_number_raw}"
+            })
+            logger.info(
+                f"Level-1 MDT registered: user={user_id}, "
+                f"raw={vehicle_number_raw}, normalized={vehicle_number}"
+            )
+
+        except asyncio.TimeoutError:
+            await websocket.send_json({
+                "type": "ERROR",
+                "message": "Registration timeout. Send vehicleNumber + token within 60s."
+            })
+            await websocket.close(code=1008)
+            return
+        except WebSocketDisconnect:
+            return
+        except Exception as e:
+            logger.exception(f"Level-1 registration failed: {e}")
+            try:
+                await websocket.close(code=1011)
+            except Exception:
+                pass
+            return
+
     try:
-        await send_current_escalations(websocket, requested_level)
+        await send_current_escalations(
+            websocket,
+            requested_level=requested_level,
+            vehicle_filter=vehicle_number,   # 👈 normalized value
+            fcm_token=fcm_token
+        )
 
         async def drain_loop():
-            """Queue se messages nikal ke client pe bhejo — level filter lagao."""
+            """Queue se messages nikal ke client pe bhejo — level + vehicle filter lagao."""
             while True:
                 payload = await queue.get()
-                
-                # 👇 1. ALL_ALERTS wala spam yahi drop kar do
+
                 msg_type = payload.get("type")
                 if msg_type == "ALL_ALERTS":
                     continue
-                
-                # 👇 2. Sirf Escalation wale messages hi frontend pe jayenge
-                if msg_type not in ["current_escalation", "new_escalation_alert", "escalation_level_changed", "escalation_closed"]:
+
+                if msg_type not in [
+                    "current_escalation",
+                    "new_escalation_alert",
+                    "escalation_level_changed",
+                    "escalation_closed",
+                ]:
                     continue
 
-                # Closed incidents hamesha bhejo (filter se exclude nahi)
+                # Closed incidents — vehicle match check
                 if msg_type == "escalation_closed":
+                    if requested_level == 1 and vehicle_number:
+                        amb = extract_ambulance_number_from_payload(payload)
+                        # 👇 Dono normalized hain, direct compare
+                        if amb and amb != vehicle_number:
+                            continue
                     if not await manager.safe_send(websocket, payload):
                         break
                     continue
 
-                # Level filter check (sirf uss level ka data bhejo jo user ne manga hai)
+                # Level filter
                 payload_level = payload.get("current_level")
                 if requested_level is None or payload_level == requested_level:
+                    # Level 1 ke liye vehicle filter
+                    if requested_level == 1 and vehicle_number:
+                        amb = extract_ambulance_number_from_payload(payload)
+                        # 👇 Dono normalized — direct compare
+                        if not amb or amb != vehicle_number:
+                            continue   # uss ambulance ka nahi → skip
+
+                        # Vehicle match → FCM push
+                        if fcm_token:
+                            await send_fcm_push(
+                                token=fcm_token,
+                                title=f"Ambulance {vehicle_number_raw} - {payload.get('current_role', 'MDT')} Alert",
+                                body=f"Escalation received for level {payload_level}",
+                                data={
+                                    "call_id": str(payload.get("call_id", "")),
+                                    "type": payload.get("type", "")
+                                }
+                            )
+
                     if not await manager.safe_send(websocket, payload):
                         break
-                # Level match nahi karta → skip (filter out)
 
         async def keep_alive_loop():
-            """Client se messages receive karo (connection alive)."""
             while True:
                 try:
                     await websocket.receive_text()
@@ -3058,23 +3385,72 @@ async def _handle_escalation_ws(websocket: WebSocket, requested_level: int, user
         manager.disconnect(websocket)
 
 
-async def send_current_escalations(websocket: WebSocket, requested_level: int = None):
-    """Ek hi combined message bhejta hai — saare records ek array mein,
-    har record mein denial_record + central_alerts dono maujood."""
+async def send_current_escalations(
+    websocket: WebSocket,
+    requested_level: int = None,
+    vehicle_filter: str = None,
+    fcm_token: str = None
+):
+    """Ek hi combined message bhejta hai — saare records ek array mein.
+    Agar vehicle_filter diya gaya (level 1 ke liye), to sirf uss ambulance ke alerts aayenge."""
     try:
         payloads = await build_all_escalation_payloads(requested_level)
+
+        # 👇 DEBUG LOG for level 1
+        if requested_level == 1:
+            logger.info(
+                f"LEVEL 1 SEND: build_all returned {len(payloads)} alerts, "
+                f"vehicle_filter={vehicle_filter}"
+            )
+
+        # Level 1 ke liye: vehicle filter lagao
+        if vehicle_filter:
+            normalized_filter = normalize_vehicle_number(vehicle_filter)
+            filtered = []
+            for p in payloads:
+                # payload se bhi normalize karke compare karo
+                amb_raw = (
+                    p.get("ambulance_no")
+                    or p.get("amb_no")
+                    or p.get("vehicleNumber")
+                )
+                amb_normalized = normalize_vehicle_number(amb_raw)
+
+                # 👇 DEBUG LOG — each vehicle comparison
+                logger.info(
+                    f"  VEHICLE MATCH: payload_amb={amb_raw} → "
+                    f"normalized={amb_normalized}, filter={normalized_filter}, "
+                    f"match={amb_normalized == normalized_filter}"
+                )
+
+                if amb_normalized == normalized_filter:
+                    filtered.append(p)
+            payloads = filtered
+
+        # Agar level 1 + koi match mila to FCM push bhej do
+        if vehicle_filter and fcm_token and len(payloads) > 0:
+            await send_fcm_push(
+                token=fcm_token,
+                title=f"Pending Alerts - {len(payloads)} alert(s)",
+                body=f"You have {len(payloads)} pending alert(s) for your ambulance",
+                data={"count": str(len(payloads))}
+            )
 
         await websocket.send_json({
             "type": "INITIAL_LOAD",
             "count": len(payloads),
-            "data": payloads
+            "data": payloads,
+            "vehicle_filter": vehicle_filter,
         })
 
         filter_name = (
             LEVEL_INFO_CENTRAL[requested_level]["role"]
             if requested_level else "ALL"
         )
-        logger.info(f"Escalation WS: sent {len(payloads)} records in ONE message (filter: {filter_name})")
+        logger.info(
+            f"Escalation WS: sent {len(payloads)} records in ONE message "
+            f"(filter: {filter_name}, vehicle: {vehicle_filter})"
+        )
 
     except Exception as e:
         logger.exception(f"send_current_escalations FAILED: {e}")
@@ -3108,7 +3484,7 @@ async def escalation_level_bump_watcher():
                     key = key.decode()
                 call_id = key.replace(ESC_LEVEL_REDIS_PREFIX, "")
 
-                # ACTION-TAKEN GUARD
+                # ACTION-TAKEN GUARD — agar band ho gaya to cleanup karke skip
                 if await is_closed(call_id) or await is_action_taken(call_id):
                     await redis_client.delete(f"{ESC_LEVEL_REDIS_PREFIX}{call_id}")
                     await redis_client.delete(f"{ESC_ESCALATED_AT_PREFIX}{call_id}")
@@ -3120,80 +3496,100 @@ async def escalation_level_bump_watcher():
                 if current_level is None:
                     continue
 
+                # Agar pehle se level 7 par hai, aage bump nahi karna
                 if current_level >= 7:
                     continue
 
-                # 👇 FIX: Agar denial record nahi hai, to central_alerts se time uthao
+                # 👇 Denial record fetch karo, warna central_alerts se uthao
                 d = await fetch_denial_record(call_id)
                 is_denial_rec = True
-                
+
                 if not d:
                     is_denial_rec = False
-                    # Central alerts table se latest record uthao
-                                        # Central alerts table se latest record uthao
                     central_row = await database2.fetch_one(
                         """SELECT * FROM public.central_alerts 
-                          WHERE CAST(incident_id AS text) = :inc_id   -- 👈 Yahan CAST lagaya
+                          WHERE CAST(incident_id AS text) = :inc_id
                           ORDER BY created_date DESC LIMIT 1""",
                         {"inc_id": str(call_id)}
                     )
                     if not central_row:
+                        # 👇 Record hi nahi mila — stale key hai, delete kar do
+                        await redis_client.delete(f"{ESC_LEVEL_REDIS_PREFIX}{call_id}")
+                        await redis_client.delete(f"{ESC_ESCALATED_AT_PREFIX}{call_id}")
+                        logger.warning(f"STALE KEY CLEANUP: call_id={call_id} (no DB record found)")
                         continue
                     d = serialize_row(central_row)
 
-                # Time calculate karo (denial ka added_date ya central ka created_date)
+                # 👇 Time calculate karo (denial ka added_date ya central ka created_date)
                 check_date = d.get("added_date") if is_denial_rec else d.get("created_date")
+                if not check_date:
+                    logger.warning(f"No date field for call_id={call_id}, skipping")
+                    continue
+
                 elapsed = elapsed_minutes_since(check_date)
-                
-                next_level = current_level + 1
-                next_level_minutes = LEVEL_INFO_CENTRAL[next_level]["minutes"]
 
-                if elapsed >= next_level_minutes:
-                    # Double-check before bump
-                    if await is_closed(call_id) or await is_action_taken(call_id):
-                        await redis_client.delete(f"{ESC_LEVEL_REDIS_PREFIX}{call_id}")
-                        await redis_client.delete(f"{ESC_ESCALATED_AT_PREFIX}{call_id}")
-                        logger.info(
-                            f"SKIP BUMP (action taken): call_id={call_id} stays at "
-                            f"{LEVEL_INFO_CENTRAL[current_level]['role']}"
-                        )
-                        continue
+                # 👇 FIX: Time-based level directly calculate karo (multi-level jump)
+                time_based_level = get_level_for_elapsed_minutes(elapsed)
+                if is_denial_rec and time_based_level < 2:
+                    time_based_level = 2
+                time_based_level = min(time_based_level, 7)
 
-                    await set_escalation_level(call_id, next_level)
+                # Agar time-based level current se zyada nahi → kuch nahi karna
+                if time_based_level <= current_level:
+                    continue
 
-                    # Agar denial record hai, to denial_payload banao, warna central
-                    if is_denial_rec:
-                        payload = await build_escalation_payload(
-                            call_id=call_id,
-                            denial_record=d,
-                            current_level=next_level,
-                            event_type="escalation_level_changed",
-                            extra={
-                                "previous_level": current_level,
-                                "previous_role":  LEVEL_INFO_CENTRAL[current_level]["role"],
-                            },
-                        )
-                    else:
-                        payload = await build_escalation_payload(
-                            call_id=call_id,
-                            denial_record={},
-                            central_alerts_data=[d],
-                            current_level=next_level,
-                            event_type="escalation_level_changed",
-                            extra={
-                                "previous_level": current_level,
-                                "previous_role":  LEVEL_INFO_CENTRAL[current_level]["role"],
-                            },
-                        )
-                        
-                    manager.broadcast(payload)
+                new_level = time_based_level
 
+                # Double-check before bump — race condition se bachne ke liye
+                if await is_closed(call_id) or await is_action_taken(call_id):
+                    await redis_client.delete(f"{ESC_LEVEL_REDIS_PREFIX}{call_id}")
+                    await redis_client.delete(f"{ESC_ESCALATED_AT_PREFIX}{call_id}")
                     logger.info(
-                        f"LEVEL BUMP: call_id={call_id} "
-                        f"{LEVEL_INFO_CENTRAL[current_level]['role']} -> "
-                        f"{LEVEL_INFO_CENTRAL[next_level]['role']} "
-                        f"(elapsed={elapsed} min)"
+                        f"SKIP BUMP (action taken): call_id={call_id} stays at "
+                        f"{LEVEL_INFO_CENTRAL[current_level]['role']}"
                     )
+                    continue
+
+                # 👇 Naya level Redis me set karo
+                await set_escalation_level(call_id, new_level)
+
+                # 👇 Payload banao + broadcast karo
+                if is_denial_rec:
+                    payload = await build_escalation_payload(
+                        call_id=call_id,
+                        denial_record=d,
+                        current_level=new_level,
+                        event_type="escalation_level_changed",
+                        extra={
+                            "previous_level": current_level,
+                            "previous_role":  LEVEL_INFO_CENTRAL[current_level]["role"],
+                            "jumped_levels":  new_level - current_level,
+                            "elapsed_minutes": elapsed,
+                        },
+                    )
+                else:
+                    payload = await build_escalation_payload(
+                        call_id=call_id,
+                        denial_record={},
+                        central_alerts_data=[d],
+                        current_level=new_level,
+                        event_type="escalation_level_changed",
+                        extra={
+                            "previous_level": current_level,
+                            "previous_role":  LEVEL_INFO_CENTRAL[current_level]["role"],
+                            "jumped_levels":  new_level - current_level,
+                            "elapsed_minutes": elapsed,
+                        },
+                    )
+
+                manager.broadcast(payload)
+
+                logger.info(
+                    f"LEVEL BUMP: call_id={call_id} "
+                    f"{LEVEL_INFO_CENTRAL[current_level]['role']} -> "
+                    f"{LEVEL_INFO_CENTRAL[new_level]['role']} "
+                    f"(elapsed={elapsed} min, jumped {new_level - current_level} level(s))"
+                )
 
             if cursor == 0:
                 await asyncio.sleep(60)
@@ -3232,6 +3628,46 @@ async def broadcast_new_escalation(call_id: str, denial_record: dict):
         )
     except Exception as e:
         logger.exception(f"broadcast_new_escalation FAILED: {e}")
+
+async def broadcast_new_central_alert(central_alert_row: dict):
+    """Central alert insert ke turant baad call karo —
+    naya alert MDT (level 1) pe real-time broadcast hoga."""
+    try:
+        call_id = str(
+            central_alert_row.get("incident_id")
+            or central_alert_row.get("alert_id")
+            or ""
+        )
+        if not call_id or call_id == "0":
+            return
+
+        if await is_closed(call_id):
+            return
+
+        # Central alerts ke liye is_denial=False
+        current_level = await get_or_init_escalation_level(
+            call_id,
+            central_alert_row.get("created_date"),
+            is_denial=False
+        )
+
+        payload = await build_escalation_payload(
+            call_id=call_id,
+            denial_record={},
+            central_alerts_data=[central_alert_row],
+            current_level=current_level,
+            event_type="new_escalation_alert",
+        )
+
+        manager.broadcast(payload)
+
+        logger.info(
+            f"NEW CENTRAL ALERT BROADCAST: call_id={call_id}, "
+            f"ambulance={central_alert_row.get('ambulance_no')}, "
+            f"level={current_level} ({LEVEL_INFO_CENTRAL[current_level]['role']})"
+        )
+    except Exception as e:
+        logger.exception(f"broadcast_new_central_alert FAILED: {e}")
 
 
 # ===========================================================================
