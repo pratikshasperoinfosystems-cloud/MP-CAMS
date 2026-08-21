@@ -854,7 +854,7 @@ MAPPED_COLUMNS = {
     "amb_no", "amb_default_mobile", "caller_no",
     "hp_name", "challenge_val", "meaning", "denial_remark",
     "added_by", "added_date", "call_id",
-    "dst_name"  # 👈 district column, required-defaults se skip hoga
+    "amb_district"  # 👈 district column, required-defaults se skip hoga
 }
 
 # FORCED_DEFAULTS = {...}  -> same rahega jaisa pehle tha
