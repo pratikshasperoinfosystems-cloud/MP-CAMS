@@ -35,7 +35,8 @@ from dotenv import load_dotenv
 
 from database import database
 from database2 import database2
-
+import firebase_admin
+from firebase_admin import credentials, messaging
 
 # ============================================================
 # Environment Configuration
@@ -126,7 +127,7 @@ async def publish_to_redis(channel: str, payload: dict):
 
 async def redis_subscriber():
     """
-    Subscribe to Redis channels and broadcast received messages to local clients.
+    Subscribe to Redis channel and push received messages to local client queues.
     Runs in every worker process to enable cross-worker WebSocket broadcasts.
     """
     logger.info("Redis Subscriber STARTED")
@@ -139,7 +140,18 @@ async def redis_subscriber():
             if message["type"] == "message":
                 try:
                     payload = json.loads(message["data"])
-                    manager.broadcast(payload)
+
+                    # 👇 Direct push to local queues (NOT via manager.broadcast — avoids loop)
+                    dead = []
+                    for ws, info in manager.active_connections.items():
+                        try:
+                            info["queue"].put_nowait(payload)
+                        except asyncio.QueueFull:
+                            logger.warning("Queue full, dropping client")
+                            dead.append(ws)
+                    for ws in dead:
+                        manager.disconnect(ws)
+
                 except Exception as e:
                     logger.error(f"Redis subscriber parse error: {e}")
     except asyncio.CancelledError:
@@ -334,6 +346,42 @@ def hhmmss_to_seconds(value: str) -> int:
         return int(h) * 3600 + int(m) * 60 + int(s)
     except Exception:
         return 0
+
+def format_seconds_human(seconds):
+    """Seconds ko human-readable format me convert karta hai.
+    
+    Examples:
+        45     → "45 sec"
+        90     → "1 min 30 sec"
+        300    → "5 min"
+        3600   → "1 hr"
+        3900   → "1 hr 5 min"
+        2880   → "48 min"
+    """
+    if seconds is None:
+        return "N/A"
+
+    seconds = int(seconds)
+
+    if seconds < 60:
+        return f"{seconds} sec"
+
+    minutes = seconds // 60
+    remaining_seconds = seconds % 60
+
+    if minutes < 60:
+        parts = [f"{minutes} min"]
+        if remaining_seconds > 0:
+            parts.append(f"{remaining_seconds} sec")
+        return " ".join(parts)
+
+    hours = minutes // 60
+    remaining_minutes = minutes % 60
+
+    parts = [f"{hours} hr"]
+    if remaining_minutes > 0:
+        parts.append(f"{remaining_minutes} min")
+    return " ".join(parts)
 
 
 def hash_filter(data: dict):
@@ -865,62 +913,126 @@ async def rtm_alert_insert_worker():
 MAPPED_COLUMNS = {
     "amb_no", "amb_default_mobile", "caller_no",
     "hp_name", "challenge_val", "meaning", "denial_remark",
-    "added_by", "added_date", "call_id",
-    "amb_district"  # 👈 district column, required-defaults se skip hoga
+    "added_by", "added_date", "call_id"
 }
-
-# FORCED_DEFAULTS = {...}  -> same rahega jaisa pehle tha
-# _required_defaults_cache, DENIAL_WORKER_LOCK_KEY, etc. -> sab same rahega
-
-
+ 
+# Forced defaults — ye columns hamesha isi value se bharenge
+FORCED_DEFAULTS = {
+    "alert_type": "incident denial",
+}
+ 
+_required_defaults_cache = None
+ 
+DENIAL_WORKER_LOCK_KEY = "denial_worker_leader_lock"
+DENIAL_WORKER_LOCK_TTL_MS = 15000
+_worker_instance_id = str(uuid.uuid4())
+ 
+ 
+async def try_acquire_denial_worker_leadership() -> bool:
+    """Redis leader lock — sirf ek process actual kaam kare."""
+    acquired = await redis_client.set(
+        DENIAL_WORKER_LOCK_KEY,
+        _worker_instance_id,
+        nx=True,
+        px=DENIAL_WORKER_LOCK_TTL_MS
+    )
+    if acquired:
+        return True
+ 
+    current_holder = await redis_client.get(DENIAL_WORKER_LOCK_KEY)
+    if isinstance(current_holder, bytes):
+        current_holder = current_holder.decode()
+ 
+    if current_holder == _worker_instance_id:
+        await redis_client.pexpire(DENIAL_WORKER_LOCK_KEY, DENIAL_WORKER_LOCK_TTL_MS)
+        return True
+ 
+    return False
+ 
+ 
+async def get_required_default_columns():
+    """Postgres ke NOT NULL (bina default) columns ke liye safe defaults."""
+    global _required_defaults_cache
+ 
+    if _required_defaults_cache is not None:
+        return _required_defaults_cache
+ 
+    rows = await database2.fetch_all(
+        """
+        SELECT column_name, data_type
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'denial_escalation_master'
+          AND is_nullable = 'NO'
+          AND column_default IS NULL
+        """
+    )
+ 
+    defaults = {}
+    for r in rows:
+        col = r["column_name"]
+        dtype = r["data_type"]
+ 
+        # in columns ko hum khud fill karte hain
+        # FORCED_DEFAULTS bhi skip — warna alert_type ko "" mil jata
+        if col in MAPPED_COLUMNS or col in ("id", "mysql_id") or col in FORCED_DEFAULTS:
+            continue
+ 
+        if dtype in ("integer", "bigint", "smallint", "numeric"):
+            defaults[col] = 0
+        elif dtype == "boolean":
+            defaults[col] = False
+        elif dtype in ("character varying", "text", "varchar", "char"):
+            defaults[col] = ""
+        elif dtype in ("timestamp without time zone", "timestamp with time zone", "date"):
+            defaults[col] = datetime.utcnow()
+        else:
+            defaults[col] = None
+ 
+    _required_defaults_cache = defaults
+    logger.info(f"Denial worker: required NOT NULL defaults resolved -> {defaults}")
+    return defaults
+ 
+ 
 async def denial_complaints_insert_worker():
     """
     Background worker: MySQL (ems_denial_complaints) -> Postgres (denial_escalation_master).
     Current month only. Uses MySQL `id` for uniqueness check.
     inc_ref_id is intentionally SKIPPED. call_id is included.
     alert_type is force-set to "incident denial".
-
-    NAYA: dst_name (via ems_mas_districts join on amb_district = dst_id)
-    NAYA: meaning ab raw id nahi, ems_denial_reason join se resolved text hai
     """
     logger.info(f"Denial Complaints Insert Worker STARTED (instance={_worker_instance_id})")
-
+ 
     while True:
         try:
             is_leader = await try_acquire_denial_worker_leadership()
-
+ 
             if not is_leader:
                 await asyncio.sleep(5)
                 continue
-
+ 
             required_defaults = await get_required_default_columns()
-
+ 
             # ------------------------------------------------
-            # STEP 1: MySQL se current month rows lao (with joins)
+            # STEP 1: MySQL se current month rows lao
             # ------------------------------------------------
             query = """
                 SELECT
-                    edc.id, edc.call_id, edc.amb_no, edc.amb_default_mobile, edc.caller_no,
-                    edc.hp_name, edc.challenge_val, edc.denial_remark,
-                    edc.added_by, edc.added_date,
-                    dr.meaning        AS reason_meaning,
-                    dist.dst_name     AS dst_name
-                FROM ems_denial_complaints edc
-                LEFT JOIN ems_denial_reason dr
-                    ON edc.meaning = dr.id
-                LEFT JOIN ems_mas_districts dist
-                    ON edc.amb_district = dist.dst_id
-                WHERE YEAR(edc.added_date) = YEAR(NOW())
-                  AND MONTH(edc.added_date) = MONTH(NOW())
-                ORDER BY edc.added_date DESC
+                    id, call_id, amb_no, amb_default_mobile, caller_no,
+                    hp_name, challenge_val, meaning, denial_remark,
+                    added_by, added_date
+                FROM ems_denial_complaints
+                WHERE YEAR(added_date) = YEAR(NOW())
+                  AND MONTH(added_date) = MONTH(NOW())
+                ORDER BY added_date DESC
                 LIMIT 1000;
             """
-
+ 
             rows = await database.fetch_all(query)
-
+ 
             logger.info("=" * 60)
             logger.info(f"Denial worker: MySQL returned {len(rows)} rows (current month filter)")
-
+ 
             if len(rows) == 0:
                 try:
                     sample = await database.fetch_one(
@@ -937,7 +1049,7 @@ async def denial_complaints_insert_worker():
                     logger.error(f"Denial worker: sample date check failed: {e}")
                 await asyncio.sleep(10)
                 continue
-
+ 
             # ------------------------------------------------
             # STEP 2: Sample 3 rows ka data log karo
             # ------------------------------------------------
@@ -950,13 +1062,11 @@ async def denial_complaints_insert_worker():
                         f"call_id={d.get('call_id')!r}, "
                         f"amb_no={d.get('amb_no')!r}, "
                         f"challenge_val={d.get('challenge_val')!r}, "
-                        f"dst_name={d.get('dst_name')!r}, "
-                        f"reason_meaning={d.get('reason_meaning')!r}, "
                         f"added_date={d.get('added_date')!r}"
                     )
                 except Exception as e:
                     logger.error(f"Denial worker: sample log error: {e}")
-
+ 
             # ------------------------------------------------
             # STEP 3: Per-row processing
             # ------------------------------------------------
@@ -965,16 +1075,17 @@ async def denial_complaints_insert_worker():
             skipped_no_id = 0
             failed_insert = 0
             failed_examples = []
-
+ 
             for row in rows:
                 try:
                     d = dict(row)
                     mysql_id = d.get("id")
-
+ 
                     if not mysql_id:
                         skipped_no_id += 1
                         continue
-
+ 
+                    # Check karo: ye mysql_id pehle se Postgres mein hai?
                     existing = await database2.fetch_one(
                         """
                         SELECT id
@@ -983,11 +1094,11 @@ async def denial_complaints_insert_worker():
                         """,
                         {"mysql_id": mysql_id}
                     )
-
+ 
                     if existing:
                         skipped_existing += 1
                         continue
-
+ 
                     # Insert karlo
                     params = {
                         "id": mysql_id,
@@ -998,22 +1109,21 @@ async def denial_complaints_insert_worker():
                         "caller_no": d.get("caller_no"),
                         "hp_name": d.get("hp_name"),
                         "challenge_val": d.get("challenge_val"),
-                        "meaning": d.get("reason_meaning"),   # 👈 join se resolved text
-                        "dst_name": d.get("dst_name"),        # 👈 district name
+                        "meaning": d.get("meaning"),
                         "denial_remark": d.get("denial_remark"),
                         "added_by": d.get("added_by"),
                         "added_date": d.get("added_date"),
                     }
-
-                    # pehle NOT NULL defaults lagao (MAPPED_COLUMNS wale skip honge)
+ 
+                    # pehle NOT NULL defaults lagao
                     params.update(required_defaults)
-
-                    # ab forced defaults
+ 
+                    # ab forced defaults — alert_type = "incident deny" hamesha
                     params.update(FORCED_DEFAULTS)
-
+ 
                     columns = ", ".join(params.keys())
                     placeholders = ", ".join(f":{k}" for k in params.keys())
-
+ 
                     await database2.execute(
                         f"""
                         INSERT INTO denial_escalation_master ({columns})
@@ -1022,7 +1132,10 @@ async def denial_complaints_insert_worker():
                         params
                     )
                     inserted_count += 1
-
+ 
+ 
+ 
+                # 👈 Separate try/except — broadcast fail ho to insert count disturb na ho
                     try:
                         await broadcast_new_escalation(
                             call_id=d.get("call_id"),
@@ -1035,8 +1148,7 @@ async def denial_complaints_insert_worker():
                                 "caller_no":         d.get("caller_no"),
                                 "hp_name":           d.get("hp_name"),
                                 "challenge_val":     d.get("challenge_val"),
-                                "meaning":           d.get("reason_meaning"),
-                                "dst_name":          d.get("dst_name"),
+                                "meaning":           d.get("meaning"),
                                 "denial_remark":     d.get("denial_remark"),
                                 "alert_type":        "incident denial",
                                 "added_by":          d.get("added_by"),
@@ -1045,7 +1157,8 @@ async def denial_complaints_insert_worker():
                         )
                     except Exception as b_err:
                         logger.error(f"Denial worker: broadcast failed for id={mysql_id}: {b_err}")
-
+ 
+ 
                 except Exception as row_err:
                     failed_insert += 1
                     if len(failed_examples) < 5:
@@ -1060,7 +1173,7 @@ async def denial_complaints_insert_worker():
                         except Exception:
                             failed_examples.append({"error": str(row_err)})
                     continue
-
+ 
             # ------------------------------------------------
             # STEP 4: Final summary
             # ------------------------------------------------
@@ -1072,18 +1185,18 @@ async def denial_complaints_insert_worker():
                 f"no_id={skipped_no_id}, "
                 f"failed={failed_insert}"
             )
-
+ 
             if failed_examples:
                 logger.warning(
                     f"Denial worker: failed insert examples -> {failed_examples}"
                 )
-
+ 
             if inserted_count:
                 logger.info(f"Denial worker: ✅ inserted {inserted_count} new rows")
-
+ 
         except Exception as e:
             logger.error(f"Denial Complaints Insert Worker Error: {e}", exc_info=True)
-
+ 
         await asyncio.sleep(10)
     
     ##################################################################################
@@ -1123,16 +1236,13 @@ class ConnectionManager:
             return False
 
     def broadcast(self, payload: dict):
-        """Non-blocking broadcast — pushes to every client's queue."""
-        dead = []
-        for ws, info in self.active_connections.items():
-            try:
-                info["queue"].put_nowait(payload)
-            except asyncio.QueueFull:
-                logger.warning("Queue full, dropping client")
-                dead.append(ws)
-        for ws in dead:
-            self.disconnect(ws)
+        """Publish to Redis — ALL workers (including this one) will receive
+        via redis_subscriber and push to their local client queues.
+        This ensures cross-worker WebSocket broadcasts work correctly."""
+        try:
+            asyncio.create_task(publish_to_redis("central_alerts_channel", payload))
+        except Exception as e:
+            logger.error(f"Broadcast (Redis publish) failed: {e}")
 
 
 manager = ConnectionManager()
@@ -1229,7 +1339,6 @@ async def alert_ws_notifier():
     while True:
         try:
             if last_sent_updated is None:
-                # 👇 COALESCE use karo — agar updated_date NULL hai to created_date se lo
                 row = await database2.fetch_one(
                     """
                     SELECT alert_id, COALESCE(updated_date, created_date) AS last_time
@@ -1263,8 +1372,6 @@ async def alert_ws_notifier():
                     last_sent_alert_id = last_row["alert_id"]
 
                     # 👇 FULL payload bhejo ALL_ALERTS format me (same as initial load)
-                    # _fetch_alerts_payload() already ALL_ALERTS format me return karta hai
-                    # with today_all + by_severity + counts — bilkul same structure
                     full_payload = await _fetch_alerts_payload()
                     manager.broadcast(full_payload)
                     print(f"📡 WS sent ALL_ALERTS update ({len(rows)} changes detected)")
@@ -1272,7 +1379,8 @@ async def alert_ws_notifier():
         except Exception as e:
             print("❌ Alert WS Notifier Error:", e)
 
-        await asyncio.sleep(1)
+        # 👇 0.5 sec — pehle 1 sec tha, ab fast hoga
+        await asyncio.sleep(0.5)
 
 
 # ============================================================
@@ -1318,6 +1426,20 @@ async def lifespan(app: FastAPI):
     await database.connect()
     await database2.connect()
     await init_redis()
+
+    # 👇 Firebase Admin SDK initialize karo — workers start hone se PEHLE
+    # (kyunki workers FCM push bhejte hain — Firebase ready hona chahiye)
+    try:
+        firebase_admin.get_app()  # Already initialized?
+        logger.info("Firebase Admin SDK already initialized")
+    except ValueError:
+        try:
+            cred_path = os.getenv("FIREBASE_CREDENTIALS_PATH", "/home/jaesadmin/firebase-creds.json")
+            cred = credentials.Certificate(cred_path)
+            firebase_admin.initialize_app(cred)
+            logger.info(f"Firebase Admin SDK initialized with {cred_path}")
+        except Exception as e:
+            logger.error(f"Firebase Admin init failed: {e}")
 
     alert_worker_task = asyncio.create_task(run_worker_with_restart())
     notifier_task = asyncio.create_task(run_notifier_with_restart())
@@ -2802,33 +2924,68 @@ def extract_ambulance_number_from_payload(payload: dict) -> str:
 
 import httpx
 
-FCM_SERVER_KEY = "AAAAdHbcA2w:APA91bGpaFIHWqD35tEQR0suCf_IRdOysTOvMsObjFgeIzGS_G2daBJjmRJrNyzQ13R5wrqBI9iVUTm-Ns_pIcs2R__m1s48RBNl__1FkFoQWAyUMZ4OPsDHNFg0a_rd2F9lXhHfInQB"   # 👈 yahan apni FCM key daalo
+# FCM_SERVER_KEY = "AAAAdHbcA2w:APA91bGpaFIHWqD35tEQR0suCf_IRdOysTOvMsObjFgeIzGS_G2daBJjmRJrNyzQ13R5wrqBI9iVUTm-Ns_pIcs2R__m1s48RBNl__1FkFoQWAyUMZ4OPsDHNFg0a_rd2F9lXhHfInQB"   # 👈 yahan apni FCM key daalo
 
 async def send_fcm_push(token: str, title: str, body: str, data: dict = None):
-    """Firebase Cloud Messaging push notification bhejo."""
+    """Firebase Cloud Messaging — SIRF data field bhejta hai.
+    Android OS isko background me drop nahi karega, onMessageReceived call hoga."""
     if not token:
+        logger.warning("FCM push skipped: no token provided")
         return
-    try:
-        message = {
-            "to": token,
-            "notification": {"title": title, "body": body},
-            "data": data or {},
-            "android": {"priority": "high"},
-            "apns": {"payload": {"aps": {"sound": "default"}}}
-        }
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.post(
-                "https://fcm.googleapis.com/fcm/send",
-                json=message,
-                headers={
-                    "Authorization": f"key={FCM_SERVER_KEY}",
-                    "Content-Type": "application/json"
-                }
-            )
-            logger.info(f"FCM push sent to {token[:15]}... status={resp.status_code}")
-    except Exception as e:
-        logger.exception(f"send_fcm_push FAILED: {e}")
 
+    try:
+        firebase_admin.get_app()
+    except ValueError:
+        logger.error("❌ FCM ERROR: Firebase Admin SDK not initialized. Check service account JSON file.")
+        return
+
+    try:
+        # 👇 SIRF data field — NO notification field
+        clean_data = {
+            "type": "Late",
+            "title": title,
+            "message": body,
+            "discription": body,
+        }
+
+        if data:
+            for k, v in data.items():
+                clean_data[k] = str(v) if v is not None else ""
+
+        # 👇 No notification object inside AndroidConfig, just high priority
+        message = messaging.Message(
+            token=token,
+            data=clean_data,
+            android=messaging.AndroidConfig(
+                priority="high"
+            ),
+            apns=messaging.APNSConfig(
+                headers={"apns-priority": "10"},
+                payload=messaging.APNSPayload(
+                    aps=messaging.Aps(
+                        content_available=True
+                    )
+                )
+            )
+        )
+
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(
+            None,
+            lambda: messaging.send(message)
+        )
+
+        logger.info(f"✅ FCM SUCCESS (Data-only): token={token[:20]}... msg_id={response} type=Late")
+
+    except Exception as e:
+        error_str = str(e)
+
+        if "NOT_REGISTERED" in error_str or "invalid-registration-token" in error_str:
+            logger.error(f"❌ FCM ERROR: Token invalid/expired: token={token[:20]}... error={error_str}")
+        elif "permission-denied" in error_str:
+            logger.error(f"❌ FCM ERROR: Permission denied: {error_str}")
+        else:
+            logger.exception(f"❌ send_fcm_push FAILED: {e}")
 
 # ===========================================================================
 # HELPERS (time → level)
@@ -2936,6 +3093,207 @@ async def build_escalation_payload(
     return payload
 
 # ===========================================================================
+async def attach_sla_info_to_alerts(alerts: list) -> list:
+    """Each alert me SLA breach details add karta hai.
+    
+    Fetches from:
+    - alert_thresholds table: SLA threshold for each alert_type + amb_area (rural/urban)
+    - rtm_dashboard table: actual duration taken by ambulance
+    
+    Adds fields:
+    - sla_threshold_seconds: SLA limit in seconds
+    - sla_actual_seconds: actual time taken in seconds
+    - sla_breach_seconds: how much time was exceeded
+    - sla_breach_reason: human-readable reason
+    - amb_area: "1" (rural) or "2" (urban)
+    - amb_area_type: "Rural" or "Urban"
+    """
+    if not alerts:
+        return alerts
+
+    # 1. Saare thresholds fetch karo (cached, 30s TTL)
+    try:
+        thresholds = await get_active_thresholds()
+    except Exception as e:
+        logger.error(f"attach_sla: thresholds fetch failed: {e}")
+        thresholds = []
+
+    # 2. Saare unique incident_ids collect karo
+    incident_ids = []
+    for a in alerts:
+        inc_id = str(a.get("incident_id") or a.get("call_id") or "")
+        if inc_id and inc_id != "0" and inc_id not in incident_ids:
+            incident_ids.append(inc_id)
+
+    # 3. rtm_dashboard se data fetch karo for these incident_ids
+    rtm_data = {}
+    if incident_ids:
+        try:
+            placeholders = ", ".join([f":id{i}" for i in range(len(incident_ids))])
+            params = {f"id{i}": incident_ids[i] for i in range(len(incident_ids))}
+            query = f"""
+                SELECT * FROM rtm_dashboard
+                WHERE CAST(inc_ref_id AS text) IN ({placeholders})
+            """
+            rtm_rows = await database2.fetch_all(query, params)
+            for r in rtm_rows:
+                rtm_data[str(r["inc_ref_id"])] = normalize_row(r)
+        except Exception as e:
+            logger.error(f"attach_sla: rtm_dashboard fetch failed: {e}")
+
+    # 4. Alert type → rtm_dashboard duration field mapping
+    ALERT_DURATION_MAP = {
+        "ACK_DELAY": "acknowledge_duration",
+        "START_DELAY": "start_from_base_duration",
+        "AT_SCENE_DELAY": "at_scene_duration",
+    }
+
+    # 5. Each alert me SLA info add karo
+    for alert in alerts:
+        alert_type = alert.get("alert_type", "")
+        incident_id = str(alert.get("incident_id") or alert.get("call_id") or "")
+
+        # rtm_dashboard se row uthao
+        rtm_row = rtm_data.get(incident_id, {})
+
+        # amb_area (1=rural, 2=urban)
+        amb_area = rtm_row.get("amb_working_area")
+        amb_area_type = ""
+        if str(amb_area) == "1":
+            amb_area_type = "Rural"
+        elif str(amb_area) == "2":
+            amb_area_type = "Urban"
+
+        # Threshold dhoondho — alert_type + amb_area match
+        # null amb_area means applies to ALL areas
+        threshold_seconds = None
+        for t in thresholds:
+            if t.get("alert_type") != alert_type:
+                continue
+            t_amb_area = t.get("amb_area")
+            if t_amb_area is not None and str(t_amb_area) != str(amb_area):
+                continue
+            threshold_seconds = int(t.get("threshold_seconds") or 0)
+            break
+
+        # Actual duration calculate karo
+        actual_seconds = None
+        breach_reason = ""
+
+        # =========================================================
+        # MDT_NOT_LOGGED_IN
+        # =========================================================
+        if alert_type == "MDT_NOT_LOGGED_IN":
+            pilot_login_out = rtm_row.get("pilot_login_out")
+            actual_seconds = 0
+            breach_reason = (
+                f"MDT not logged in — pilot login status: {pilot_login_out}"
+            )
+
+        # =========================================================
+        # BACK_TO_BASE_DELAY — patient_handover ke baad se check
+        # =========================================================
+        elif alert_type == "BACK_TO_BASE_DELAY":
+            patient_handover_dt = to_datetime(rtm_row.get("patient_handover"))
+            back_to_base_dt = to_datetime(rtm_row.get("back_to_base_loc"))
+
+            if patient_handover_dt and back_to_base_dt:
+                diff = (back_to_base_dt - patient_handover_dt).total_seconds()
+                if diff >= 0:
+                    actual_seconds = int(diff)
+
+            if actual_seconds is not None and threshold_seconds is not None:
+                breach_seconds = max(0, actual_seconds - threshold_seconds)
+                breach_reason = (
+                    f"Back to base delay — ambulance took {format_seconds_human(actual_seconds)} "
+                    f"to return to base after patient handover, "
+                    f"{format_seconds_human(breach_seconds)} over the "
+                    f"{format_seconds_human(threshold_seconds)} SLA limit"
+                    + (f" ({amb_area_type} area)" if amb_area_type else "")
+                )
+            elif actual_seconds is not None and threshold_seconds is None:
+                breach_reason = (
+                    f"Back to base delay — ambulance took {format_seconds_human(actual_seconds)} "
+                    f"to return to base after patient handover. "
+                    f"SLA threshold not configured for this alert type."
+                )
+            else:
+                breach_reason = (
+                    "Back to base delay — patient handover or back to base "
+                    "time data not available in rtm_dashboard."
+                )
+
+        # =========================================================
+        # ACK_DELAY, START_DELAY, AT_SCENE_DELAY — direct duration field
+        # =========================================================
+        else:
+            duration_field = ALERT_DURATION_MAP.get(alert_type)
+            if duration_field:
+                raw_duration = rtm_row.get(duration_field)
+                actual_seconds = hhmmss_to_seconds(raw_duration) if raw_duration else None
+
+                if actual_seconds is not None and threshold_seconds is not None:
+                    breach_seconds = max(0, actual_seconds - threshold_seconds)
+
+                    # Human-readable message per alert type
+                    if alert_type == "ACK_DELAY":
+                        breach_reason = (
+                            f"Acknowledge delay — ambulance took {format_seconds_human(actual_seconds)} "
+                            f"to acknowledge the call, "
+                            f"{format_seconds_human(breach_seconds)} over the "
+                            f"{format_seconds_human(threshold_seconds)} SLA limit"
+                            + (f" ({amb_area_type} area)" if amb_area_type else "")
+                        )
+                    elif alert_type == "START_DELAY":
+                        breach_reason = (
+                            f"Start from base delay — ambulance took {format_seconds_human(actual_seconds)} "
+                            f"to depart from base, "
+                            f"{format_seconds_human(breach_seconds)} over the "
+                            f"{format_seconds_human(threshold_seconds)} SLA limit"
+                            + (f" ({amb_area_type} area)" if amb_area_type else "")
+                        )
+                    elif alert_type == "AT_SCENE_DELAY":
+                        breach_reason = (
+                            f"At scene delay — ambulance spent {format_seconds_human(actual_seconds)} "
+                            f"at the scene, "
+                            f"{format_seconds_human(breach_seconds)} over the "
+                            f"{format_seconds_human(threshold_seconds)} SLA limit"
+                            + (f" ({amb_area_type} area)" if amb_area_type else "")
+                        )
+                    else:
+                        breach_reason = (
+                            f"{alert_type} — actual: {format_seconds_human(actual_seconds)}, "
+                            f"threshold: {format_seconds_human(threshold_seconds)}, "
+                            f"breached by: {format_seconds_human(breach_seconds)}"
+                            + (f" ({amb_area_type} area)" if amb_area_type else "")
+                        )
+                elif actual_seconds is not None and threshold_seconds is None:
+                    breach_reason = (
+                        f"{alert_type} — ambulance took {format_seconds_human(actual_seconds)}. "
+                        f"SLA threshold not configured for this alert type."
+                    )
+                else:
+                    breach_reason = (
+                        f"{alert_type} — duration data not available in rtm_dashboard."
+                    )
+            else:
+                breach_reason = f"{alert_type} — unknown alert type, no SLA mapping available."
+
+        # breach seconds
+        breach_seconds = None
+        if actual_seconds is not None and threshold_seconds is not None:
+            breach_seconds = max(0, actual_seconds - threshold_seconds)
+
+        # 👇 SLA fields add karo alert me
+        alert["sla_threshold_seconds"] = threshold_seconds
+        alert["sla_actual_seconds"] = actual_seconds
+        alert["sla_breach_seconds"] = breach_seconds
+        alert["sla_breach_reason"] = breach_reason
+        alert["amb_area"] = amb_area
+        alert["amb_area_type"] = amb_area_type
+
+    return alerts
+
 # ===========================================================================
 # PAYLOAD BUILDER
 # ===========================================================================
@@ -2954,7 +3312,7 @@ async def build_all_escalation_payloads(requested_level: int = None) -> list:
             FROM public.denial_escalation_master
             WHERE added_date::date = CURRENT_DATE
             ORDER BY added_date DESC
-            LIMIT 100
+            LIMIT 5000
             """
         )
 
@@ -2967,7 +3325,7 @@ async def build_all_escalation_payloads(requested_level: int = None) -> list:
         AND escalate_status = '1'
         AND is_deleted = false
         ORDER BY created_date DESC
-        LIMIT 100
+        LIMIT 5000
         """
     )
 
@@ -2990,7 +3348,6 @@ async def build_all_escalation_payloads(requested_level: int = None) -> list:
     # 3. Saare alerts ko time ke hisaab se DESC (latest upar) sort karo
     unified_alerts.sort(key=lambda x: x.get("sort_time") or "", reverse=True)
 
-    # 👇 DEBUG LOG
     logger.info(
         f"BUILD PAYLOADS: fetched denial={len(denial_rows)}, "
         f"central={len(central_rows)}, requested_level={requested_level}"
@@ -2999,12 +3356,10 @@ async def build_all_escalation_payloads(requested_level: int = None) -> list:
     # 4. Level info attach karo aur filter lagao
     filtered_alerts = []
     for alert in unified_alerts:
-        # Call_id ya incident_id ko as a unique key use karo
         call_id = str(alert.get("call_id") or alert.get("incident_id") or "")
         if not call_id or call_id == "0":
             continue
 
-        # Check if closed or action taken
         if await is_closed(call_id):
             action_details = await get_closed_details(call_id)
             current_level = to_int(action_details.get("action_by_level")) or 1
@@ -3015,7 +3370,6 @@ async def build_all_escalation_payloads(requested_level: int = None) -> list:
                 continue
         else:
             is_denial = (alert.get("record_source") == "denial")
-            # 👇 FIX: is_denial parameter ab sahi se pass ho raha hai
             current_level = await get_or_init_escalation_level(
                 call_id,
                 alert.get("sort_time"),
@@ -3026,26 +3380,18 @@ async def build_all_escalation_payloads(requested_level: int = None) -> list:
             if requested_level is not None and current_level != requested_level:
                 continue
 
-        # Level info add karo
         level_info = get_level_info_for_level(current_level)
         alert["current_level"] = current_level
         alert["current_role"] = level_info["role"]
         alert["current_level_minutes"] = level_info["minutes"]
         alert["severity"] = SEVERITY_BY_LEVEL.get(current_level, "LOW")
         alert["type"] = "current_escalation"
-
-        # Timezone fix: Ab IST time aayega (DB ke time ke hisaab se), UTC nahi
         alert["escalated_at"] = datetime.now(ist).isoformat()
 
-        # 👇 DEBUG LOG
-        amb = alert.get("ambulance_no") or alert.get("amb_no")
-        logger.info(
-            f"  ALERT PASSED FILTER: call_id={call_id}, amb={amb}, "
-            f"level={current_level}, source={alert.get('record_source')}, "
-            f"closed={alert.get('is_closed')}"
-        )
-
         filtered_alerts.append(alert)
+
+    # SLA breach details add karo
+    filtered_alerts = await attach_sla_info_to_alerts(filtered_alerts)
 
     logger.info(
         f"BUILD PAYLOADS: returning {len(filtered_alerts)} alerts "
@@ -3233,22 +3579,18 @@ async def _handle_escalation_ws(websocket: WebSocket, requested_level: int, user
     conn_info = await manager.connect(websocket, user_id)
     queue = conn_info["queue"]
 
-    # Level 1 (MDT) ke liye: pehle vehicleNumber + token lo
-    vehicle_number = None       # 👈 normalized value yahan rahegi
-    vehicle_number_raw = None   # 👈 display ke liye raw value
+    vehicle_number = None
+    vehicle_number_raw = None
     fcm_token = None
 
+    # =========================================================
+    # Level 1: SILENTLY wait for registration message
+    # =========================================================
     if requested_level == 1:
         try:
-            await websocket.send_json({
-                "type": "REGISTRATION_REQUIRED",
-                "message": "Please send JSON with vehicleNumber and token"
-            })
-
             raw = await asyncio.wait_for(websocket.receive_text(), timeout=60)
             data = json.loads(raw)
 
-            # 👇 Raw value (frontend format - spaces wagarah ke saath)
             vehicle_number_raw = (
                 data.get("vehicleNumber")
                 or data.get("ambulance_no")
@@ -3256,33 +3598,20 @@ async def _handle_escalation_ws(websocket: WebSocket, requested_level: int, user
             )
             fcm_token = data.get("token") or data.get("fcm_token")
 
-            # 👇 NORMALIZE karo — spaces/hyphens hata ke uppercase
             vehicle_number = normalize_vehicle_number(vehicle_number_raw)
 
             if not vehicle_number or not fcm_token:
-                await websocket.send_json({
-                    "type": "ERROR",
-                    "message": "vehicleNumber and token are required for level=1"
-                })
                 await websocket.close(code=1008)
                 return
 
-            await websocket.send_json({
-                "type": "REGISTRATION_SUCCESS",
-                "vehicleNumber": vehicle_number_raw,   # raw value user ko dikhao
-                "normalized": vehicle_number,          # 👈 normalized bhi bhej do (debug ke liye)
-                "message": f"You will now receive alerts for ambulance {vehicle_number_raw}"
-            })
+            # 👇 Redis me token save karo taaki background me bhi chalega
+            await redis_client.set(f"fcm_token:{vehicle_number}", fcm_token)
             logger.info(
-                f"Level-1 MDT registered: user={user_id}, "
+                f"Level-1 MDT registered & SAVED IN REDIS: user={user_id}, "
                 f"raw={vehicle_number_raw}, normalized={vehicle_number}"
             )
 
         except asyncio.TimeoutError:
-            await websocket.send_json({
-                "type": "ERROR",
-                "message": "Registration timeout. Send vehicleNumber + token within 60s."
-            })
             await websocket.close(code=1008)
             return
         except WebSocketDisconnect:
@@ -3296,65 +3625,96 @@ async def _handle_escalation_ws(websocket: WebSocket, requested_level: int, user
             return
 
     try:
+        # Send INITIAL_LOAD
         await send_current_escalations(
             websocket,
             requested_level=requested_level,
-            vehicle_filter=vehicle_number,   # 👈 normalized value
-            fcm_token=fcm_token
+            vehicle_filter=vehicle_number,
+            fcm_token=None  # 👈 Pehli baar connect hote waqt FCM nahi bajana
         )
 
         async def drain_loop():
-            """Queue se messages nikal ke client pe bhejo — level + vehicle filter lagao."""
+            """Sirf INITIAL_LOAD format bhejo — kuch aur nahi."""
+            last_refresh_time = 0
+            notified_alert_ids = set()  # 👈 Jis alerts ke liye FCM baj chuka hai
+
             while True:
                 payload = await queue.get()
-
                 msg_type = payload.get("type")
-                if msg_type == "ALL_ALERTS":
-                    continue
 
+                # Sirf ye types handle karo — baaki sab skip
                 if msg_type not in [
-                    "current_escalation",
+                    "ESCALATION_REFRESH",
+                    "ALL_ALERTS",
                     "new_escalation_alert",
                     "escalation_level_changed",
                     "escalation_closed",
+                    "current_escalation",
                 ]:
                     continue
 
-                # Closed incidents — vehicle match check
-                if msg_type == "escalation_closed":
-                    if requested_level == 1 and vehicle_number:
-                        amb = extract_ambulance_number_from_payload(payload)
-                        # 👇 Dono normalized hain, direct compare
-                        if amb and amb != vehicle_number:
-                            continue
-                    if not await manager.safe_send(websocket, payload):
-                        break
-                    continue
+                # ESCALATION_REFRESH: no throttle (immediate)
+                # Others: 1 sec throttle
+                if msg_type != "ESCALATION_REFRESH":
+                    now = time.time()
+                    if now - last_refresh_time < 1:
+                        continue
+                    last_refresh_time = now
 
-                # Level filter
-                payload_level = payload.get("current_level")
-                if requested_level is None or payload_level == requested_level:
-                    # Level 1 ke liye vehicle filter
-                    if requested_level == 1 and vehicle_number:
-                        amb = extract_ambulance_number_from_payload(payload)
-                        # 👇 Dono normalized — direct compare
-                        if not amb or amb != vehicle_number:
-                            continue   # uss ambulance ka nahi → skip
+                # Re-fetch and send INITIAL_LOAD (same format always)
+                try:
+                    payloads = await build_all_escalation_payloads(requested_level)
 
-                        # Vehicle match → FCM push
-                        if fcm_token:
-                            await send_fcm_push(
-                                token=fcm_token,
-                                title=f"Ambulance {vehicle_number_raw} - {payload.get('current_role', 'MDT')} Alert",
-                                body=f"Escalation received for level {payload_level}",
-                                data={
-                                    "call_id": str(payload.get("call_id", "")),
-                                    "type": payload.get("type", "")
-                                }
+                    if requested_level == 1 and vehicle_number:
+                        filtered = []
+                        for p in payloads:
+                            amb_raw = (
+                                p.get("ambulance_no")
+                                or p.get("amb_no")
+                                or p.get("vehicleNumber")
                             )
+                            amb_normalized = normalize_vehicle_number(amb_raw)
+                            if amb_normalized == vehicle_number:
+                                filtered.append(p)
+                        payloads = filtered
 
-                    if not await manager.safe_send(websocket, payload):
-                        break
+                        # =========================================================
+                        # 👇 FCM PUSH LOGIC: Yahan check hoga har baar
+                        # Isse manual inserts pe bhi FCM bajegi!
+                        # =========================================================
+                        if fcm_token and len(payloads) > 0:
+                            for p in payloads:
+                                # Central alert ke liye alert_id, Denial ke liye call_id
+                                unique_id = str(
+                                    p.get("alert_id") 
+                                    or p.get("call_id") 
+                                    or p.get("incident_id") 
+                                    or ""
+                                )
+                                
+                                # Agar ye unique_id pehle se notified nahi hai → FCM BAAJO!
+                                if unique_id and unique_id not in notified_alert_ids:
+                                    logger.info(f"🚀 Triggering FCM from WS loop for ID={unique_id}")
+                                    await send_fcm_push(
+                                        token=fcm_token,
+                                        title=f"Ambulance {vehicle_number_raw} - New Alert",
+                                        body=f"Alert: {p.get('alert_type', 'Escalation')}",
+                                        data={
+                                            "alert_id": unique_id,
+                                            "type": "Late",
+                                        }
+                                    )
+                                    # Mark as notified taaki dubara na bajje
+                                    notified_alert_ids.add(unique_id)
+
+                    await manager.safe_send(websocket, {
+                        "type": "INITIAL_LOAD",
+                        "count": len(payloads),
+                        "data": payloads,
+                        "vehicle_filter": vehicle_number if requested_level == 1 else None,
+                    })
+                except Exception as e:
+                    logger.error(f"drain_loop refresh failed: {e}")
 
         async def keep_alive_loop():
             while True:
@@ -3391,24 +3751,20 @@ async def send_current_escalations(
     vehicle_filter: str = None,
     fcm_token: str = None
 ):
-    """Ek hi combined message bhejta hai — saare records ek array mein.
-    Agar vehicle_filter diya gaya (level 1 ke liye), to sirf uss ambulance ke alerts aayenge."""
+    """Sirf INITIAL_LOAD format bhejta hai — kuch aur nahi."""
     try:
         payloads = await build_all_escalation_payloads(requested_level)
 
-        # 👇 DEBUG LOG for level 1
         if requested_level == 1:
             logger.info(
                 f"LEVEL 1 SEND: build_all returned {len(payloads)} alerts, "
                 f"vehicle_filter={vehicle_filter}"
             )
 
-        # Level 1 ke liye: vehicle filter lagao
         if vehicle_filter:
             normalized_filter = normalize_vehicle_number(vehicle_filter)
             filtered = []
             for p in payloads:
-                # payload se bhi normalize karke compare karo
                 amb_raw = (
                     p.get("ambulance_no")
                     or p.get("amb_no")
@@ -3416,7 +3772,6 @@ async def send_current_escalations(
                 )
                 amb_normalized = normalize_vehicle_number(amb_raw)
 
-                # 👇 DEBUG LOG — each vehicle comparison
                 logger.info(
                     f"  VEHICLE MATCH: payload_amb={amb_raw} → "
                     f"normalized={amb_normalized}, filter={normalized_filter}, "
@@ -3427,15 +3782,7 @@ async def send_current_escalations(
                     filtered.append(p)
             payloads = filtered
 
-        # Agar level 1 + koi match mila to FCM push bhej do
-        if vehicle_filter and fcm_token and len(payloads) > 0:
-            await send_fcm_push(
-                token=fcm_token,
-                title=f"Pending Alerts - {len(payloads)} alert(s)",
-                body=f"You have {len(payloads)} pending alert(s) for your ambulance",
-                data={"count": str(len(payloads))}
-            )
-
+        # 👇 ONLY this format — nothing else
         await websocket.send_json({
             "type": "INITIAL_LOAD",
             "count": len(payloads),
@@ -3453,25 +3800,108 @@ async def send_current_escalations(
         )
 
     except Exception as e:
+        # 👇 No ERROR message to client — just log
         logger.exception(f"send_current_escalations FAILED: {e}")
-        try:
-            await websocket.send_json({"type": "ERROR", "message": str(e)})
-        except Exception:
-            pass
-
 # ===========================================================================
 # WATCHER: TIME-BASED LEVEL BUMP (MDT → DM → ZM → OM → SH → COO → CBO)
 #   *** AGAR ACTION LIYA TO AAGE ESCALATE NAHI KAREGA ***
 # ===========================================================================
+async def init_escalation_levels_for_today():
+    """Aaj ke saare alerts scan karke Redis me level set karo.
+    
+    Problem: Agar alert insert hua BEFORE broadcast code was added,
+    to uska Redis key (esc_level:{call_id}) kabhi nahi bana.
+    Bump watcher sirf existing keys scan karta hai — to ye alerts
+    kabhi escalate hi nahi hote.
+    
+    Solution: Aaj ke saare DB records uthao, check karo Redis me key hai ya nahi.
+    Agar nahi hai → time-based level calculate karke set kar do.
+    """
+    try:
+        # ---------- Central Alerts ----------
+        central_rows = await database2.fetch_all(
+            """
+            SELECT incident_id, created_date
+            FROM public.central_alerts
+            WHERE created_date::date = CURRENT_DATE
+            AND escalate_status = '1'
+            AND is_deleted = false
+            """
+        )
+
+        central_init = 0
+        for row in central_rows:
+            call_id = str(row["incident_id"])
+            if not call_id or call_id == "0":
+                continue
+
+            key = f"{ESC_LEVEL_REDIS_PREFIX}{call_id}"
+            exists = await redis_client.get(key)
+
+            if exists is None:
+                # Redis me nahi hai → initialize kar
+                await get_or_init_escalation_level(
+                    call_id,
+                    row["created_date"],
+                    is_denial=False
+                )
+                central_init += 1
+
+        # ---------- Denial Records ----------
+        denial_rows = await database2.fetch_all(
+            """
+            SELECT call_id, added_date
+            FROM public.denial_escalation_master
+            WHERE added_date::date = CURRENT_DATE
+            """
+        )
+
+        denial_init = 0
+        for row in denial_rows:
+            call_id = str(row["call_id"])
+            if not call_id or call_id == "0":
+                continue
+
+            key = f"{ESC_LEVEL_REDIS_PREFIX}{call_id}"
+            exists = await redis_client.get(key)
+
+            if exists is None:
+                await get_or_init_escalation_level(
+                    call_id,
+                    row["added_date"],
+                    is_denial=True
+                )
+                denial_init += 1
+
+        if central_init > 0 or denial_init > 0:
+            logger.info(
+                f"INIT ESCALATION: initialized {central_init} central + "
+                f"{denial_init} denial Redis keys (total {central_init + denial_init})"
+            )
+
+    except Exception as e:
+        logger.error(f"init_escalation_levels_for_today failed: {e}")
+
+
 async def escalation_level_bump_watcher():
     logger.info("Escalation Level Bump Watcher STARTED")
 
     cursor = 0
+    last_init_time = 0
+
     while True:
         try:
             if not await try_acquire_bump_leadership():
                 await asyncio.sleep(10)
                 continue
+
+            # 👇 HAR 5 MINUTE me aaj ke saare alerts ka Redis key init karo
+            # Isse jo alerts broadcast code se pehle insert hue the, unke bhi
+            # Redis keys ban jayenge → bump watcher unhe bhi escalate karega
+            now = time.time()
+            if now - last_init_time > 300:  # 5 minutes
+                await init_escalation_levels_for_today()
+                last_init_time = now
 
             cursor, keys = await redis_client.scan(
                 cursor=cursor,
@@ -3484,7 +3914,7 @@ async def escalation_level_bump_watcher():
                     key = key.decode()
                 call_id = key.replace(ESC_LEVEL_REDIS_PREFIX, "")
 
-                # ACTION-TAKEN GUARD — agar band ho gaya to cleanup karke skip
+                # ACTION-TAKEN GUARD
                 if await is_closed(call_id) or await is_action_taken(call_id):
                     await redis_client.delete(f"{ESC_LEVEL_REDIS_PREFIX}{call_id}")
                     await redis_client.delete(f"{ESC_ESCALATED_AT_PREFIX}{call_id}")
@@ -3496,11 +3926,10 @@ async def escalation_level_bump_watcher():
                 if current_level is None:
                     continue
 
-                # Agar pehle se level 7 par hai, aage bump nahi karna
                 if current_level >= 7:
                     continue
 
-                # 👇 Denial record fetch karo, warna central_alerts se uthao
+                # Denial record fetch karo, warna central_alerts se uthao
                 d = await fetch_denial_record(call_id)
                 is_denial_rec = True
 
@@ -3513,14 +3942,12 @@ async def escalation_level_bump_watcher():
                         {"inc_id": str(call_id)}
                     )
                     if not central_row:
-                        # 👇 Record hi nahi mila — stale key hai, delete kar do
                         await redis_client.delete(f"{ESC_LEVEL_REDIS_PREFIX}{call_id}")
                         await redis_client.delete(f"{ESC_ESCALATED_AT_PREFIX}{call_id}")
                         logger.warning(f"STALE KEY CLEANUP: call_id={call_id} (no DB record found)")
                         continue
                     d = serialize_row(central_row)
 
-                # 👇 Time calculate karo (denial ka added_date ya central ka created_date)
                 check_date = d.get("added_date") if is_denial_rec else d.get("created_date")
                 if not check_date:
                     logger.warning(f"No date field for call_id={call_id}, skipping")
@@ -3528,19 +3955,18 @@ async def escalation_level_bump_watcher():
 
                 elapsed = elapsed_minutes_since(check_date)
 
-                # 👇 FIX: Time-based level directly calculate karo (multi-level jump)
+                # Time-based level directly calculate karo (multi-level jump)
                 time_based_level = get_level_for_elapsed_minutes(elapsed)
                 if is_denial_rec and time_based_level < 2:
                     time_based_level = 2
                 time_based_level = min(time_based_level, 7)
 
-                # Agar time-based level current se zyada nahi → kuch nahi karna
                 if time_based_level <= current_level:
                     continue
 
                 new_level = time_based_level
 
-                # Double-check before bump — race condition se bachne ke liye
+                # Double-check before bump
                 if await is_closed(call_id) or await is_action_taken(call_id):
                     await redis_client.delete(f"{ESC_LEVEL_REDIS_PREFIX}{call_id}")
                     await redis_client.delete(f"{ESC_ESCALATED_AT_PREFIX}{call_id}")
@@ -3550,10 +3976,8 @@ async def escalation_level_bump_watcher():
                     )
                     continue
 
-                # 👇 Naya level Redis me set karo
                 await set_escalation_level(call_id, new_level)
 
-                # 👇 Payload banao + broadcast karo
                 if is_denial_rec:
                     payload = await build_escalation_payload(
                         call_id=call_id,
@@ -3631,7 +4055,7 @@ async def broadcast_new_escalation(call_id: str, denial_record: dict):
 
 async def broadcast_new_central_alert(central_alert_row: dict):
     """Central alert insert ke turant baad call karo —
-    naya alert MDT (level 1) pe real-time broadcast hoga."""
+    naya alert MDT (level 1) pe real-time broadcast hoga + FCM push hoga."""
     try:
         call_id = str(
             central_alert_row.get("incident_id")
@@ -3643,6 +4067,11 @@ async def broadcast_new_central_alert(central_alert_row: dict):
 
         if await is_closed(call_id):
             return
+
+        # 👇 SLA breach details add karo before broadcast
+        alerts_with_sla = await attach_sla_info_to_alerts([central_alert_row])
+        if alerts_with_sla:
+            central_alert_row = alerts_with_sla[0]
 
         # Central alerts ke liye is_denial=False
         current_level = await get_or_init_escalation_level(
@@ -3658,7 +4087,6 @@ async def broadcast_new_central_alert(central_alert_row: dict):
             current_level=current_level,
             event_type="new_escalation_alert",
         )
-
         manager.broadcast(payload)
 
         logger.info(
@@ -3666,9 +4094,33 @@ async def broadcast_new_central_alert(central_alert_row: dict):
             f"ambulance={central_alert_row.get('ambulance_no')}, "
             f"level={current_level} ({LEVEL_INFO_CENTRAL[current_level]['role']})"
         )
+
+        # =========================================================
+        # 👇 NAYA FCM LOGIC: Redis se token nikal kar direct push maro
+        # Isse chahe WebSocket disconnect ho, tab bhi notification bajegi
+        # =========================================================
+        amb_raw = central_alert_row.get("ambulance_no")
+        if amb_raw:
+            amb_normalized = normalize_vehicle_number(amb_raw)
+            # Redis se token uthao
+            token = await redis_client.get(f"fcm_token:{amb_normalized}")
+            
+            if token:
+                logger.info(f"🚀 Triggering FCM from worker for amb={amb_normalized}")
+                await send_fcm_push(
+                    token=token,
+                    title=f"Ambulance {amb_raw} - New Alert",
+                    body=f"Alert: {central_alert_row.get('alert_type', 'Escalation')}",
+                    data={
+                        "alert_id": str(call_id),
+                        "type": "Late",
+                    }
+                )
+            else:
+                logger.info(f"SKIP FCM: No token found in Redis for amb={amb_normalized}")
+
     except Exception as e:
         logger.exception(f"broadcast_new_central_alert FAILED: {e}")
-
 
 # ===========================================================================
 # API — Take Action  (path-based level: /api/escalation/take_action/{level})
@@ -3794,6 +4246,43 @@ async def take_escalation_action(level: int, request: Request):
 
 
 
+
+
+# ============================================================
+# TEST API — FCM push manually test karne ke liye
+# ============================================================
+@app.get("/api/test-fcm")
+async def test_fcm_push(
+    token: str = Query(..., description="FCM device token"),
+    title: str = Query("Test Alert", description="Notification title"),
+    body: str = Query("This is a test notification", description="Notification body")
+):
+    """
+    FCM push notification manually test karne ke liye.
+    
+    Usage:
+      GET /api/test-fcm?token=cFtOhLxNj9c:APA91b...&title=Test&body=Hello
+    
+    Server logs me check karo:
+      ✅ FCM SUCCESS  → notification bajega
+      ❌ FCM ERROR    → token ya key me problem hai
+    """
+    logger.info(f"TEST FCM: manual test requested for token={token[:20]}...")
+
+    await send_fcm_push(
+        token=token,
+        title=title,
+        body=body,
+        data={"test": "true", "timestamp": str(datetime.now(ist).isoformat())}
+    )
+
+    return {
+        "status": "sent",
+        "message": "Check server logs for FCM response (✅ SUCCESS or ❌ ERROR)",
+        "token_preview": f"{token[:20]}...",
+        "title": title,
+        "body": body
+    }
 
 
 
