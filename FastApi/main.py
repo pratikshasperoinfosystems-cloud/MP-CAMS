@@ -4445,7 +4445,15 @@ async def broadcast_new_escalation(call_id: str, denial_record: dict):
         if await is_closed(call_id):
             return
 
-        current_level = await get_or_init_escalation_level(call_id, denial_record.get("added_date"), is_denial=True)
+        # 👇 FIX: Naye denial alert ka level uske naye added_date se calculate karo
+        elapsed = elapsed_minutes_since(denial_record.get("added_date"))
+        current_level = get_level_for_elapsed_minutes(elapsed)
+        if current_level < 2:
+            current_level = 2
+        current_level = min(current_level, 7)
+        
+        # Redis me forcefully update karo
+        await set_escalation_level(call_id, current_level)
 
         payload = await build_escalation_payload(
             call_id=call_id,
@@ -4494,12 +4502,13 @@ async def broadcast_new_central_alert(central_alert_row: dict):
         if alerts_with_sla:
             central_alert_row = alerts_with_sla[0]
 
-        # Central alerts ke liye is_denial=False
-        current_level = await get_or_init_escalation_level(
-            call_id,
-            central_alert_row.get("created_date"),
-            is_denial=False
-        )
+        # 👇 FIX: Naye alert ka level uske naye created_date se calculate karo aur Redis overwrite karo
+        elapsed = elapsed_minutes_since(central_alert_row.get("created_date"))
+        current_level = get_level_for_elapsed_minutes(elapsed)
+        current_level = min(current_level, 7)
+        
+        # Redis me forcefully update karo taaki purana level overwrite ho jaye
+        await set_escalation_level(call_id, current_level)
 
         payload = await build_escalation_payload(
             call_id=call_id,
@@ -4719,7 +4728,7 @@ async def take_escalation_action(level: int, request: Request):
 
     Body:
     {
-        "call_id": "ALERT_ID_OR_CALL_ID",  <-- Frontend yahan se alert_id ya call_id bhejega
+        "call_id": "ALERT_ID_OR_CALL_ID",  (ya "alert_id")
         "action_by": "user_id",
         "action_by_role": "MDT",
         "action_remark": "Ambulance dispatched",
@@ -4742,7 +4751,11 @@ async def take_escalation_action(level: int, request: Request):
         action_by_role  = LEVEL_INFO_CENTRAL[level]["role"]
 
         body              = await request.json()
-        payload_id        = str(body.get("call_id")) 
+        
+        # 👇 FIX: Dono keys check karo (call_id ya alert_id)
+        raw_id = body.get("call_id") or body.get("alert_id")
+        payload_id = str(raw_id).strip() if raw_id is not None else ""
+        
         action_by         = body.get("action_by", "unknown")
         action_remark     = body.get("action_remark", "")
         action_type       = body.get("action_type", "acknowledge")
@@ -4750,10 +4763,18 @@ async def take_escalation_action(level: int, request: Request):
         if body.get("action_by_role"):
             action_by_role = body.get("action_by_role")
 
-        if not payload_id:
+        # 👇 DEBUG LOG
+        logger.info(f"🚀 TAKE ACTION API CALLED. Received ID: '{payload_id}'")
+
+        if not payload_id or payload_id.lower() == "none":
             return {"status": "error", "message": "call_id or alert_id is required"}
 
-        if await is_closed(payload_id):
+        # Check if already closed
+        is_already_closed = await is_closed(payload_id)
+        logger.info(f"🔍 Checking is_closed for ID '{payload_id}': {is_already_closed}")
+        
+        if is_already_closed:
+            logger.warning(f"❌ BLOCKED: Incident {payload_id} is already closed in Redis.")
             return {"status": "error", "message": "Incident already closed"}
 
         # Mark action taken + cleanup Redis state (aage escalate nahi hoga)
@@ -4768,8 +4789,6 @@ async def take_escalation_action(level: int, request: Request):
 
         # =========================================================
         # IDENTIFY & UPDATE CORRECT TABLE
-        # Agar central_alerts me mila -> Central Alert hai
-        # Agar wahan nahi mila -> Denial Alert hai
         # =========================================================
         central_record = await database2.fetch_one(
             "SELECT alert_id FROM public.central_alerts WHERE CAST(alert_id AS text) = :id",
@@ -4795,7 +4814,7 @@ async def take_escalation_action(level: int, request: Request):
                         "alert_id": payload_id,
                     },
                 )
-                logger.info(f"CENTRAL TABLE UPDATED: alert_id={payload_id}, status=2")
+                logger.info(f"✅ CENTRAL TABLE UPDATED: alert_id={payload_id}, status=2")
             except Exception as db_err:
                 logger.exception(f"Central DB update failed: {db_err}")
         else:
@@ -4813,7 +4832,7 @@ async def take_escalation_action(level: int, request: Request):
                         "call_id": payload_id,
                     },
                 )
-                logger.info(f"DENIAL TABLE UPDATED: call_id={payload_id}, status=2")
+                logger.info(f"✅ DENIAL TABLE UPDATED: call_id={payload_id}, status=2")
             except Exception as db_err:
                 logger.exception(f"Denial DB update failed: {db_err}")
 
