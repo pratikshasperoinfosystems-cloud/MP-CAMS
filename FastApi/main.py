@@ -3517,6 +3517,162 @@ async def mark_action_taken(
     return action_details
 
 
+# Escalation Flow Table Mapping
+ESC_FLOW_LEVEL_MAP = {
+    1: "pilot",
+    2: "dm",
+    3: "zm",
+    4: "om",   
+    5: "sh",   
+    6: "coo",
+    7: "cbo",
+}
+
+ROLE_NAMES = {
+    1: "Pilot",
+    2: "DM",
+    3: "ZM",
+    4: "OM",
+    5: "SH",
+    6: "COO",
+    7: "CBO"
+}
+
+def safe_int(val):
+    """Convert string/float to int safely, return None if invalid."""
+    if val is None or str(val).strip() == "" or str(val).strip() == "None":
+        return None
+    try:
+        return int(float(str(val).strip()))
+    except (ValueError, TypeError):
+        return None
+
+async def update_escalation_flow(
+    call_id: str,
+    alert_id: str,
+    level: int,
+    event_type: str,
+    action_by: str = None,
+    action_remark: str = None,
+    generated_at: str = None
+):
+    """alert_escalation_flow table me real-time tracking maintain karta hai."""
+    try:
+        # 👇 Dono ko int me convert karo
+        c_id = safe_int(call_id)
+        a_id = safe_int(alert_id)
+        lvl = safe_int(level)
+        
+        # Timestamp convert karo
+        gen_dt = to_datetime(generated_at) if generated_at else None
+        
+        # Build WHERE clause (Sirf wahi ID search karenge jo real me available hai aur 0 nahi hai)
+        where_clauses = []
+        params = {}
+        if a_id is not None and a_id != 0:
+            where_clauses.append("alert_id = :a_id")
+            params["a_id"] = a_id
+        if c_id is not None and c_id != 0:
+            where_clauses.append("call_id = :c_id")
+            params["c_id"] = c_id
+            
+        if not where_clauses:
+            return # Koi real ID nahi hai track karne ke liye
+
+        query = f"""
+            SELECT sr_no FROM alert_escalation_flow 
+            WHERE {' OR '.join(where_clauses)}
+            LIMIT 1
+        """
+        existing = await database2.fetch_one(query, params)
+
+        if event_type == "NEW_ALERT":
+            if not existing:
+                role_prefix = ESC_FLOW_LEVEL_MAP.get(level)
+                role_name = ROLE_NAMES.get(level, "Unknown")
+                
+                cols = ["alert_id", "call_id", "alert_generated_at", "level", "status", "is_closed", "created_at", "updated_at"]
+                vals = [":alert_id", ":call_id", ":alert_generated_at", ":level", ":status", ":is_closed", "NOW()", "NOW()"]
+                
+                # 👇 Agar value None hai to Integer 0 daal do (DB NOT NULL constraint ke liye)
+                params_insert = {
+                    "alert_id": a_id if a_id is not None else 0,
+                    "call_id": c_id if c_id is not None else 0,
+                    "alert_generated_at": gen_dt,
+                    "level": lvl,
+                    "status": f"Escalated To {role_name}",
+                    "is_closed": 0
+                }
+
+                if role_prefix:
+                    cols.append(f"{role_prefix}_send_datetime")
+                    vals.append("NOW()")
+
+                sql = f"""
+                    INSERT INTO alert_escalation_flow ({', '.join(cols)})
+                    VALUES ({', '.join(vals)})
+                """
+                await database2.execute(sql, params_insert)
+
+        elif event_type == "LEVEL_BUMP":
+            if not existing:
+                # Fallback if bumped before insert
+                await update_escalation_flow(call_id, alert_id, level, "NEW_ALERT", generated_at=generated_at)
+                existing = await database2.fetch_one(query, params)
+                if not existing: 
+                    return
+
+            role_prefix = ESC_FLOW_LEVEL_MAP.get(level)
+            role_name = ROLE_NAMES.get(level, "Unknown")
+            params_update = {
+                "sr_no": existing["sr_no"],
+                "level": lvl,
+                "status": f"Escalated To {role_name}"
+            }
+            if role_prefix:
+                sql = f"""
+                    UPDATE alert_escalation_flow 
+                    SET level = :level, status = :status, {role_prefix}_send_datetime = NOW(), updated_at = NOW()
+                    WHERE sr_no = :sr_no
+                """
+            else:
+                sql = """
+                    UPDATE alert_escalation_flow 
+                    SET level = :level, status = :status, updated_at = NOW()
+                    WHERE sr_no = :sr_no
+                """
+            await database2.execute(sql, params_update)
+
+        elif event_type == "ACTION_TAKEN":
+            if not existing:
+                return
+
+            role_prefix = ESC_FLOW_LEVEL_MAP.get(level)
+            params_update = {
+                "sr_no": existing["sr_no"],
+                "action_by": action_by,
+                "status": "Closed",
+                "is_closed": 1,
+                "action_remark": action_remark
+            }
+            if role_prefix:
+                sql = f"""
+                    UPDATE alert_escalation_flow 
+                    SET status = :status, is_closed = :is_closed, action_by = :action_by, 
+                        {role_prefix}_action = :action_remark, {role_prefix}_action_datetime = NOW(),
+                        updated_at = NOW()
+                    WHERE sr_no = :sr_no
+                """
+            else:
+                sql = """
+                    UPDATE alert_escalation_flow 
+                    SET status = :status, is_closed = :is_closed, action_by = :action_by, updated_at = NOW()
+                    WHERE sr_no = :sr_no
+                """
+            await database2.execute(sql, params_update)
+
+    except Exception as e:
+        logger.error(f"Failed to update escalation flow: {e}")
 # ===========================================================================
 # REDIS LEADER LOCK (bump watcher ke liye)
 # ===========================================================================
@@ -4015,6 +4171,17 @@ async def escalation_level_bump_watcher():
                     f"(elapsed={elapsed} min, jumped {new_level - current_level} level(s))"
                 )
 
+                # =========================================================
+                # 👇 TRACK IN ESCALATION FLOW TABLE (LEVEL BUMP)
+                # =========================================================
+                await update_escalation_flow(
+                    call_id=0 if not is_denial_rec else call_id,  
+                    alert_id=0 if is_denial_rec else str(d.get("alert_id")),
+                    level=new_level,
+                    event_type="LEVEL_BUMP",
+                    generated_at=check_date
+                )
+
             if cursor == 0:
                 await asyncio.sleep(60)
             else:
@@ -4035,7 +4202,6 @@ async def broadcast_new_escalation(call_id: str, denial_record: dict):
         if await is_closed(call_id):
             return
 
-        # 👈 Yahan is_denial=True pass kar rahe hain
         current_level = await get_or_init_escalation_level(call_id, denial_record.get("added_date"), is_denial=True)
 
         payload = await build_escalation_payload(
@@ -4050,6 +4216,18 @@ async def broadcast_new_escalation(call_id: str, denial_record: dict):
             f"NEW ESCALATION: call_id={call_id}, "
             f"level={current_level} ({LEVEL_INFO_CENTRAL[current_level]['role']})"
         )
+
+        # =========================================================
+        # 👇 TRACK IN ESCALATION FLOW TABLE (Denial ke liye alert_id = 0)
+        # =========================================================
+        await update_escalation_flow(
+            call_id=call_id,
+            alert_id=0, # 👈 Yahan 0 bhej rahe hain
+            level=current_level,
+            event_type="NEW_ALERT",
+            generated_at=denial_record.get("added_date")
+        )
+
     except Exception as e:
         logger.exception(f"broadcast_new_escalation FAILED: {e}")
 
@@ -4095,14 +4273,10 @@ async def broadcast_new_central_alert(central_alert_row: dict):
             f"level={current_level} ({LEVEL_INFO_CENTRAL[current_level]['role']})"
         )
 
-        # =========================================================
         # 👇 NAYA FCM LOGIC: Redis se token nikal kar direct push maro
-        # Isse chahe WebSocket disconnect ho, tab bhi notification bajegi
-        # =========================================================
         amb_raw = central_alert_row.get("ambulance_no")
         if amb_raw:
             amb_normalized = normalize_vehicle_number(amb_raw)
-            # Redis se token uthao
             token = await redis_client.get(f"fcm_token:{amb_normalized}")
             
             if token:
@@ -4119,9 +4293,19 @@ async def broadcast_new_central_alert(central_alert_row: dict):
             else:
                 logger.info(f"SKIP FCM: No token found in Redis for amb={amb_normalized}")
 
+        # =========================================================
+        # 👇 TRACK IN ESCALATION FLOW TABLE (Central Alert ke liye call_id = 0)
+        # =========================================================
+        await update_escalation_flow(
+            call_id=0, # 👈 Yahan 0 bhej rahe hain
+            alert_id=str(central_alert_row.get("alert_id")),
+            level=current_level,
+            event_type="NEW_ALERT",
+            generated_at=central_alert_row.get("created_date")
+        )
+
     except Exception as e:
         logger.exception(f"broadcast_new_central_alert FAILED: {e}")
-
 # ===========================================================================
 # API — Take Action  (path-based level: /api/escalation/take_action/{level})
 #   koi bhi role action le → incident close, aage forward nahi
@@ -4133,116 +4317,116 @@ class TakeActionRequest(BaseModel):
     action_remark: Optional[str] = ""
     action_type: Optional[str] = "acknowledge"
 
-@app.post("/api/escalation/take_action/{level}")
-async def take_escalation_action(level: int, request: Request):
-    """
-    URL:  POST /api/escalation/take_action/1    (1=MDT, 2=DM, ..., 7=CBO)
+# @app.post("/api/escalation/take_action/{level}")
+# async def take_escalation_action(level: int, request: Request):
+#     """
+#     URL:  POST /api/escalation/take_action/1    (1=MDT, 2=DM, ..., 7=CBO)
 
-    Body:
-    {
-        "call_id": "CALL123",
-        "action_by": "user_id",
-        "action_by_role": "MDT",
-        "action_remark": "Ambulance dispatched",
-        "action_type": "acknowledge"
-    }
-    """
-    try:
-        # Validate level
-        if level < 1 or level > 7:
-            return {
-                "status": "error",
-                "message": f"Invalid level: {level}. Must be 1-7.",
-                "valid_levels": {
-                    1: "MDT", 2: "DM", 3: "ZM", 4: "OM",
-                    5: "SH", 6: "COO", 7: "CBO"
-                }
-            }
+#     Body:
+#     {
+#         "call_id": "CALL123",
+#         "action_by": "user_id",
+#         "action_by_role": "MDT",
+#         "action_remark": "Ambulance dispatched",
+#         "action_type": "acknowledge"
+#     }
+#     """
+#     try:
+#         # Validate level
+#         if level < 1 or level > 7:
+#             return {
+#                 "status": "error",
+#                 "message": f"Invalid level: {level}. Must be 1-7.",
+#                 "valid_levels": {
+#                     1: "MDT", 2: "DM", 3: "ZM", 4: "OM",
+#                     5: "SH", 6: "COO", 7: "CBO"
+#                 }
+#             }
 
-        action_by_level = level
-        action_by_role  = LEVEL_INFO_CENTRAL[level]["role"]
+#         action_by_level = level
+#         action_by_role  = LEVEL_INFO_CENTRAL[level]["role"]
 
-        body              = await request.json()
-        call_id           = body.get("call_id")
-        action_by         = body.get("action_by", "unknown")
-        action_remark     = body.get("action_remark", "")
-        action_type       = body.get("action_type", "acknowledge")
+#         body              = await request.json()
+#         call_id           = body.get("call_id")
+#         action_by         = body.get("action_by", "unknown")
+#         action_remark     = body.get("action_remark", "")
+#         action_type       = body.get("action_type", "acknowledge")
 
-        # Body mein role diya to wahi use karo, warnha URL level se
-        if body.get("action_by_role"):
-            action_by_role = body.get("action_by_role")
+#         # Body mein role diya to wahi use karo, warnha URL level se
+#         if body.get("action_by_role"):
+#             action_by_role = body.get("action_by_role")
 
-        if not call_id:
-            return {"status": "error", "message": "call_id is required"}
+#         if not call_id:
+#             return {"status": "error", "message": "call_id is required"}
 
-        if await is_closed(call_id):
-            return {"status": "error", "message": "Incident already closed"}
+#         if await is_closed(call_id):
+#             return {"status": "error", "message": "Incident already closed"}
 
-        # Mark action taken + cleanup Redis state (aage escalate nahi hoga)
-        action_details = await mark_action_taken(
-            call_id=call_id,
-            action_by=action_by,
-            action_by_role=action_by_role,
-            action_by_level=action_by_level,
-            action_remark=action_remark,
-            action_type=action_type,
-        )
+#         # Mark action taken + cleanup Redis state (aage escalate nahi hoga)
+#         action_details = await mark_action_taken(
+#             call_id=call_id,
+#             action_by=action_by,
+#             action_by_role=action_by_role,
+#             action_by_level=action_by_level,
+#             action_remark=action_remark,
+#             action_type=action_type,
+#         )
 
-        # DB update (central_alerts → CLOSED)
-        try:
-            await database2.execute(
-                """
-                UPDATE public.central_alerts
-                SET escalate_status = 'CLOSED',
-                    cancel_by        = :action_by,
-                    cancel_date      = NOW(),
-                    remark           = CONCAT(COALESCE(remark, ''),
-                                             ' | CLOSED BY ', :role, ': ', :remark)
-                WHERE alert_id = :call_id
-                """,
-                {
-                    "action_by": action_by,
-                    "role":      action_by_role,
-                    "remark":    action_remark,
-                    "call_id":   call_id,
-                },
-            )
-        except Exception as db_err:
-            logger.exception(f"DB update failed (still broadcasting): {db_err}")
+#         # DB update (central_alerts → CLOSED)
+#         try:
+#             await database2.execute(
+#                 """
+#                 UPDATE public.central_alerts
+#                 SET escalate_status = 'CLOSED',
+#                     cancel_by        = :action_by,
+#                     cancel_date      = NOW(),
+#                     remark           = CONCAT(COALESCE(remark, ''),
+#                                              ' | CLOSED BY ', :role, ': ', :remark)
+#                 WHERE alert_id = :call_id
+#                 """,
+#                 {
+#                     "action_by": action_by,
+#                     "role":      action_by_role,
+#                     "remark":    action_remark,
+#                     "call_id":   call_id,
+#                 },
+#             )
+#         except Exception as db_err:
+#             logger.exception(f"DB update failed (still broadcasting): {db_err}")
 
-        # Broadcast to all WS clients
-        denial_record = await fetch_denial_record(call_id)
-        payload = await build_escalation_payload(
-            call_id=call_id,
-            denial_record=denial_record,
-            current_level=action_by_level,
-            event_type="escalation_closed",
-            extra={
-                "action_by":         action_by,
-                "action_by_role":    action_by_role,
-                "action_by_level":   action_by_level,
-                "action_remark":     action_remark,
-                "action_type":       action_type,
-                "action_taken_at":   action_details["action_taken_at"],
-                "closed":            True,
-            },
-        )
-        manager.broadcast(payload)
+#         # Broadcast to all WS clients
+#         denial_record = await fetch_denial_record(call_id)
+#         payload = await build_escalation_payload(
+#             call_id=call_id,
+#             denial_record=denial_record,
+#             current_level=action_by_level,
+#             event_type="escalation_closed",
+#             extra={
+#                 "action_by":         action_by,
+#                 "action_by_role":    action_by_role,
+#                 "action_by_level":   action_by_level,
+#                 "action_remark":     action_remark,
+#                 "action_type":       action_type,
+#                 "action_taken_at":   action_details["action_taken_at"],
+#                 "closed":            True,
+#             },
+#         )
+#         manager.broadcast(payload)
 
-        logger.info(
-            f"ACTION TAKEN → INCIDENT CLOSED: call_id={call_id}, "
-            f"by={action_by_role} (level {action_by_level}), remark={action_remark}"
-        )
+#         logger.info(
+#             f"ACTION TAKEN → INCIDENT CLOSED: call_id={call_id}, "
+#             f"by={action_by_role} (level {action_by_level}), remark={action_remark}"
+#         )
 
-        return {
-            "status": "success",
-            "message": "Action taken, incident closed. Aage escalate nahi hoga.",
-            "action_details": action_details,
-        }
+#         return {
+#             "status": "success",
+#             "message": "Action taken, incident closed. Aage escalate nahi hoga.",
+#             "action_details": action_details,
+#         }
 
-    except Exception as e:
-        logger.exception(f"take_escalation_action FAILED: {e}")
-        return {"status": "error", "message": str(e)}
+#     except Exception as e:
+#         logger.exception(f"take_escalation_action FAILED: {e}")
+#         return {"status": "error", "message": str(e)}
 
 
 
@@ -4285,14 +4469,155 @@ async def test_fcm_push(
     }
 
 
+@app.post("/api/escalation/take_action/{level}")
+async def take_escalation_action(level: int, request: Request):
+    """
+    URL:  POST /api/escalation/take_action/1    (1=MDT, 2=DM, ..., 7=CBO)
 
-    
+    Body:
+    {
+        "call_id": "ALERT_ID_OR_CALL_ID",  <-- Frontend yahan se alert_id ya call_id bhejega
+        "action_by": "user_id",
+        "action_by_role": "MDT",
+        "action_remark": "Ambulance dispatched",
+        "action_type": "acknowledge"
+    }
+    """
+    try:
+        # Validate level
+        if level < 1 or level > 7:
+            return {
+                "status": "error",
+                "message": f"Invalid level: {level}. Must be 1-7.",
+                "valid_levels": {
+                    1: "MDT", 2: "DM", 3: "ZM", 4: "OM",
+                    5: "SH", 6: "COO", 7: "CBO"
+                }
+            }
 
+        action_by_level = level
+        action_by_role  = LEVEL_INFO_CENTRAL[level]["role"]
 
+        body              = await request.json()
+        payload_id        = str(body.get("call_id")) 
+        action_by         = body.get("action_by", "unknown")
+        action_remark     = body.get("action_remark", "")
+        action_type       = body.get("action_type", "acknowledge")
 
+        if body.get("action_by_role"):
+            action_by_role = body.get("action_by_role")
 
+        if not payload_id:
+            return {"status": "error", "message": "call_id or alert_id is required"}
 
+        if await is_closed(payload_id):
+            return {"status": "error", "message": "Incident already closed"}
 
+        # Mark action taken + cleanup Redis state (aage escalate nahi hoga)
+        action_details = await mark_action_taken(
+            call_id=payload_id,
+            action_by=action_by,
+            action_by_role=action_by_role,
+            action_by_level=action_by_level,
+            action_remark=action_remark,
+            action_type=action_type,
+        )
 
+        # =========================================================
+        # IDENTIFY & UPDATE CORRECT TABLE
+        # Agar central_alerts me mila -> Central Alert hai
+        # Agar wahan nahi mila -> Denial Alert hai
+        # =========================================================
+        central_record = await database2.fetch_one(
+            "SELECT alert_id FROM public.central_alerts WHERE CAST(alert_id AS text) = :id",
+            {"id": payload_id}
+        )
 
-    
+        if central_record:
+            # --- CENTRAL ALERT ---
+            try:
+                await database2.execute(
+                    """
+                    UPDATE public.central_alerts
+                    SET escalate_status = '2',
+                        escalated_deny_remark = :remark,
+                        cancel_by = :action_by,
+                        cancel_date = NOW(),
+                        updated_date = NOW()
+                    WHERE CAST(alert_id AS text) = :alert_id
+                    """,
+                    {
+                        "remark": action_remark,
+                        "action_by": action_by,
+                        "alert_id": payload_id,
+                    },
+                )
+                logger.info(f"CENTRAL TABLE UPDATED: alert_id={payload_id}, status=2")
+            except Exception as db_err:
+                logger.exception(f"Central DB update failed: {db_err}")
+        else:
+            # --- DENIAL ALERT ---
+            try:
+                await database2.execute(
+                    """
+                    UPDATE public.denial_escalation_master
+                    SET escalate_status = '2',
+                        remark = :remark
+                    WHERE CAST(call_id AS text) = :call_id
+                    """,
+                    {
+                        "remark": action_remark,
+                        "call_id": payload_id,
+                    },
+                )
+                logger.info(f"DENIAL TABLE UPDATED: call_id={payload_id}, status=2")
+            except Exception as db_err:
+                logger.exception(f"Denial DB update failed: {db_err}")
+
+        # =========================================================
+        # BROADCAST TO ALL WS CLIENTS
+        # =========================================================
+        denial_record_payload = await fetch_denial_record(payload_id)
+        payload = await build_escalation_payload(
+            call_id=payload_id,
+            denial_record=denial_record_payload,
+            current_level=action_by_level,
+            event_type="escalation_closed",
+            extra={
+                "action_by":         action_by,
+                "action_by_role":    action_by_role,
+                "action_by_level":   action_by_level,
+                "action_remark":     action_remark,
+                "action_type":       action_type,
+                "action_taken_at":   action_details["action_taken_at"],
+                "closed":            True,
+            },
+        )
+        manager.broadcast(payload)
+
+        logger.info(
+            f"ACTION TAKEN → INCIDENT CLOSED: id={payload_id}, "
+            f"by={action_by_role} (level {action_by_level}), remark={action_remark}"
+        )
+
+        # =========================================================
+        # TRACK IN AUDIT TABLE (alert_escalation_flow)
+        # =========================================================
+        await update_escalation_flow(
+            call_id=payload_id,
+            alert_id=payload_id, 
+            level=action_by_level,
+            event_type="ACTION_TAKEN",
+            action_by=action_by,
+            action_remark=action_remark
+        )
+
+        return {
+            "status": "success",
+            "message": "Action taken, incident closed successfully.",
+            "action_details": action_details,
+        }
+
+    except Exception as e:
+        logger.exception(f"take_escalation_action FAILED: {e}")
+        return {"status": "error", "message": str(e)}
