@@ -997,207 +997,349 @@ async def get_required_default_columns():
 async def denial_complaints_insert_worker():
     """
     Background worker: MySQL (ems_denial_complaints) -> Postgres (denial_escalation_master).
-    Current month only. Uses MySQL `id` for uniqueness check.
-    inc_ref_id is intentionally SKIPPED. call_id is included.
-    alert_type is force-set to "incident denial".
     """
     logger.info(f"Denial Complaints Insert Worker STARTED (instance={_worker_instance_id})")
- 
     while True:
         try:
             is_leader = await try_acquire_denial_worker_leadership()
- 
             if not is_leader:
                 await asyncio.sleep(5)
                 continue
- 
             required_defaults = await get_required_default_columns()
- 
             # ------------------------------------------------
-            # STEP 1: MySQL se current month rows lao
+            # STEP 1: MySQL se current month rows lao (WITH JOINS)
             # ------------------------------------------------
+            # 👇 NAYA QUERY: dst_id ki jagah dst_code use kiya gaya hai
             query = """
                 SELECT
-                    id, call_id, amb_no, amb_default_mobile, caller_no,
-                    hp_name, challenge_val, meaning, denial_remark,
-                    added_by, added_date
-                FROM ems_denial_complaints
-                WHERE YEAR(added_date) = YEAR(NOW())
-                  AND MONTH(added_date) = MONTH(NOW())
-                ORDER BY added_date DESC
+                    edc.id, edc.call_id, edc.amb_no, edc.amb_default_mobile, edc.caller_no,
+                    edc.hp_name, edc.challenge_val, edc.denial_remark,
+                    edc.added_by, edc.added_date,
+                    dr.meaning AS reason_meaning,
+                    dist.dst_name AS dst_name
+                FROM ems_denial_complaints edc
+                LEFT JOIN ems_denial_reason dr 
+                    ON edc.meaning = dr.id
+                LEFT JOIN ems_mas_districts dist 
+                    ON edc.amb_district = dist.dst_code  -- 👈 YAHAN FIX KIYA GAYA HAI
+                WHERE YEAR(edc.added_date) = YEAR(NOW())
+                  AND MONTH(edc.added_date) = MONTH(NOW())
+                ORDER BY edc.added_date DESC
                 LIMIT 1000;
             """
- 
             rows = await database.fetch_all(query)
- 
+
+
             logger.info("=" * 60)
+
             logger.info(f"Denial worker: MySQL returned {len(rows)} rows (current month filter)")
- 
+
             if len(rows) == 0:
+
                 try:
+
                     sample = await database.fetch_one(
+
                         "SELECT MIN(added_date) AS min_dt, MAX(added_date) AS max_dt, "
+
                         "COUNT(*) AS total FROM ems_denial_complaints"
+
                     )
+
                     if sample:
+
                         logger.warning(
+
                             f"Denial worker: 0 rows for current month! "
+
                             f"Table has min_date={sample['min_dt']}, "
-                            f"max_date={sample['max_dt']}, total_rows={sample['total']}"
+
+                            f"max_date={sample['max_date']}, total_rows={sample['total']}"
+
                         )
+
                 except Exception as e:
+
                     logger.error(f"Denial worker: sample date check failed: {e}")
+
                 await asyncio.sleep(10)
+
                 continue
- 
+
             # ------------------------------------------------
+
             # STEP 2: Sample 3 rows ka data log karo
+
             # ------------------------------------------------
+
             for idx, r in enumerate(rows[:3]):
+
                 try:
+
                     d = dict(r)
+
                     logger.info(
+
                         f"Denial worker: sample row {idx} -> "
+
                         f"id={d.get('id')!r}, "
+
                         f"call_id={d.get('call_id')!r}, "
+
                         f"amb_no={d.get('amb_no')!r}, "
-                        f"challenge_val={d.get('challenge_val')!r}, "
+
+                        f"reason_meaning={d.get('reason_meaning')!r}, " # 👈 Changed
+
+                        f"dst_name={d.get('dst_name')!r}, "            # 👈 Changed
+
                         f"added_date={d.get('added_date')!r}"
+
                     )
+
                 except Exception as e:
+
                     logger.error(f"Denial worker: sample log error: {e}")
- 
+
             # ------------------------------------------------
+
             # STEP 3: Per-row processing
+
             # ------------------------------------------------
+
             inserted_count = 0
+
             skipped_existing = 0
+
             skipped_no_id = 0
+
             failed_insert = 0
+
             failed_examples = []
- 
+
             for row in rows:
+
                 try:
+
                     d = dict(row)
+
                     mysql_id = d.get("id")
- 
+
                     if not mysql_id:
+
                         skipped_no_id += 1
+
                         continue
- 
+
                     # Check karo: ye mysql_id pehle se Postgres mein hai?
+
                     existing = await database2.fetch_one(
+
                         """
+
                         SELECT id
+
                         FROM denial_escalation_master
+
                         WHERE mysql_id = :mysql_id
+
                         """,
+
                         {"mysql_id": mysql_id}
+
                     )
- 
+
                     if existing:
+
                         skipped_existing += 1
+
                         continue
- 
+
                     # Insert karlo
+
+                    # 👇 NAYA: meaning ki jagah reason_meaning, aur dst_name add kiya
+
                     params = {
+
                         "id": mysql_id,
+
                         "mysql_id": mysql_id,
+
                         "call_id": d.get("call_id"),
+
                         "amb_no": d.get("amb_no"),
+
                         "amb_default_mobile": d.get("amb_default_mobile"),
+
                         "caller_no": d.get("caller_no"),
+
                         "hp_name": d.get("hp_name"),
+
                         "challenge_val": d.get("challenge_val"),
-                        "meaning": d.get("meaning"),
+
+                        "meaning": d.get("reason_meaning"),  # 👈 Ab ye text aayega ID nahi
+
+                        "dst_name": d.get("dst_name"),       # 👈 District naam add kiya
+
                         "denial_remark": d.get("denial_remark"),
+
                         "added_by": d.get("added_by"),
+
                         "added_date": d.get("added_date"),
+
                     }
- 
+
                     # pehle NOT NULL defaults lagao
+
                     params.update(required_defaults)
- 
+
                     # ab forced defaults — alert_type = "incident deny" hamesha
+
                     params.update(FORCED_DEFAULTS)
- 
+
                     columns = ", ".join(params.keys())
+
                     placeholders = ", ".join(f":{k}" for k in params.keys())
- 
+
                     await database2.execute(
+
                         f"""
+
                         INSERT INTO denial_escalation_master ({columns})
+
                         VALUES ({placeholders})
+
                         """,
+
                         params
+
                     )
+
                     inserted_count += 1
- 
- 
- 
-                # 👈 Separate try/except — broadcast fail ho to insert count disturb na ho
+
+                    # NAYA: alert_escalation_flow table me insert karo
+
                     try:
+
+                        await insert_into_escalation_flow('denial', d)
+
+                    except Exception as flow_err:
+
+                        logger.error(f"Flow insert failed for denial: {flow_err}")
+
+                    # 👈 Separate try/except — broadcast fail ho to insert count disturb na ho
+
+                    try:
+
                         await broadcast_new_escalation(
+
                             call_id=d.get("call_id"),
+
                             denial_record={
+
                                 "id":                mysql_id,
+
                                 "mysql_id":          mysql_id,
+
                                 "call_id":           d.get("call_id"),
+
                                 "amb_no":            d.get("amb_no"),
+
                                 "amb_default_mobile": d.get("amb_default_mobile"),
+
                                 "caller_no":         d.get("caller_no"),
+
                                 "hp_name":           d.get("hp_name"),
+
                                 "challenge_val":     d.get("challenge_val"),
-                                "meaning":           d.get("meaning"),
+
+                                "meaning":           d.get("reason_meaning"), # 👈 Text bheja
+
+                                "dst_name":          d.get("dst_name"),       # 👈 Naam bheja
+
                                 "denial_remark":     d.get("denial_remark"),
+
                                 "alert_type":        "incident denial",
+
                                 "added_by":          d.get("added_by"),
+
                                 "added_date":        d.get("added_date").isoformat() if d.get("added_date") else None,
+
                             },
+
                         )
+
                     except Exception as b_err:
+
                         logger.error(f"Denial worker: broadcast failed for id={mysql_id}: {b_err}")
- 
- 
+
                 except Exception as row_err:
+
                     failed_insert += 1
+
                     if len(failed_examples) < 5:
+
                         try:
+
                             d_err = dict(row)
+
                             failed_examples.append({
+
                                 "id": d_err.get("id"),
+
                                 "call_id": d_err.get("call_id"),
+
                                 "amb_no": d_err.get("amb_no"),
+
                                 "error": str(row_err),
+
                             })
+
                         except Exception:
+
                             failed_examples.append({"error": str(row_err)})
+
                     continue
- 
+
             # ------------------------------------------------
+
             # STEP 4: Final summary
+
             # ------------------------------------------------
+
             logger.info(
+
                 f"Denial worker SUMMARY: "
+
                 f"fetched={len(rows)}, "
+
                 f"inserted={inserted_count}, "
+
                 f"existing={skipped_existing}, "
+
                 f"no_id={skipped_no_id}, "
+
                 f"failed={failed_insert}"
+
             )
- 
+
             if failed_examples:
+
                 logger.warning(
+
                     f"Denial worker: failed insert examples -> {failed_examples}"
+
                 )
- 
+
             if inserted_count:
+
                 logger.info(f"Denial worker: ✅ inserted {inserted_count} new rows")
- 
+
         except Exception as e:
+
             logger.error(f"Denial Complaints Insert Worker Error: {e}", exc_info=True)
- 
+
         await asyncio.sleep(10)
+ 
     
     ##################################################################################
 
@@ -1800,12 +1942,10 @@ async def rtm_alerts_ws(websocket: WebSocket):
 
 # -------------------- Central Alerts WebSocket --------------------
 
- 
 # ---- tuning knobs ----
 MAX_CONSECUTIVE_RECV_ERRORS = 5  # only bail if the socket is TRULY broken (not for one bad message)
 RECV_ERROR_WINDOW = 10           # errors must cluster within this many seconds to count as "truly broken"
- 
- 
+
 def _bump_error(consecutive_errors: int, first_error_ts):
     """Track error bursts so a single stray error never kills a healthy connection,
     but a genuinely dead socket (many errors back-to-back) still gets cleaned up."""
@@ -1813,8 +1953,7 @@ def _bump_error(consecutive_errors: int, first_error_ts):
     if first_error_ts is None or now - first_error_ts > RECV_ERROR_WINDOW:
         return 1, now
     return consecutive_errors + 1, first_error_ts
- 
- 
+
 @app.websocket("/ws/central_alerts")
 async def central_alerts_ws(websocket: WebSocket):
 
@@ -1840,11 +1979,17 @@ async def central_alerts_ws(websocket: WebSocket):
         # =====================================================
         rows = await cached_query(
             """
-            SELECT *
-            FROM central_alerts
-            WHERE inc_datetime >= CURRENT_DATE
-              AND inc_datetime < CURRENT_DATE + INTERVAL '1 day'
-            ORDER BY inc_datetime DESC, alert_id DESC
+            SELECT c.*, af.status AS alert_flow_status
+            FROM central_alerts c
+            LEFT JOIN LATERAL (
+                SELECT status
+                FROM alert_escalation_flow
+                WHERE alert_id = c.alert_id
+                LIMIT 1
+            ) af ON TRUE
+            WHERE c.inc_datetime >= CURRENT_DATE
+              AND c.inc_datetime < CURRENT_DATE + INTERVAL '1 day'
+            ORDER BY c.inc_datetime DESC, c.alert_id DESC
             """,
             ttl=3,
             fetch="all",
@@ -1903,15 +2048,82 @@ async def central_alerts_ws(websocket: WebSocket):
         # 2️⃣ TWO CONCURRENT LOOPS — real-time updates ke liye
         # =====================================================
 
+        # 👇 YE FUNCTION AB BATCH QUERY MAREGA (100% SAFE & FAST)
+        async def ensure_status(records):
+            if not records:
+                return records
+                
+            # 1. Un records ko nikaalo jisme status missing hai
+            missing_records = [r for r in records if "alert_flow_status" not in r or r.get("alert_flow_status") is None]
+            
+            # Agar sabke paas status hai, toh kuch karne ki zaroorat nahi
+            if not missing_records:
+                return records
+                
+            # 2. Missing records ke alert_ids nikaalo
+            alert_ids = [r.get("alert_id") for r in missing_records if r.get("alert_id") is not None]
+            
+            if not alert_ids:
+                for r in missing_records:
+                    r["alert_flow_status"] = None
+                return records
+                
+            try:
+                # 3. Data type issue fix karo
+                try:
+                    clean_ids = [int(aid) for aid in alert_ids]
+                except (ValueError, TypeError):
+                    clean_ids = alert_ids
+                    
+                # 4. Ek hi query mein saare IDs ka status nikaalo (Batch Query)
+                ids_str = ",".join(str(aid) for aid in clean_ids)
+                q = f"""
+                    SELECT alert_id, status 
+                    FROM alert_escalation_flow 
+                    WHERE alert_id IN ({ids_str})
+                """
+                rows = await database2.fetch_all(q)
+                
+                # 5. Dictionary bana lo taaki map karna fast ho
+                status_map = {}
+                for row in rows:
+                    try:
+                        status_map[int(row["alert_id"])] = row["status"]
+                    except (ValueError, TypeError):
+                        status_map[str(row["alert_id"])] = row["status"]
+                        
+                # 6. Missing records mein status attach karo
+                for r in missing_records:
+                    aid = r.get("alert_id")
+                    status = None
+                    try:
+                        status = status_map.get(int(aid))
+                    except (ValueError, TypeError):
+                        status = status_map.get(str(aid))
+                    r["alert_flow_status"] = status
+                    
+            except Exception as e:
+                print(f"❌ Error in ensure_status: {e}")
+                # Agar query fail ho jaye, toh None set kar do, disconnect mat karo
+                for r in missing_records:
+                    r["alert_flow_status"] = None
+                
+            return records
+
+
         async def drain_loop():
             """Queue se broadcast messages nikal ke client pe bhejo."""
             while True:
                 payload = await queue.get()
                 msg_type = payload.get("type")
 
-                # 👇 Sirf ALL_ALERTS type bhejo — bilkul same format as initial load
-                # Frontend ko kuch nahi badalna padega
                 if msg_type == "ALL_ALERTS":
+                    data = payload.get("data", {})
+                    records = data.get("today_all", [])
+                    
+                    # 👇 YAHAN ENSURE_STATUS CALL HO RAHA HAI
+                    data["today_all"] = await ensure_status(records)
+
                     if not await manager.safe_send(websocket, payload):
                         break
 
@@ -1926,37 +2138,40 @@ async def central_alerts_ws(websocket: WebSocket):
                 conditions = []
                 params = {}
 
-                # incident filter
                 if incident_id:
-                    conditions.append("incident_id = :incident_id")
+                    conditions.append("c.incident_id = :incident_id")
                     params["incident_id"] = str(incident_id)
 
-                # created_date filter
                 if filter_date:
                     start_dt = datetime.strptime(filter_date, "%Y-%m-%d")
                     end_dt = start_dt + timedelta(days=1)
 
                     conditions.append("""
-                        created_date >= :start_date
-                        AND created_date < :end_date
+                        c.created_date >= :start_date
+                        AND c.created_date < :end_date
                     """)
 
                     params["start_date"] = start_dt
                     params["end_date"] = end_dt
                 else:
-                    # default today logic
                     conditions.append("""
-                        inc_datetime >= CURRENT_DATE
-                        AND inc_datetime < CURRENT_DATE + INTERVAL '1 day'
+                        c.inc_datetime >= CURRENT_DATE
+                        AND c.inc_datetime < CURRENT_DATE + INTERVAL '1 day'
                     """)
 
                 where_clause = " AND ".join(conditions)
 
                 query = f"""
-                    SELECT *
-                    FROM central_alerts
+                    SELECT c.*, af.status AS alert_flow_status
+                    FROM central_alerts c
+                    LEFT JOIN LATERAL (
+                        SELECT status
+                        FROM alert_escalation_flow
+                        WHERE alert_id = c.alert_id
+                        LIMIT 1
+                    ) af ON TRUE
                     WHERE {where_clause}
-                    ORDER BY inc_datetime DESC, alert_id DESC
+                    ORDER BY c.inc_datetime DESC, c.alert_id DESC
                 """
 
                 if filter_date:
@@ -1971,6 +2186,10 @@ async def central_alerts_ws(websocket: WebSocket):
                     )
 
                 today_all = [serialize_row(r) for r in rows]
+                
+                # 👇 YAHAN BHI ENSURE_STATUS CALL HO RAHA HAI
+                today_all = await ensure_status(today_all)
+                
                 by_severity = group_by_severity(rows)
 
                 await manager.safe_send(websocket, {
@@ -2705,15 +2924,40 @@ async def fetch_current_data(query) -> list[dict]:
     return data
 
 
+async def get_alert_flow_status(call_id) -> str | None:
+    """alert_escalation_flow se status laata hai (fallback)."""
+    if not call_id:
+        return None
+    # Yahan ORDER BY nahi lagaye taaki error na aaye (agar date column na ho)
+    q = """
+        SELECT status
+        FROM alert_escalation_flow
+        WHERE call_id = :call_id
+        LIMIT 1;
+    """
+    row = await database2.fetch_one(q, {"call_id": call_id})
+    if row:
+        return row.get("status")
+    return None
+
+
 async def attach_level_info_to_groups(grouped_data: list[dict]) -> list[dict]:
     """Har call_id group ke liye escalation level/role/severity attach karta hai.
     Denial records hamesha Level 2 (DM) se start hote hain (is_denial=True).
-    Agar action already liya ja chuka hai (closed), to closed_level use hota hai."""
+    Agar action already liya ja chuka hai (closed), to closed_level use hota hai.
+    Saath hi alert_escalation_flow ka status bhi attach karta hai."""
 
     for group in grouped_data:
         call_id = group.get("call_id")
         records = group.get("records", [])
         latest_record = records[0] if records else {}
+
+        # ---- alert_escalation_flow ka status (JOIN se aaya, fallback se) ----
+        alert_flow_status = latest_record.get("alert_flow_status")
+        if alert_flow_status is None:
+            alert_flow_status = await get_alert_flow_status(call_id)
+
+        group["alert_flow_status"] = alert_flow_status
 
         if await is_closed(call_id):
             action_details = await get_closed_details(call_id)
@@ -2743,22 +2987,29 @@ async def websocket_denial_alerts(websocket: WebSocket):
     DB mein koi bhi change hote hi (LISTEN/NOTIFY) turant push hoga.
     Existing database2 pool se hi connection liya ja raha hai.
     Har call_id group ke saath escalation level/role/severity bhi attach hota hai
-    (denial records hamesha Level 2 — DM — se start hote hain)."""
+    (denial records hamesha Level 2 — DM — se start hote hain).
+    alert_escalation_flow ka status bhi response mein include hota hai."""
 
     await websocket.accept()
 
     last_sent_ids: set = set()
     notify_event = asyncio.Event()
-    db_connection = None   # databases.Connection wrapper
-    raw_conn = None        # underlying asyncpg connection (LISTEN ke liye)
 
+    # denial_escalation_master ke added_date se DESC order mein rakha hai
     query = """
-        SELECT *
-        FROM denial_escalation_master
-        WHERE escalate_status = '1' 
-        AND (is_deleted = FALSE OR is_deleted IS NULL)
-        AND added_date::date = CURRENT_DATE
-        ORDER BY added_date DESC;
+        SELECT d.*,
+               af.status AS alert_flow_status
+        FROM denial_escalation_master d
+        LEFT JOIN LATERAL (
+            SELECT status
+            FROM alert_escalation_flow
+            WHERE call_id = d.call_id
+            LIMIT 1
+        ) af ON TRUE
+        WHERE d.escalate_status = '1' 
+        AND (d.is_deleted = FALSE OR d.is_deleted IS NULL)
+        AND d.added_date::date = CURRENT_DATE
+        ORDER BY d.added_date DESC;
     """
 
     async def send_if_changed():
@@ -2779,13 +3030,10 @@ async def websocket_denial_alerts(websocket: WebSocket):
             last_sent_ids = current_ids
 
     def on_notify(conn, pid, channel, payload):
-        # DB se turant signal aata hai idhar (INSERT/UPDATE/DELETE hote hi)
         notify_event.set()
 
     try:
-        # ---------------------------------------------------------
         # STEP 1: Initial load
-        # ---------------------------------------------------------
         initial_data = await fetch_current_data(query)
         last_sent_ids = {d["id"] for d in initial_data}
 
@@ -2798,47 +3046,42 @@ async def websocket_denial_alerts(websocket: WebSocket):
             "data": grouped_initial
         })
 
-        # ---------------------------------------------------------
-        # STEP 2: database2 ke pool se hi ek connection nikaalo
-        # aur uska raw asyncpg connection le kar LISTEN lagao
-        # ---------------------------------------------------------
-        db_connection = database2.connection()
-        await db_connection.__aenter__()          # connection open karo (pool se)
-        raw_conn = db_connection.raw_connection    # underlying asyncpg.Connection
-        await raw_conn.add_listener("denial_escalation_channel", on_notify)
+        # STEP 2: database2 connection & LISTEN
+        async with database2.connection() as db_connection:
+            raw_conn = db_connection.raw_connection
+            await raw_conn.add_listener("denial_escalation_channel", on_notify)
 
-        # ---------------------------------------------------------
-        # STEP 3: Jab bhi DB mein change ho (ya safety-net timeout),
-        # turant fresh data check karke bhejo
-        # ---------------------------------------------------------
-        while True:
-            try:
-                # Notify ka wait — DB change hote hi ye turant trigger hoga
-                await asyncio.wait_for(notify_event.wait(), timeout=30)
-            except asyncio.TimeoutError:
-                pass  # 30 sec safety-net poll, agar kabhi notify miss ho jaye
+            # STEP 3: Wait for notify and send changes
+            while True:
+                try:
+                    await asyncio.wait_for(notify_event.wait(), timeout=30)
+                except asyncio.TimeoutError:
+                    pass
 
-            notify_event.clear()
-            await send_if_changed()
+                notify_event.clear()
+                await send_if_changed()
 
     except WebSocketDisconnect:
         print("Frontend disconnected from WebSocket")
+        
     except Exception as e:
-        print(f"WebSocket Error: {e}")
         import traceback
-        traceback.print_exc()
-        await websocket.close()
-    finally:
-        if raw_conn:
-            try:
-                await raw_conn.remove_listener("denial_escalation_channel", on_notify)
-            except Exception:
-                pass
-        if db_connection:
-            await db_connection.__aexit__(None, None, None)   # connection pool ko wapas
-
-
-
+        error_trace = traceback.format_exc()
+        print(f"WebSocket Error: {e}\n{error_trace}")
+        
+        try:
+            await websocket.send_json({
+                "type": "ERROR",
+                "message": str(e),
+                "trace": error_trace
+            })
+        except:
+            pass
+            
+        try:
+            await websocket.close()
+        except:
+            pass
 
 ##########################################################################################
 # ------------------------------------------------------------------
