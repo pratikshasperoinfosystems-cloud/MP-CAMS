@@ -4621,3 +4621,84 @@ async def take_escalation_action(level: int, request: Request):
     except Exception as e:
         logger.exception(f"take_escalation_action FAILED: {e}")
         return {"status": "error", "message": str(e)}
+
+
+
+
+@app.get("/api/mdt/alerts")
+async def get_mdt_alerts_by_ambulance(ambulance_no: str = Query(..., description="Ambulance Number")):
+    """
+    Fetch all alerts for a specific ambulance (MDT Level 1 perspective).
+    
+    URL: GET /api/mdt/alerts?ambulance_no=TT-00-MP-0001
+    
+    Returns:
+    - Same format as WebSocket INITIAL_LOAD.
+    - Includes all past and present alerts.
+    - Adds 'able_to_action' boolean (True if < 10 min old & not closed).
+    """
+    try:
+        normalized_amb = normalize_vehicle_number(ambulance_no)
+        
+        # SQL query to fetch all alerts for this ambulance (normalized match)
+        # We replace spaces, hyphens, dots, underscores in SQL to match normalized string
+        query = """
+            SELECT * FROM public.central_alerts
+            WHERE UPPER(
+                REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(ambulance_no, ' ', ''), '-', ''), '.', ''), '_', ''), '/', '')
+            ) = :amb
+            ORDER BY created_date DESC
+            LIMIT 500
+        """
+        
+        rows = await database2.fetch_all(query, {"amb": normalized_amb})
+        
+        if not rows:
+            return {
+                "type": "INITIAL_LOAD",
+                "count": 0,
+                "data": [],
+                "vehicle_filter": normalized_amb
+            }
+
+        # Serialize rows
+        alerts = [serialize_row(r) for r in rows]
+        
+        # Attach SLA info to all alerts
+        alerts = await attach_sla_info_to_alerts(alerts)
+        
+        response_data = []
+        for alert in alerts:
+            call_id = str(alert.get("incident_id") or alert.get("alert_id") or "")
+            check_date = alert.get("created_date")
+            
+            # Check if closed
+            if await is_closed(call_id):
+                current_level = 1  # Default fallback
+                is_closed_flag = True
+            else:
+                # Calculate current level based on time
+                elapsed = elapsed_minutes_since(check_date)
+                current_level = get_level_for_elapsed_minutes(elapsed)
+                is_closed_flag = False
+                
+            alert["current_level"] = current_level
+            alert["current_role"] = LEVEL_INFO_CENTRAL.get(current_level, {}).get("role", "MDT")
+            alert["is_closed"] = is_closed_flag
+            
+            # 👇 MAIN LOGIC: able_to_action
+            # True only if alert is Level 1 (under 10 min) AND not closed
+            alert["able_to_action"] = (current_level == 1 and not is_closed_flag)
+            
+            response_data.append(alert)
+            
+        return {
+            "type": "INITIAL_LOAD",
+            "count": len(response_data),
+            "data": response_data,
+            "vehicle_filter": normalized_amb
+        }
+
+    except Exception as e:
+        logger.exception(f"get_mdt_alerts_by_ambulance FAILED: {e}")
+        return {"status": "error", "message": str(e)}
