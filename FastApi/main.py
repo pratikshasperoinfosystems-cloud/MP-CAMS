@@ -3642,6 +3642,12 @@ async def build_all_escalation_payloads(requested_level: int = None) -> list:
         alert["type"] = "current_escalation"
         alert["escalated_at"] = datetime.now(ist).isoformat()
 
+        # 👇 FIX: Level 1 ke liye faltu fields hata do
+        if requested_level == 1:
+            alert.pop("escalated_at", None)
+            alert.pop("updated_date", None)
+            alert.pop("current_level_minutes", None)
+
         filtered_alerts.append(alert)
 
     # SLA breach details add karo
@@ -4014,7 +4020,7 @@ async def _handle_escalation_ws(websocket: WebSocket, requested_level: int, user
                 await websocket.close(code=1008)
                 return
 
-            # 👇 Redis me token save karo taaki background me bhi chalega
+            # Redis me token save karo
             await redis_client.set(f"fcm_token:{vehicle_number}", fcm_token)
             logger.info(
                 f"Level-1 MDT registered & SAVED IN REDIS: user={user_id}, "
@@ -4035,41 +4041,43 @@ async def _handle_escalation_ws(websocket: WebSocket, requested_level: int, user
             return
 
     try:
-        # Send INITIAL_LOAD
+        # Send INITIAL_LOAD (First time connect hote hi)
         await send_current_escalations(
             websocket,
             requested_level=requested_level,
             vehicle_filter=vehicle_number,
-            fcm_token=None  # 👈 Pehli baar connect hote waqt FCM nahi bajana
+            fcm_token=None
         )
 
         async def drain_loop():
             """Sirf INITIAL_LOAD format bhejo — kuch aur nahi."""
             last_refresh_time = 0
-            notified_alert_ids = set()  # 👈 Jis alerts ke liye FCM baj chuka hai
+            notified_alert_ids = set()
+            last_sent_signature = None  # 👈 SPAM STOPPER
 
             while True:
                 payload = await queue.get()
                 msg_type = payload.get("type")
 
-                # Sirf ye types handle karo — baaki sab skip
-                if msg_type not in [
+                # Level 1 ke liye ye events allow karo (ALL_ALERTS wapas laaya)
+                allowed_types = [
                     "ESCALATION_REFRESH",
                     "ALL_ALERTS",
                     "new_escalation_alert",
                     "escalation_level_changed",
                     "escalation_closed",
                     "current_escalation",
-                ]:
+                ]
+
+                if msg_type not in allowed_types:
                     continue
 
-                # ESCALATION_REFRESH: no throttle (immediate)
-                # Others: 1 sec throttle
-                if msg_type != "ESCALATION_REFRESH":
-                    now = time.time()
-                    if now - last_refresh_time < 1:
-                        continue
-                    last_refresh_time = now
+                # Throttle (0.5s for Level 1 to be very fast)
+                now = time.time()
+                throttle_time = 0.5 if requested_level == 1 else 1
+                if now - last_refresh_time < throttle_time:
+                    continue
+                last_refresh_time = now
 
                 # Re-fetch and send INITIAL_LOAD (same format always)
                 try:
@@ -4088,13 +4096,25 @@ async def _handle_escalation_ws(websocket: WebSocket, requested_level: int, user
                                 filtered.append(p)
                         payloads = filtered
 
-                        # =========================================================
-                        # 👇 FCM PUSH LOGIC: Yahan check hoga har baar
-                        # Isse manual inserts pe bhi FCM bajegi!
-                        # =========================================================
+                        # 👇 SPAM STOPPER LOGIC: Check if data actually changed for our vehicle
+                        current_signature = set()
+                        for p in payloads:
+                            uid = str(p.get("alert_id") or p.get("call_id") or p.get("incident_id"))
+                            lvl = p.get("current_level")
+                            is_cl = p.get("is_closed")
+                            # Signature banao: Alert ID + Level + Closed Status
+                            current_signature.add(f"{uid}_{lvl}_{is_cl}")
+                        
+                        # Agar data same hai, to message bhejne ki zaroorat nahi (Spam Stop)
+                        if current_signature == last_sent_signature:
+                            continue
+                        
+                        # Data change ho gaya hai, last_sent_signature update karo
+                        last_sent_signature = current_signature
+
+                        # 👇 FCM PUSH LOGIC: Naye alerts ke liye
                         if fcm_token and len(payloads) > 0:
                             for p in payloads:
-                                # Central alert ke liye alert_id, Denial ke liye call_id
                                 unique_id = str(
                                     p.get("alert_id") 
                                     or p.get("call_id") 
@@ -4102,7 +4122,6 @@ async def _handle_escalation_ws(websocket: WebSocket, requested_level: int, user
                                     or ""
                                 )
                                 
-                                # Agar ye unique_id pehle se notified nahi hai → FCM BAAJO!
                                 if unique_id and unique_id not in notified_alert_ids:
                                     logger.info(f"🚀 Triggering FCM from WS loop for ID={unique_id}")
                                     await send_fcm_push(
@@ -4114,7 +4133,6 @@ async def _handle_escalation_ws(websocket: WebSocket, requested_level: int, user
                                             "type": "Late",
                                         }
                                     )
-                                    # Mark as notified taaki dubara na bajje
                                     notified_alert_ids.add(unique_id)
 
                     await manager.safe_send(websocket, {
@@ -4153,7 +4171,6 @@ async def _handle_escalation_ws(websocket: WebSocket, requested_level: int, user
         logger.exception(f"websocket_escalate_alerts FAILED: {e}")
     finally:
         manager.disconnect(websocket)
-
 
 async def send_current_escalations(
     websocket: WebSocket,
