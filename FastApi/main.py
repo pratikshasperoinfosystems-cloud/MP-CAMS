@@ -3294,7 +3294,8 @@ async def fetch_denial_record(call_id: str) -> dict:
                hp_name, challenge_val, meaning, denial_remark,
                alert_type, added_by, added_date
         FROM public.denial_escalation_master
-        WHERE CAST(call_id AS text) = :call_id   -- 👈 Yahan CAST lagaya
+        WHERE CAST(call_id AS text) = :call_id
+        ORDER BY added_date DESC LIMIT 1   -- 👈 Yahan fix kiya
         """,
         {"call_id": str(call_id)},
     )
@@ -3547,13 +3548,18 @@ async def build_all_escalation_payloads(requested_level: int = None) -> list:
     # Fetch denial records (sirf un case mein lao jab level 1 na ho)
     denial_rows = []
     if requested_level is None or requested_level != 1:
+        # 👇 FIX: DISTINCT ON use kiya taaki ek call_id ka sirf 1 latest record aaye
         denial_rows = await database2.fetch_all(
             """
-            SELECT id, mysql_id, call_id, amb_no, amb_default_mobile, caller_no,
-                   hp_name, challenge_val, meaning, denial_remark,
-                   alert_type, added_by, added_date
-            FROM public.denial_escalation_master
-            WHERE added_date::date = CURRENT_DATE
+            SELECT * FROM (
+                SELECT DISTINCT ON (call_id) 
+                       id, mysql_id, call_id, amb_no, amb_default_mobile, caller_no,
+                       hp_name, challenge_val, meaning, denial_remark,
+                       alert_type, added_by, added_date
+                FROM public.denial_escalation_master
+                WHERE added_date::date = CURRENT_DATE
+                ORDER BY call_id, added_date DESC
+            ) as latest_denials
             ORDER BY added_date DESC
             LIMIT 5000
             """
@@ -3599,7 +3605,12 @@ async def build_all_escalation_payloads(requested_level: int = None) -> list:
     # 4. Level info attach karo aur filter lagao
     filtered_alerts = []
     for alert in unified_alerts:
-        call_id = str(alert.get("call_id") or alert.get("incident_id") or "")
+        # Central alert ke liye alert_id use karo, Denial ke liye call_id
+        if alert.get("record_source") == "central":
+            call_id = str(alert.get("alert_id") or "")
+        else:
+            call_id = str(alert.get("call_id") or "")
+
         if not call_id or call_id == "0":
             continue
 
@@ -4206,21 +4217,13 @@ async def send_current_escalations(
 #   *** AGAR ACTION LIYA TO AAGE ESCALATE NAHI KAREGA ***
 # ===========================================================================
 async def init_escalation_levels_for_today():
-    """Aaj ke saare alerts scan karke Redis me level set karo.
-    
-    Problem: Agar alert insert hua BEFORE broadcast code was added,
-    to uska Redis key (esc_level:{call_id}) kabhi nahi bana.
-    Bump watcher sirf existing keys scan karta hai — to ye alerts
-    kabhi escalate hi nahi hote.
-    
-    Solution: Aaj ke saare DB records uthao, check karo Redis me key hai ya nahi.
-    Agar nahi hai → time-based level calculate karke set kar do.
-    """
+    """Aaj ke saare alerts scan karke Redis me level set karo."""
     try:
         # ---------- Central Alerts ----------
+        # 👇 FIX: alert_id uthao
         central_rows = await database2.fetch_all(
             """
-            SELECT incident_id, created_date
+            SELECT alert_id, created_date
             FROM public.central_alerts
             WHERE created_date::date = CURRENT_DATE
             AND escalate_status = '1'
@@ -4230,7 +4233,7 @@ async def init_escalation_levels_for_today():
 
         central_init = 0
         for row in central_rows:
-            call_id = str(row["incident_id"])
+            call_id = str(row["alert_id"]) # 👈 FIX
             if not call_id or call_id == "0":
                 continue
 
@@ -4238,7 +4241,6 @@ async def init_escalation_levels_for_today():
             exists = await redis_client.get(key)
 
             if exists is None:
-                # Redis me nahi hai → initialize kar
                 await get_or_init_escalation_level(
                     call_id,
                     row["created_date"],
@@ -4294,11 +4296,8 @@ async def escalation_level_bump_watcher():
                 await asyncio.sleep(10)
                 continue
 
-            # 👇 HAR 5 MINUTE me aaj ke saare alerts ka Redis key init karo
-            # Isse jo alerts broadcast code se pehle insert hue the, unke bhi
-            # Redis keys ban jayenge → bump watcher unhe bhi escalate karega
             now = time.time()
-            if now - last_init_time > 300:  # 5 minutes
+            if now - last_init_time > 300:
                 await init_escalation_levels_for_today()
                 last_init_time = now
 
@@ -4313,7 +4312,6 @@ async def escalation_level_bump_watcher():
                     key = key.decode()
                 call_id = key.replace(ESC_LEVEL_REDIS_PREFIX, "")
 
-                # ACTION-TAKEN GUARD
                 if await is_closed(call_id) or await is_action_taken(call_id):
                     await redis_client.delete(f"{ESC_LEVEL_REDIS_PREFIX}{call_id}")
                     await redis_client.delete(f"{ESC_ESCALATED_AT_PREFIX}{call_id}")
@@ -4328,17 +4326,17 @@ async def escalation_level_bump_watcher():
                 if current_level >= 7:
                     continue
 
-                # Denial record fetch karo, warna central_alerts se uthao
                 d = await fetch_denial_record(call_id)
                 is_denial_rec = True
 
                 if not d:
                     is_denial_rec = False
+                    # 👇 FIX: alert_id se search karo
                     central_row = await database2.fetch_one(
                         """SELECT * FROM public.central_alerts 
-                          WHERE CAST(incident_id AS text) = :inc_id
+                          WHERE CAST(alert_id AS text) = :id
                           ORDER BY created_date DESC LIMIT 1""",
-                        {"inc_id": str(call_id)}
+                          {"id": str(call_id)} # 👈 FIX
                     )
                     if not central_row:
                         await redis_client.delete(f"{ESC_LEVEL_REDIS_PREFIX}{call_id}")
@@ -4349,12 +4347,10 @@ async def escalation_level_bump_watcher():
 
                 check_date = d.get("added_date") if is_denial_rec else d.get("created_date")
                 if not check_date:
-                    logger.warning(f"No date field for call_id={call_id}, skipping")
                     continue
 
                 elapsed = elapsed_minutes_since(check_date)
 
-                # Time-based level directly calculate karo (multi-level jump)
                 time_based_level = get_level_for_elapsed_minutes(elapsed)
                 if is_denial_rec and time_based_level < 2:
                     time_based_level = 2
@@ -4365,14 +4361,9 @@ async def escalation_level_bump_watcher():
 
                 new_level = time_based_level
 
-                # Double-check before bump
                 if await is_closed(call_id) or await is_action_taken(call_id):
                     await redis_client.delete(f"{ESC_LEVEL_REDIS_PREFIX}{call_id}")
                     await redis_client.delete(f"{ESC_ESCALATED_AT_PREFIX}{call_id}")
-                    logger.info(
-                        f"SKIP BUMP (action taken): call_id={call_id} stays at "
-                        f"{LEVEL_INFO_CENTRAL[current_level]['role']}"
-                    )
                     continue
 
                 await set_escalation_level(call_id, new_level)
@@ -4414,9 +4405,6 @@ async def escalation_level_bump_watcher():
                     f"(elapsed={elapsed} min, jumped {new_level - current_level} level(s))"
                 )
 
-                # =========================================================
-                # 👇 TRACK IN ESCALATION FLOW TABLE (LEVEL BUMP)
-                # =========================================================
                 await update_escalation_flow(
                     call_id=0 if not is_denial_rec else call_id,  
                     alert_id=0 if is_denial_rec else str(d.get("alert_id")),
@@ -4486,11 +4474,8 @@ async def broadcast_new_central_alert(central_alert_row: dict):
     """Central alert insert ke turant baad call karo —
     naya alert MDT (level 1) pe real-time broadcast hoga + FCM push hoga."""
     try:
-        call_id = str(
-            central_alert_row.get("incident_id")
-            or central_alert_row.get("alert_id")
-            or ""
-        )
+        # 👇 FIX: Ab hum alert_id ko track karenge, incident_id ko nahi
+        call_id = str(central_alert_row.get("alert_id") or "")
         if not call_id or call_id == "0":
             return
 
@@ -4502,12 +4487,12 @@ async def broadcast_new_central_alert(central_alert_row: dict):
         if alerts_with_sla:
             central_alert_row = alerts_with_sla[0]
 
-        # 👇 FIX: Naye alert ka level uske naye created_date se calculate karo aur Redis overwrite karo
+        # Naye alert ka level uske naye created_date se calculate karo
         elapsed = elapsed_minutes_since(central_alert_row.get("created_date"))
         current_level = get_level_for_elapsed_minutes(elapsed)
         current_level = min(current_level, 7)
         
-        # Redis me forcefully update karo taaki purana level overwrite ho jaye
+        # Redis me forcefully update karo
         await set_escalation_level(call_id, current_level)
 
         payload = await build_escalation_payload(
@@ -4520,7 +4505,7 @@ async def broadcast_new_central_alert(central_alert_row: dict):
         manager.broadcast(payload)
 
         logger.info(
-            f"NEW CENTRAL ALERT BROADCAST: call_id={call_id}, "
+            f"NEW CENTRAL ALERT BROADCAST: alert_id={call_id}, "
             f"ambulance={central_alert_row.get('ambulance_no')}, "
             f"level={current_level} ({LEVEL_INFO_CENTRAL[current_level]['role']})"
         )
@@ -4549,7 +4534,7 @@ async def broadcast_new_central_alert(central_alert_row: dict):
         # 👇 TRACK IN ESCALATION FLOW TABLE (Central Alert ke liye call_id = 0)
         # =========================================================
         await update_escalation_flow(
-            call_id=0, # 👈 Yahan 0 bhej rahe hain
+            call_id=0,
             alert_id=str(central_alert_row.get("alert_id")),
             level=current_level,
             event_type="NEW_ALERT",
@@ -4895,7 +4880,7 @@ async def get_mdt_alerts_by_ambulance(ambulance_no: str = Query(..., description
     URL: GET /api/mdt/alerts?ambulance_no=TT-00-MP-0001
     
     Returns:
-    - Same format as WebSocket INITIAL_LOAD.
+    - Direct data array (no WebSocket INITIAL_LOAD wrapper).
     - Includes all past and present alerts.
     - Adds 'able_to_action' boolean (True if < 10 min old & not closed).
     """
@@ -4903,7 +4888,6 @@ async def get_mdt_alerts_by_ambulance(ambulance_no: str = Query(..., description
         normalized_amb = normalize_vehicle_number(ambulance_no)
         
         # SQL query to fetch all alerts for this ambulance (normalized match)
-        # We replace spaces, hyphens, dots, underscores in SQL to match normalized string
         query = """
             SELECT * FROM public.central_alerts
             WHERE UPPER(
@@ -4916,9 +4900,8 @@ async def get_mdt_alerts_by_ambulance(ambulance_no: str = Query(..., description
         rows = await database2.fetch_all(query, {"amb": normalized_amb})
         
         if not rows:
+            # 👇 Direct format
             return {
-                "type": "INITIAL_LOAD",
-                "count": 0,
                 "data": [],
                 "vehicle_filter": normalized_amb
             }
@@ -4931,7 +4914,7 @@ async def get_mdt_alerts_by_ambulance(ambulance_no: str = Query(..., description
         
         response_data = []
         for alert in alerts:
-            call_id = str(alert.get("incident_id") or alert.get("alert_id") or "")
+            call_id = str(alert.get("alert_id") or "")
             check_date = alert.get("created_date")
             
             # Check if closed
@@ -4954,9 +4937,8 @@ async def get_mdt_alerts_by_ambulance(ambulance_no: str = Query(..., description
             
             response_data.append(alert)
             
+        # 👇 Direct format (No type, No count)
         return {
-            "type": "INITIAL_LOAD",
-            "count": len(response_data),
             "data": response_data,
             "vehicle_filter": normalized_amb
         }
