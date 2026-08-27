@@ -13,7 +13,7 @@ import calendar
 import io
 from contextlib import asynccontextmanager
 from datetime import datetime, date, timedelta, timezone
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Union
 from decimal import Decimal
 
 import pytz
@@ -5069,7 +5069,8 @@ async def broadcast_new_central_alert(central_alert_row: dict):
 #   koi bhi role action le → incident close, aage forward nahi
 # ===========================================================================
 class TakeActionRequest(BaseModel):
-    call_id: str
+    call_id: Optional[Union[str, int]] = None
+    alert_id: Optional[Union[str, int]] = None
     action_by: Optional[str] = "unknown"
     action_by_role: Optional[str] = None
     action_remark: Optional[str] = ""
@@ -5228,17 +5229,15 @@ async def test_fcm_push(
 
 
 @app.post("/api/escalation/take_action/{level}")
-async def take_escalation_action(level: int, request: Request):
+async def take_escalation_action(level: int, payload: TakeActionRequest):
     """
     URL:  POST /api/escalation/take_action/1    (1=MDT, 2=DM, ..., 7=CBO)
 
     Body:
     {
-        "call_id": "ALERT_ID_OR_CALL_ID",  (ya "alert_id")
-        "action_by": "user_id",
-        "action_by_role": "MDT",
-        "action_remark": "Ambulance dispatched",
-        "action_type": "acknowledge"
+        "alert_id": 159125894,  <-- int ya string dono accept honge
+        "action_by": "pilot_user_id",
+        "action_remark": "Ambulance dispatched to location"
     }
     """
     try:
@@ -5256,18 +5255,18 @@ async def take_escalation_action(level: int, request: Request):
         action_by_level = level
         action_by_role  = LEVEL_INFO_CENTRAL[level]["role"]
 
-        body              = await request.json()
+        # 👇 Pydantic model se data lo
+        raw_id = payload.call_id if payload.call_id is not None else payload.alert_id
         
-        # 👇 FIX: Dono keys check karo (call_id ya alert_id)
-        raw_id = body.get("call_id") or body.get("alert_id")
+        # ID ko hamesha string me convert karo (agar int aaya to str ban jayega)
         payload_id = str(raw_id).strip() if raw_id is not None else ""
         
-        action_by         = body.get("action_by", "unknown")
-        action_remark     = body.get("action_remark", "")
-        action_type       = body.get("action_type", "acknowledge")
+        action_by         = payload.action_by if payload.action_by else "unknown"
+        action_remark     = payload.action_remark if payload.action_remark else ""
+        action_type       = payload.action_type if payload.action_type else "acknowledge"
 
-        if body.get("action_by_role"):
-            action_by_role = body.get("action_by_role")
+        if payload.action_by_role:
+            action_by_role = payload.action_by_role
 
         # 👇 DEBUG LOG
         logger.info(f"🚀 TAKE ACTION API CALLED. Received ID: '{payload_id}'")
@@ -5296,9 +5295,15 @@ async def take_escalation_action(level: int, request: Request):
         # =========================================================
         # IDENTIFY & UPDATE CORRECT TABLE
         # =========================================================
+        # 👇 ID ko int me convert karke query me daal rahe hain taaki DB match ho jaye
+        try:
+            db_id = int(payload_id)
+        except ValueError:
+            db_id = payload_id
+
         central_record = await database2.fetch_one(
-            "SELECT alert_id FROM public.central_alerts WHERE CAST(alert_id AS text) = :id",
-            {"id": payload_id}
+            "SELECT alert_id FROM public.central_alerts WHERE alert_id = :id",
+            {"id": db_id}
         )
 
         if central_record:
@@ -5312,12 +5317,12 @@ async def take_escalation_action(level: int, request: Request):
                         cancel_by = :action_by,
                         cancel_date = NOW(),
                         updated_date = NOW()
-                    WHERE CAST(alert_id AS text) = :alert_id
+                    WHERE alert_id = :alert_id
                     """,
                     {
                         "remark": action_remark,
                         "action_by": action_by,
-                        "alert_id": payload_id,
+                        "alert_id": db_id,
                     },
                 )
                 logger.info(f"✅ CENTRAL TABLE UPDATED: alert_id={payload_id}, status=2")
@@ -5331,11 +5336,11 @@ async def take_escalation_action(level: int, request: Request):
                     UPDATE public.denial_escalation_master
                     SET escalate_status = '2',
                         remark = :remark
-                    WHERE CAST(call_id AS text) = :call_id
+                    WHERE call_id = :call_id
                     """,
                     {
                         "remark": action_remark,
-                        "call_id": payload_id,
+                        "call_id": str(db_id), # Denial table me call_id varchar hai
                     },
                 )
                 logger.info(f"✅ DENIAL TABLE UPDATED: call_id={payload_id}, status=2")
@@ -5346,7 +5351,7 @@ async def take_escalation_action(level: int, request: Request):
         # BROADCAST TO ALL WS CLIENTS
         # =========================================================
         denial_record_payload = await fetch_denial_record(payload_id)
-        payload = await build_escalation_payload(
+        broadcast_payload = await build_escalation_payload(
             call_id=payload_id,
             denial_record=denial_record_payload,
             current_level=action_by_level,
@@ -5361,7 +5366,7 @@ async def take_escalation_action(level: int, request: Request):
                 "closed":            True,
             },
         )
-        manager.broadcast(payload)
+        manager.broadcast(broadcast_payload)
 
         logger.info(
             f"ACTION TAKEN → INCIDENT CLOSED: id={payload_id}, "
