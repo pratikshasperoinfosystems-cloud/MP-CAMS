@@ -907,9 +907,8 @@ async def rtm_alert_insert_worker():
 
 #         await asyncio.sleep(10)
 
+########################################################################################
 
-
-# Columns jo hum MySQL se map kar rahe hain
 MAPPED_COLUMNS = {
     "amb_no", "amb_default_mobile", "caller_no",
     "hp_name", "challenge_val", "meaning", "denial_remark",
@@ -994,6 +993,352 @@ async def get_required_default_columns():
     return defaults
  
  
+# async def denial_complaints_insert_worker():
+#     """
+#     Background worker: MySQL (ems_denial_complaints) -> Postgres (denial_escalation_master).
+#     """
+#     logger.info(f"Denial Complaints Insert Worker STARTED (instance={_worker_instance_id})")
+#     while True:
+#         try:
+#             is_leader = await try_acquire_denial_worker_leadership()
+#             if not is_leader:
+#                 await asyncio.sleep(5)
+#                 continue
+#             required_defaults = await get_required_default_columns()
+#             # ------------------------------------------------
+#             # STEP 1: MySQL se current month rows lao (WITH JOINS)
+#             # ------------------------------------------------
+#             # 👇 NAYA QUERY: dst_id ki jagah dst_code use kiya gaya hai
+#             query = """
+#                 SELECT
+#                     edc.id, edc.call_id, edc.amb_no, edc.amb_default_mobile, edc.caller_no,
+#                     edc.hp_name, edc.challenge_val, edc.denial_remark,
+#                     edc.added_by, edc.added_date,
+#                     dr.meaning AS reason_meaning,
+#                     dist.dst_name AS dst_name
+#                 FROM ems_denial_complaints edc
+#                 LEFT JOIN ems_denial_reason dr 
+#                     ON edc.meaning = dr.id
+#                 LEFT JOIN ems_mas_districts dist 
+#                     ON edc.amb_district = dist.dst_code  -- 👈 YAHAN FIX KIYA GAYA HAI
+#                 WHERE YEAR(edc.added_date) = YEAR(NOW())
+#                   AND MONTH(edc.added_date) = MONTH(NOW())
+#                 ORDER BY edc.added_date DESC
+#                 LIMIT 1000;
+#             """
+#             rows = await database.fetch_all(query)
+
+
+#             logger.info("=" * 60)
+
+#             logger.info(f"Denial worker: MySQL returned {len(rows)} rows (current month filter)")
+
+#             if len(rows) == 0:
+
+#                 try:
+
+#                     sample = await database.fetch_one(
+
+#                         "SELECT MIN(added_date) AS min_dt, MAX(added_date) AS max_dt, "
+
+#                         "COUNT(*) AS total FROM ems_denial_complaints"
+
+#                     )
+
+#                     if sample:
+
+#                         logger.warning(
+
+#                             f"Denial worker: 0 rows for current month! "
+
+#                             f"Table has min_date={sample['min_dt']}, "
+
+#                             f"max_date={sample['max_date']}, total_rows={sample['total']}"
+
+#                         )
+
+#                 except Exception as e:
+
+#                     logger.error(f"Denial worker: sample date check failed: {e}")
+
+#                 await asyncio.sleep(10)
+
+#                 continue
+
+#             # ------------------------------------------------
+
+#             # STEP 2: Sample 3 rows ka data log karo
+
+#             # ------------------------------------------------
+
+#             for idx, r in enumerate(rows[:3]):
+
+#                 try:
+
+#                     d = dict(r)
+
+#                     logger.info(
+
+#                         f"Denial worker: sample row {idx} -> "
+
+#                         f"id={d.get('id')!r}, "
+
+#                         f"call_id={d.get('call_id')!r}, "
+
+#                         f"amb_no={d.get('amb_no')!r}, "
+
+#                         f"reason_meaning={d.get('reason_meaning')!r}, " # 👈 Changed
+
+#                         f"dst_name={d.get('dst_name')!r}, "            # 👈 Changed
+
+#                         f"added_date={d.get('added_date')!r}"
+
+#                     )
+
+#                 except Exception as e:
+
+#                     logger.error(f"Denial worker: sample log error: {e}")
+
+#             # ------------------------------------------------
+
+#             # STEP 3: Per-row processing
+
+#             # ------------------------------------------------
+
+#             inserted_count = 0
+
+#             skipped_existing = 0
+
+#             skipped_no_id = 0
+
+#             failed_insert = 0
+
+#             failed_examples = []
+
+#             for row in rows:
+
+#                 try:
+
+#                     d = dict(row)
+
+#                     mysql_id = d.get("id")
+
+#                     if not mysql_id:
+
+#                         skipped_no_id += 1
+
+#                         continue
+
+#                     # Check karo: ye mysql_id pehle se Postgres mein hai?
+
+#                     existing = await database2.fetch_one(
+
+#                         """
+
+#                         SELECT id
+
+#                         FROM denial_escalation_master
+
+#                         WHERE mysql_id = :mysql_id
+
+#                         """,
+
+#                         {"mysql_id": mysql_id}
+
+#                     )
+
+#                     if existing:
+
+#                         skipped_existing += 1
+
+#                         continue
+
+#                     # Insert karlo
+
+#                     # 👇 NAYA: meaning ki jagah reason_meaning, aur dst_name add kiya
+
+#                     params = {
+
+#                         "id": mysql_id,
+
+#                         "mysql_id": mysql_id,
+
+#                         "call_id": d.get("call_id"),
+
+#                         "amb_no": d.get("amb_no"),
+
+#                         "amb_default_mobile": d.get("amb_default_mobile"),
+
+#                         "caller_no": d.get("caller_no"),
+
+#                         "hp_name": d.get("hp_name"),
+
+#                         "challenge_val": d.get("challenge_val"),
+
+#                         "meaning": d.get("reason_meaning"),  # 👈 Ab ye text aayega ID nahi
+
+#                         "dst_name": d.get("dst_name"),       # 👈 District naam add kiya
+
+#                         "denial_remark": d.get("denial_remark"),
+
+#                         "added_by": d.get("added_by"),
+
+#                         "added_date": d.get("added_date"),
+
+#                     }
+
+#                     # pehle NOT NULL defaults lagao
+
+#                     params.update(required_defaults)
+
+#                     # ab forced defaults — alert_type = "incident deny" hamesha
+
+#                     params.update(FORCED_DEFAULTS)
+
+#                     columns = ", ".join(params.keys())
+
+#                     placeholders = ", ".join(f":{k}" for k in params.keys())
+
+#                     await database2.execute(
+
+#                         f"""
+
+#                         INSERT INTO denial_escalation_master ({columns})
+
+#                         VALUES ({placeholders})
+
+#                         """,
+
+#                         params
+
+#                     )
+
+#                     inserted_count += 1
+
+#                     # NAYA: alert_escalation_flow table me insert karo
+
+#                     try:
+
+#                         await insert_into_escalation_flow('denial', d)
+
+#                     except Exception as flow_err:
+
+#                         logger.error(f"Flow insert failed for denial: {flow_err}")
+
+#                     # 👈 Separate try/except — broadcast fail ho to insert count disturb na ho
+
+#                     try:
+
+#                         await broadcast_new_escalation(
+
+#                             call_id=d.get("call_id"),
+
+#                             denial_record={
+
+#                                 "id":                mysql_id,
+
+#                                 "mysql_id":          mysql_id,
+
+#                                 "call_id":           d.get("call_id"),
+
+#                                 "amb_no":            d.get("amb_no"),
+
+#                                 "amb_default_mobile": d.get("amb_default_mobile"),
+
+#                                 "caller_no":         d.get("caller_no"),
+
+#                                 "hp_name":           d.get("hp_name"),
+
+#                                 "challenge_val":     d.get("challenge_val"),
+
+#                                 "meaning":           d.get("reason_meaning"), # 👈 Text bheja
+
+#                                 "dst_name":          d.get("dst_name"),       # 👈 Naam bheja
+
+#                                 "denial_remark":     d.get("denial_remark"),
+
+#                                 "alert_type":        "incident denial",
+
+#                                 "added_by":          d.get("added_by"),
+
+#                                 "added_date":        d.get("added_date").isoformat() if d.get("added_date") else None,
+
+#                             },
+
+#                         )
+
+#                     except Exception as b_err:
+
+#                         logger.error(f"Denial worker: broadcast failed for id={mysql_id}: {b_err}")
+
+#                 except Exception as row_err:
+
+#                     failed_insert += 1
+
+#                     if len(failed_examples) < 5:
+
+#                         try:
+
+#                             d_err = dict(row)
+
+#                             failed_examples.append({
+
+#                                 "id": d_err.get("id"),
+
+#                                 "call_id": d_err.get("call_id"),
+
+#                                 "amb_no": d_err.get("amb_no"),
+
+#                                 "error": str(row_err),
+
+#                             })
+
+#                         except Exception:
+
+#                             failed_examples.append({"error": str(row_err)})
+
+#                     continue
+
+#             # ------------------------------------------------
+
+#             # STEP 4: Final summary
+
+#             # ------------------------------------------------
+
+#             logger.info(
+
+#                 f"Denial worker SUMMARY: "
+
+#                 f"fetched={len(rows)}, "
+
+#                 f"inserted={inserted_count}, "
+
+#                 f"existing={skipped_existing}, "
+
+#                 f"no_id={skipped_no_id}, "
+
+#                 f"failed={failed_insert}"
+
+#             )
+
+#             if failed_examples:
+
+#                 logger.warning(
+
+#                     f"Denial worker: failed insert examples -> {failed_examples}"
+
+#                 )
+
+#             if inserted_count:
+
+#                 logger.info(f"Denial worker: ✅ inserted {inserted_count} new rows")
+
+#         except Exception as e:
+
+#             logger.error(f"Denial Complaints Insert Worker Error: {e}", exc_info=True)
+
+#         await asyncio.sleep(10)
+
 async def denial_complaints_insert_worker():
     """
     Background worker: MySQL (ems_denial_complaints) -> Postgres (denial_escalation_master).
@@ -1006,336 +1351,222 @@ async def denial_complaints_insert_worker():
                 await asyncio.sleep(5)
                 continue
             required_defaults = await get_required_default_columns()
+            
             # ------------------------------------------------
             # STEP 1: MySQL se current month rows lao (WITH JOINS)
             # ------------------------------------------------
-            # 👇 NAYA QUERY: dst_id ki jagah dst_code use kiya gaya hai
             query = """
-                SELECT
-                    edc.id, edc.call_id, edc.amb_no, edc.amb_default_mobile, edc.caller_no,
-                    edc.hp_name, edc.challenge_val, edc.denial_remark,
-                    edc.added_by, edc.added_date,
-                    dr.meaning AS reason_meaning,
-                    dist.dst_name AS dst_name
-                FROM ems_denial_complaints edc
-                LEFT JOIN ems_denial_reason dr 
-                    ON edc.meaning = dr.id
-                LEFT JOIN ems_mas_districts dist 
-                    ON edc.amb_district = dist.dst_code  -- 👈 YAHAN FIX KIYA GAYA HAI
-                WHERE YEAR(edc.added_date) = YEAR(NOW())
-                  AND MONTH(edc.added_date) = MONTH(NOW())
-                ORDER BY edc.added_date DESC
-                LIMIT 1000;
+                SELECT 
+                    edc.id, edc.call_id, edc.amb_no, edc.amb_default_mobile, edc.caller_no, 
+                    edc.hp_name, edc.challenge_val, edc.denial_remark, 
+                    edc.added_by, edc.added_date, 
+                    dr.meaning AS reason_meaning, 
+                    dist.dst_name AS dst_name 
+                FROM ems_denial_complaints edc 
+                LEFT JOIN ems_denial_reason dr  
+                    ON edc.meaning = dr.id 
+                LEFT JOIN ems_mas_districts dist  
+                    ON edc.amb_district = dist.dst_code 
+                WHERE YEAR(edc.added_date) = YEAR(NOW()) 
+                  AND MONTH(edc.added_date) = MONTH(NOW()) 
+                ORDER BY edc.added_date DESC 
+                LIMIT 1000; 
             """
             rows = await database.fetch_all(query)
 
-
             logger.info("=" * 60)
-
             logger.info(f"Denial worker: MySQL returned {len(rows)} rows (current month filter)")
 
             if len(rows) == 0:
-
                 try:
-
                     sample = await database.fetch_one(
-
                         "SELECT MIN(added_date) AS min_dt, MAX(added_date) AS max_dt, "
-
                         "COUNT(*) AS total FROM ems_denial_complaints"
-
                     )
-
                     if sample:
-
                         logger.warning(
-
                             f"Denial worker: 0 rows for current month! "
-
                             f"Table has min_date={sample['min_dt']}, "
-
-                            f"max_date={sample['max_date']}, total_rows={sample['total']}"
-
+                            f"max_date={sample['max_dt']}, total_rows={sample['total']}"
                         )
-
                 except Exception as e:
-
                     logger.error(f"Denial worker: sample date check failed: {e}")
-
                 await asyncio.sleep(10)
-
                 continue
 
             # ------------------------------------------------
-
             # STEP 2: Sample 3 rows ka data log karo
-
             # ------------------------------------------------
-
             for idx, r in enumerate(rows[:3]):
-
                 try:
-
                     d = dict(r)
-
                     logger.info(
-
                         f"Denial worker: sample row {idx} -> "
-
                         f"id={d.get('id')!r}, "
-
                         f"call_id={d.get('call_id')!r}, "
-
                         f"amb_no={d.get('amb_no')!r}, "
-
-                        f"reason_meaning={d.get('reason_meaning')!r}, " # 👈 Changed
-
-                        f"dst_name={d.get('dst_name')!r}, "            # 👈 Changed
-
+                        f"reason_meaning={d.get('reason_meaning')!r}, "
+                        f"dst_name={d.get('dst_name')!r}, "
                         f"added_date={d.get('added_date')!r}"
-
                     )
-
                 except Exception as e:
-
                     logger.error(f"Denial worker: sample log error: {e}")
 
             # ------------------------------------------------
-
             # STEP 3: Per-row processing
-
             # ------------------------------------------------
-
             inserted_count = 0
-
             skipped_existing = 0
-
             skipped_no_id = 0
-
             failed_insert = 0
-
             failed_examples = []
 
             for row in rows:
-
                 try:
-
                     d = dict(row)
-
                     mysql_id = d.get("id")
 
                     if not mysql_id:
-
                         skipped_no_id += 1
-
                         continue
 
                     # Check karo: ye mysql_id pehle se Postgres mein hai?
-
                     existing = await database2.fetch_one(
-
                         """
-
-                        SELECT id
-
-                        FROM denial_escalation_master
-
-                        WHERE mysql_id = :mysql_id
-
+                        SELECT id 
+                        FROM denial_escalation_master 
+                        WHERE mysql_id = :mysql_id 
                         """,
-
                         {"mysql_id": mysql_id}
-
                     )
 
                     if existing:
-
                         skipped_existing += 1
-
                         continue
 
+                    # 👇 NAYA LOGIC: Call_id ke against kitne alerts pehle se hain?
+                    call_id_val = d.get("call_id")
+                    alert_count = 0
+                    
+                    if call_id_val:
+                        count_row = await database2.fetch_one(
+                            "SELECT COUNT(*) AS cnt FROM denial_escalation_master WHERE call_id = :call_id",
+                            {"call_id": call_id_val}
+                        )
+                        alert_count = count_row["cnt"] if count_row else 0
+
+                    # 1 -> LOW, 2 -> MEDIUM, 3 -> HIGH, 4+ -> CRITICAL
+                    if alert_count == 0:
+                        severity = "LOW"
+                    elif alert_count == 1:
+                        severity = "MEDIUM"
+                    elif alert_count == 2:
+                        severity = "HIGH"
+                    else:
+                        severity = "CRITICAL"
+
                     # Insert karlo
-
-                    # 👇 NAYA: meaning ki jagah reason_meaning, aur dst_name add kiya
-
                     params = {
-
                         "id": mysql_id,
-
                         "mysql_id": mysql_id,
-
-                        "call_id": d.get("call_id"),
-
+                        "call_id": call_id_val,
                         "amb_no": d.get("amb_no"),
-
                         "amb_default_mobile": d.get("amb_default_mobile"),
-
                         "caller_no": d.get("caller_no"),
-
                         "hp_name": d.get("hp_name"),
-
                         "challenge_val": d.get("challenge_val"),
-
-                        "meaning": d.get("reason_meaning"),  # 👈 Ab ye text aayega ID nahi
-
-                        "dst_name": d.get("dst_name"),       # 👈 District naam add kiya
-
+                        "meaning": d.get("reason_meaning"), 
+                        "dst_name": d.get("dst_name"),       
                         "denial_remark": d.get("denial_remark"),
-
                         "added_by": d.get("added_by"),
-
                         "added_date": d.get("added_date"),
-
+                        "severity": severity, # 👈 Yahan severity pass ho rahi hai
                     }
 
                     # pehle NOT NULL defaults lagao
-
                     params.update(required_defaults)
-
-                    # ab forced defaults — alert_type = "incident deny" hamesha
-
+                    # ab forced defaults — alert_type = "incident denial" hamesha
                     params.update(FORCED_DEFAULTS)
 
                     columns = ", ".join(params.keys())
-
                     placeholders = ", ".join(f":{k}" for k in params.keys())
 
                     await database2.execute(
-
                         f"""
-
-                        INSERT INTO denial_escalation_master ({columns})
-
-                        VALUES ({placeholders})
-
+                        INSERT INTO denial_escalation_master ({columns}) 
+                        VALUES ({placeholders}) 
                         """,
-
                         params
-
                     )
-
                     inserted_count += 1
 
                     # NAYA: alert_escalation_flow table me insert karo
-
                     try:
-
                         await insert_into_escalation_flow('denial', d)
-
                     except Exception as flow_err:
-
                         logger.error(f"Flow insert failed for denial: {flow_err}")
 
                     # 👈 Separate try/except — broadcast fail ho to insert count disturb na ho
-
                     try:
-
                         await broadcast_new_escalation(
-
-                            call_id=d.get("call_id"),
-
+                            call_id=call_id_val,
                             denial_record={
-
                                 "id":                mysql_id,
-
                                 "mysql_id":          mysql_id,
-
-                                "call_id":           d.get("call_id"),
-
+                                "call_id":           call_id_val,
                                 "amb_no":            d.get("amb_no"),
-
                                 "amb_default_mobile": d.get("amb_default_mobile"),
-
                                 "caller_no":         d.get("caller_no"),
-
                                 "hp_name":           d.get("hp_name"),
-
                                 "challenge_val":     d.get("challenge_val"),
-
-                                "meaning":           d.get("reason_meaning"), # 👈 Text bheja
-
-                                "dst_name":          d.get("dst_name"),       # 👈 Naam bheja
-
+                                "meaning":           d.get("reason_meaning"), 
+                                "dst_name":          d.get("dst_name"),       
                                 "denial_remark":     d.get("denial_remark"),
-
                                 "alert_type":        "incident denial",
-
                                 "added_by":          d.get("added_by"),
-
                                 "added_date":        d.get("added_date").isoformat() if d.get("added_date") else None,
-
+                                "severity":          severity, # 👈 Broadcast payload me bhi severity bhejo
                             },
-
                         )
-
                     except Exception as b_err:
-
                         logger.error(f"Denial worker: broadcast failed for id={mysql_id}: {b_err}")
 
                 except Exception as row_err:
-
                     failed_insert += 1
-
                     if len(failed_examples) < 5:
-
                         try:
-
                             d_err = dict(row)
-
                             failed_examples.append({
-
                                 "id": d_err.get("id"),
-
                                 "call_id": d_err.get("call_id"),
-
                                 "amb_no": d_err.get("amb_no"),
-
                                 "error": str(row_err),
-
                             })
-
                         except Exception:
-
                             failed_examples.append({"error": str(row_err)})
-
                     continue
 
             # ------------------------------------------------
-
             # STEP 4: Final summary
-
             # ------------------------------------------------
-
             logger.info(
-
                 f"Denial worker SUMMARY: "
-
                 f"fetched={len(rows)}, "
-
                 f"inserted={inserted_count}, "
-
                 f"existing={skipped_existing}, "
-
                 f"no_id={skipped_no_id}, "
-
                 f"failed={failed_insert}"
-
             )
 
             if failed_examples:
-
                 logger.warning(
-
                     f"Denial worker: failed insert examples -> {failed_examples}"
-
                 )
 
             if inserted_count:
-
                 logger.info(f"Denial worker: ✅ inserted {inserted_count} new rows")
 
         except Exception as e:
-
             logger.error(f"Denial Complaints Insert Worker Error: {e}", exc_info=True)
 
         await asyncio.sleep(10)
@@ -2783,7 +3014,7 @@ async def download_client_report(
             "challenge_val": "Challenge",
             "meaning": "Denial Reason",
             "denial_remark": "Denial Remark",
-            "remark": "Remark",                        # ✅ NAYA
+            "remark": "Action Remark",                        # ✅ NAYA
             "dst_name": "District",
             "alert_type": "Alert Type",
             "added_by": "Added By",
@@ -2798,7 +3029,7 @@ async def download_client_report(
             "Sr No", "Denial ID", "Call ID", "Ambulance Number", "Ambulance Mobile",
             "Caller No", "Hospital Name", "Challenge", "Denial Reason",
             "Denial Remark", "District", "Alert Type", "Added By",
-            "Added Date & Time", "Escalation Status", "Remark",
+            "Added Date & Time", "Escalation Status", "Action Remark",
         ]
  
         denial_ordered_cols = [c for c in denial_column_order if c in df_denial.columns]
@@ -3412,7 +3643,7 @@ async def get_alert_flow_status(call_id) -> str | None:
     """
     row = await database2.fetch_one(q, {"call_id": call_id})
     if row:
-        return row.get("status")
+        return dict(row).get("status")
     return None
 
 
@@ -3450,123 +3681,235 @@ async def attach_level_info_to_groups(grouped_data: list[dict]) -> list[dict]:
 
 
 @app.websocket("/ws/denial_alerts")
+
 async def websocket_denial_alerts(websocket: WebSocket):
+
     """URL se ?date=YYYY-MM-DD pass kar sakte hain.
+
     Date na diya to default CURRENT_DATE (aaj) use hoga."""
-
+ 
     await websocket.accept()
-
+ 
     last_sent_ids: set = set()
+
     notify_event = asyncio.Event()
+ 
+    # URL se date param
 
-    # --------------------------------------------------------
-    # ✅ NAYA: URL se date param nikaalo
-    # --------------------------------------------------------
-    date_param = websocket.query_params.get("date")  # ?date=2025-01-15
-
+    date_param = websocket.query_params.get("date")
+ 
     if date_param:
+
         try:
+
             selected_date = datetime.strptime(date_param, "%Y-%m-%d").date()
+
             date_condition = f"d.added_date::date = '{selected_date}'"
+
         except ValueError:
+
             await websocket.send_json({
+
                 "type": "ERROR",
+
                 "message": "Invalid date format! Use ?date=YYYY-MM-DD"
+
             })
+
             await websocket.close()
+
             return
+
     else:
+
         selected_date = None
+
         date_condition = "d.added_date::date = CURRENT_DATE"
-
-    # --------------------------------------------------------
-    # ✅ FIXED: Query me dynamic date condition
-    # --------------------------------------------------------
+ 
     query = f"""
+
         SELECT d.*,
+
                af.status AS alert_flow_status
+
         FROM denial_escalation_master d
+
         LEFT JOIN LATERAL (
+
             SELECT status
+
             FROM alert_escalation_flow
+
             WHERE call_id = d.call_id
+
             LIMIT 1
+
         ) af ON TRUE
+
         WHERE d.escalate_status = '1' 
+
         AND (d.is_deleted = FALSE OR d.is_deleted IS NULL)
+
         AND {date_condition}
+
         ORDER BY d.added_date DESC;
+
     """
-
+ 
     async def send_if_changed():
+
         nonlocal last_sent_ids
+
         current_data = await fetch_current_data(query)
+
         current_ids = {d["id"] for d in current_data}
-
+ 
         if current_ids != last_sent_ids:
+
             grouped_current = group_by_call_id(current_data)
+
             grouped_current = await attach_level_info_to_groups(grouped_current)
+
             await websocket.send_json({
+
                 "type": "INITIAL_LOAD",
+
                 "count": len(grouped_current),
+
                 "data": grouped_current
+
             })
+
             last_sent_ids = current_ids
-
+ 
     def on_notify(conn, pid, channel, payload):
+
         notify_event.set()
+ 
+    # ✅ NAYA: Ye flag se pata chalega client zinda hai ya nahi
 
+    client_alive = True
+ 
     try:
+
         # STEP 1: Initial load
+
         initial_data = await fetch_current_data(query)
+
         last_sent_ids = {d["id"] for d in initial_data}
-
+ 
         grouped_initial = group_by_call_id(initial_data)
+
         grouped_initial = await attach_level_info_to_groups(grouped_initial)
-
+ 
         await websocket.send_json({
+
             "type": "INITIAL_LOAD",
+
             "count": len(grouped_initial),
+
             "selected_date": str(selected_date) if selected_date else "today",
+
             "data": grouped_initial
+
         })
+ 
+        # STEP 2: Connection & LISTEN
 
-        # STEP 2: database2 connection & LISTEN
         async with database2.connection() as db_connection:
+
             raw_conn = db_connection.raw_connection
+
             await raw_conn.add_listener("denial_escalation_channel", on_notify)
+ 
+            try:
 
-            # STEP 3: Wait for notify and send changes
-            while True:
+                # STEP 3: Wait for notify and send changes
+
+                while client_alive:
+
+                    try:
+
+                        await asyncio.wait_for(notify_event.wait(), timeout=30)
+
+                    except asyncio.TimeoutError:
+
+                        pass
+ 
+                    notify_event.clear()
+ 
+                    # ✅ NAYA: Send ko guard karo — dead client pe crash nahi hoga
+
+                    try:
+
+                        await send_if_changed()
+
+                    except (WebSocketDisconnect, RuntimeError):
+
+                        # Client chala gaya — loop se NIKAL jao (break), error mat failao
+
+                        print("🔌 Client disconnected during send — stopping listener loop")
+
+                        client_alive = False
+
+                        break
+ 
+            finally:
+
+                # ✅ NAYA: Listener hamesha remove hoga — InterfaceWarning fix
+
                 try:
-                    await asyncio.wait_for(notify_event.wait(), timeout=30)
-                except asyncio.TimeoutError:
+
+                    raw_conn.remove_listener("denial_escalation_channel", on_notify)
+
+                except Exception:
+
                     pass
-
-                notify_event.clear()
-                await send_if_changed()
-
+ 
     except WebSocketDisconnect:
+
         print("Frontend disconnected from WebSocket")
-
+ 
     except Exception as e:
+
         import traceback
+
         error_trace = traceback.format_exc()
+
         print(f"WebSocket Error: {e}\n{error_trace}")
+ 
+        # ✅ NAYA: Transport dead ho to send_json try hi mat karo
 
         try:
-            await websocket.send_json({
-                "type": "ERROR",
-                "message": str(e),
-                "trace": error_trace
-            })
-        except:
+
+            if client_alive:
+
+                await websocket.send_json({
+
+                    "type": "ERROR",
+
+                    "message": str(e),
+
+                    "trace": error_trace
+
+                })
+
+        except Exception:
+
             pass
+ 
+    finally:
+
+        # ✅ NAYA: Close bhi safe — BrokenPipe handle
 
         try:
+
             await websocket.close()
-        except:
+
+        except Exception:
+
             pass
+ 
 
 ##########################################################################################
 # ------------------------------------------------------------------
