@@ -3387,7 +3387,7 @@ def group_by_call_id(records: list[dict]) -> list[dict]:
 
 
 async def fetch_current_data(query) -> list[dict]:
-    """DB se current active (status=1, not deleted, aaj ke) records nikaal kar
+    """DB se current active (status=1, not deleted) records nikaal kar
     JSON-safe dict list return karta hai."""
     rows = await database2.fetch_all(query)
     data = []
@@ -3404,7 +3404,6 @@ async def get_alert_flow_status(call_id) -> str | None:
     """alert_escalation_flow se status laata hai (fallback)."""
     if not call_id:
         return None
-    # Yahan ORDER BY nahi lagaye taaki error na aaye (agar date column na ho)
     q = """
         SELECT status
         FROM alert_escalation_flow
@@ -3418,17 +3417,12 @@ async def get_alert_flow_status(call_id) -> str | None:
 
 
 async def attach_level_info_to_groups(grouped_data: list[dict]) -> list[dict]:
-    """Har call_id group ke liye escalation level/role/severity attach karta hai.
-    Denial records hamesha Level 2 (DM) se start hote hain (is_denial=True).
-    Agar action already liya ja chuka hai (closed), to closed_level use hota hai.
-    Saath hi alert_escalation_flow ka status bhi attach karta hai."""
-
+    """Har call_id group ke liye escalation level/role/severity attach karta hai."""
     for group in grouped_data:
         call_id = group.get("call_id")
         records = group.get("records", [])
         latest_record = records[0] if records else {}
 
-        # ---- alert_escalation_flow ka status (JOIN se aaya, fallback se) ----
         alert_flow_status = latest_record.get("alert_flow_status")
         if alert_flow_status is None:
             alert_flow_status = await get_alert_flow_status(call_id)
@@ -3457,22 +3451,38 @@ async def attach_level_info_to_groups(grouped_data: list[dict]) -> list[dict]:
 
 @app.websocket("/ws/denial_alerts")
 async def websocket_denial_alerts(websocket: WebSocket):
-    """Har baar poori current list (status=1, not deleted, aaj ke) bhejta hai,
-    latest added_date sabse upar. Status 2 hote hi record apne aap
-    list se hat jata hai kyunki wo query mein aata hi nahi.
-    DB mein koi bhi change hote hi (LISTEN/NOTIFY) turant push hoga.
-    Existing database2 pool se hi connection liya ja raha hai.
-    Har call_id group ke saath escalation level/role/severity bhi attach hota hai
-    (denial records hamesha Level 2 — DM — se start hote hain).
-    alert_escalation_flow ka status bhi response mein include hota hai."""
+    """URL se ?date=YYYY-MM-DD pass kar sakte hain.
+    Date na diya to default CURRENT_DATE (aaj) use hoga."""
 
     await websocket.accept()
 
     last_sent_ids: set = set()
     notify_event = asyncio.Event()
 
-    # denial_escalation_master ke added_date se DESC order mein rakha hai
-    query = """
+    # --------------------------------------------------------
+    # ✅ NAYA: URL se date param nikaalo
+    # --------------------------------------------------------
+    date_param = websocket.query_params.get("date")  # ?date=2025-01-15
+
+    if date_param:
+        try:
+            selected_date = datetime.strptime(date_param, "%Y-%m-%d").date()
+            date_condition = f"d.added_date::date = '{selected_date}'"
+        except ValueError:
+            await websocket.send_json({
+                "type": "ERROR",
+                "message": "Invalid date format! Use ?date=YYYY-MM-DD"
+            })
+            await websocket.close()
+            return
+    else:
+        selected_date = None
+        date_condition = "d.added_date::date = CURRENT_DATE"
+
+    # --------------------------------------------------------
+    # ✅ FIXED: Query me dynamic date condition
+    # --------------------------------------------------------
+    query = f"""
         SELECT d.*,
                af.status AS alert_flow_status
         FROM denial_escalation_master d
@@ -3484,13 +3494,11 @@ async def websocket_denial_alerts(websocket: WebSocket):
         ) af ON TRUE
         WHERE d.escalate_status = '1' 
         AND (d.is_deleted = FALSE OR d.is_deleted IS NULL)
-        AND d.added_date::date = CURRENT_DATE
+        AND {date_condition}
         ORDER BY d.added_date DESC;
     """
 
     async def send_if_changed():
-        """Latest data nikaal kar bhejta hai, sirf agar kuch change hua ho.
-        Level/role/severity bhi har group ke saath attach karta hai."""
         nonlocal last_sent_ids
         current_data = await fetch_current_data(query)
         current_ids = {d["id"] for d in current_data}
@@ -3519,6 +3527,7 @@ async def websocket_denial_alerts(websocket: WebSocket):
         await websocket.send_json({
             "type": "INITIAL_LOAD",
             "count": len(grouped_initial),
+            "selected_date": str(selected_date) if selected_date else "today",
             "data": grouped_initial
         })
 
@@ -3539,12 +3548,12 @@ async def websocket_denial_alerts(websocket: WebSocket):
 
     except WebSocketDisconnect:
         print("Frontend disconnected from WebSocket")
-        
+
     except Exception as e:
         import traceback
         error_trace = traceback.format_exc()
         print(f"WebSocket Error: {e}\n{error_trace}")
-        
+
         try:
             await websocket.send_json({
                 "type": "ERROR",
@@ -3553,7 +3562,7 @@ async def websocket_denial_alerts(websocket: WebSocket):
             })
         except:
             pass
-            
+
         try:
             await websocket.close()
         except:
