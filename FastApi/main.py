@@ -4165,6 +4165,207 @@ async def build_escalation_payload(
     return payload
 
 # ===========================================================================
+# async def attach_sla_info_to_alerts(alerts: list) -> list:
+#     """Each alert me SLA breach details add karta hai.
+    
+#     Fetches from:
+#     - alert_thresholds table: SLA threshold for each alert_type + amb_area (rural/urban)
+#     - rtm_dashboard table: actual duration taken by ambulance
+    
+#     Adds fields:
+#     - sla_threshold_seconds: SLA limit in seconds
+#     - sla_actual_seconds: actual time taken in seconds
+#     - sla_breach_seconds: how much time was exceeded
+#     - sla_breach_reason: human-readable reason
+#     - amb_area: "1" (rural) or "2" (urban)
+#     - amb_area_type: "Rural" or "Urban"
+#     """
+#     if not alerts:
+#         return alerts
+
+#     # 1. Saare thresholds fetch karo (cached, 30s TTL)
+#     try:
+#         thresholds = await get_active_thresholds()
+#     except Exception as e:
+#         logger.error(f"attach_sla: thresholds fetch failed: {e}")
+#         thresholds = []
+
+#     # 2. Saare unique incident_ids collect karo
+#     incident_ids = []
+#     for a in alerts:
+#         inc_id = str(a.get("incident_id") or a.get("call_id") or "")
+#         if inc_id and inc_id != "0" and inc_id not in incident_ids:
+#             incident_ids.append(inc_id)
+
+#     # 3. rtm_dashboard se data fetch karo for these incident_ids
+#     rtm_data = {}
+#     if incident_ids:
+#         try:
+#             placeholders = ", ".join([f":id{i}" for i in range(len(incident_ids))])
+#             params = {f"id{i}": incident_ids[i] for i in range(len(incident_ids))}
+#             query = f"""
+#                 SELECT * FROM rtm_dashboard
+#                 WHERE CAST(inc_ref_id AS text) IN ({placeholders})
+#             """
+#             rtm_rows = await database2.fetch_all(query, params)
+#             for r in rtm_rows:
+#                 rtm_data[str(r["inc_ref_id"])] = normalize_row(r)
+#         except Exception as e:
+#             logger.error(f"attach_sla: rtm_dashboard fetch failed: {e}")
+
+#     # 4. Alert type → rtm_dashboard duration field mapping
+#     ALERT_DURATION_MAP = {
+#         "ACK_DELAY": "acknowledge_duration",
+#         "START_DELAY": "start_from_base_duration",
+#         "AT_SCENE_DELAY": "at_scene_duration",
+#     }
+
+#     # 5. Each alert me SLA info add karo
+#     for alert in alerts:
+#         alert_type = alert.get("alert_type", "")
+#         incident_id = str(alert.get("incident_id") or alert.get("call_id") or "")
+
+#         # rtm_dashboard se row uthao
+#         rtm_row = rtm_data.get(incident_id, {})
+
+#         # amb_area (1=rural, 2=urban)
+#         amb_area = rtm_row.get("amb_working_area")
+#         amb_area_type = ""
+#         if str(amb_area) == "1":
+#             amb_area_type = "Rural"
+#         elif str(amb_area) == "2":
+#             amb_area_type = "Urban"
+
+#         # Threshold dhoondho — alert_type + amb_area match
+#         # null amb_area means applies to ALL areas
+#         threshold_seconds = None
+#         for t in thresholds:
+#             if t.get("alert_type") != alert_type:
+#                 continue
+#             t_amb_area = t.get("amb_area")
+#             if t_amb_area is not None and str(t_amb_area) != str(amb_area):
+#                 continue
+#             threshold_seconds = int(t.get("threshold_seconds") or 0)
+#             break
+
+#         # Actual duration calculate karo
+#         actual_seconds = None
+#         breach_reason = ""
+
+#         # =========================================================
+#         # MDT_NOT_LOGGED_IN
+#         # =========================================================
+#         if alert_type == "MDT_NOT_LOGGED_IN":
+#             pilot_login_out = rtm_row.get("pilot_login_out")
+#             actual_seconds = 0
+#             breach_reason = (
+#                 f"MDT not logged in — pilot login status: {pilot_login_out}"
+#             )
+
+#         # =========================================================
+#         # BACK_TO_BASE_DELAY — patient_handover ke baad se check
+#         # =========================================================
+#         elif alert_type == "BACK_TO_BASE_DELAY":
+#             patient_handover_dt = to_datetime(rtm_row.get("patient_handover"))
+#             back_to_base_dt = to_datetime(rtm_row.get("back_to_base_loc"))
+
+#             if patient_handover_dt and back_to_base_dt:
+#                 diff = (back_to_base_dt - patient_handover_dt).total_seconds()
+#                 if diff >= 0:
+#                     actual_seconds = int(diff)
+
+#             if actual_seconds is not None and threshold_seconds is not None:
+#                 breach_seconds = max(0, actual_seconds - threshold_seconds)
+#                 breach_reason = (
+#                     f"Back to base delay — ambulance took {format_seconds_human(actual_seconds)} "
+#                     f"to return to base after patient handover, "
+#                     f"{format_seconds_human(breach_seconds)} over the "
+#                     f"{format_seconds_human(threshold_seconds)} SLA limit"
+#                     + (f" ({amb_area_type} area)" if amb_area_type else "")
+#                 )
+#             elif actual_seconds is not None and threshold_seconds is None:
+#                 breach_reason = (
+#                     f"Back to base delay — ambulance took {format_seconds_human(actual_seconds)} "
+#                     f"to return to base after patient handover. "
+#                     f"SLA threshold not configured for this alert type."
+#                 )
+#             else:
+#                 breach_reason = (
+#                     "Back to base delay — patient handover or back to base "
+#                     "time data not available in rtm_dashboard."
+#                 )
+
+#         # =========================================================
+#         # ACK_DELAY, START_DELAY, AT_SCENE_DELAY — direct duration field
+#         # =========================================================
+#         else:
+#             duration_field = ALERT_DURATION_MAP.get(alert_type)
+#             if duration_field:
+#                 raw_duration = rtm_row.get(duration_field)
+#                 actual_seconds = hhmmss_to_seconds(raw_duration) if raw_duration else None
+
+#                 if actual_seconds is not None and threshold_seconds is not None:
+#                     breach_seconds = max(0, actual_seconds - threshold_seconds)
+
+#                     # Human-readable message per alert type
+#                     if alert_type == "ACK_DELAY":
+#                         breach_reason = (
+#                             f"Acknowledge delay — ambulance took {format_seconds_human(actual_seconds)} "
+#                             f"to acknowledge the call, "
+#                             f"{format_seconds_human(breach_seconds)} over the "
+#                             f"{format_seconds_human(threshold_seconds)} SLA limit"
+#                             + (f" ({amb_area_type} area)" if amb_area_type else "")
+#                         )
+#                     elif alert_type == "START_DELAY":
+#                         breach_reason = (
+#                             f"Start from base delay — ambulance took {format_seconds_human(actual_seconds)} "
+#                             f"to depart from base, "
+#                             f"{format_seconds_human(breach_seconds)} over the "
+#                             f"{format_seconds_human(threshold_seconds)} SLA limit"
+#                             + (f" ({amb_area_type} area)" if amb_area_type else "")
+#                         )
+#                     elif alert_type == "AT_SCENE_DELAY":
+#                         breach_reason = (
+#                             f"At scene delay — ambulance spent {format_seconds_human(actual_seconds)} "
+#                             f"at the scene, "
+#                             f"{format_seconds_human(breach_seconds)} over the "
+#                             f"{format_seconds_human(threshold_seconds)} SLA limit"
+#                             + (f" ({amb_area_type} area)" if amb_area_type else "")
+#                         )
+#                     else:
+#                         breach_reason = (
+#                             f"{alert_type} — actual: {format_seconds_human(actual_seconds)}, "
+#                             f"threshold: {format_seconds_human(threshold_seconds)}, "
+#                             f"breached by: {format_seconds_human(breach_seconds)}"
+#                             + (f" ({amb_area_type} area)" if amb_area_type else "")
+#                         )
+#                 elif actual_seconds is not None and threshold_seconds is None:
+#                     breach_reason = (
+#                         f"{alert_type} — ambulance took {format_seconds_human(actual_seconds)}. "
+#                         f"SLA threshold not configured for this alert type."
+#                     )
+#                 else:
+#                     breach_reason = (
+#                         f"{alert_type} — duration data not available in rtm_dashboard."
+#                     )
+#             else:
+#                 breach_reason = f"{alert_type} — unknown alert type, no SLA mapping available."
+
+#         # breach seconds
+#         breach_seconds = None
+#         if actual_seconds is not None and threshold_seconds is not None:
+#             breach_seconds = max(0, actual_seconds - threshold_seconds)
+
+#         # 👇 SLA fields add karo alert me
+#         alert["sla_threshold_seconds"] = threshold_seconds
+#         alert["sla_actual_seconds"] = actual_seconds
+#         alert["sla_breach_seconds"] = breach_seconds
+#         alert["sla_breach_reason"] = breach_reason
+#         alert["amb_area"] = amb_area
+#         alert["amb_area_type"] = amb_area_type
+
+#     return alerts
+
 async def attach_sla_info_to_alerts(alerts: list) -> list:
     """Each alert me SLA breach details add karta hai.
     
@@ -4176,7 +4377,8 @@ async def attach_sla_info_to_alerts(alerts: list) -> list:
     - sla_threshold_seconds: SLA limit in seconds
     - sla_actual_seconds: actual time taken in seconds
     - sla_breach_seconds: how much time was exceeded
-    - sla_breach_reason: human-readable reason
+    - sla_breach_reason: human-readable reason (English)
+    - hin_sla_breach_reason: human-readable reason (Hindi)
     - amb_area: "1" (rural) or "2" (urban)
     - amb_area_type: "Rural" or "Urban"
     """
@@ -4237,7 +4439,6 @@ async def attach_sla_info_to_alerts(alerts: list) -> list:
             amb_area_type = "Urban"
 
         # Threshold dhoondho — alert_type + amb_area match
-        # null amb_area means applies to ALL areas
         threshold_seconds = None
         for t in thresholds:
             if t.get("alert_type") != alert_type:
@@ -4251,6 +4452,7 @@ async def attach_sla_info_to_alerts(alerts: list) -> list:
         # Actual duration calculate karo
         actual_seconds = None
         breach_reason = ""
+        hin_breach_reason = "" # 👈 HINDI TRANSLATION VARIABLE
 
         # =========================================================
         # MDT_NOT_LOGGED_IN
@@ -4260,6 +4462,9 @@ async def attach_sla_info_to_alerts(alerts: list) -> list:
             actual_seconds = 0
             breach_reason = (
                 f"MDT not logged in — pilot login status: {pilot_login_out}"
+            )
+            hin_breach_reason = (
+                f"MDT लॉग इन नहीं है — पायलट लॉगिन स्टेटस: {pilot_login_out}"
             )
 
         # =========================================================
@@ -4283,17 +4488,27 @@ async def attach_sla_info_to_alerts(alerts: list) -> list:
                     f"{format_seconds_human(threshold_seconds)} SLA limit"
                     + (f" ({amb_area_type} area)" if amb_area_type else "")
                 )
+                hin_breach_reason = (
+                    f"बेस वापसी में देरी — एम्बुलेंस को मरीज को सौंपने के बाद बेस लौटने में {format_seconds_human(actual_seconds)} लगे, "
+                    f"जो {format_seconds_human(threshold_seconds)} की SLA सीमा से {format_seconds_human(breach_seconds)} अधिक है"
+                    + (f" ({amb_area_type} क्षेत्र)" if amb_area_type else "")
+                )
             elif actual_seconds is not None and threshold_seconds is None:
                 breach_reason = (
                     f"Back to base delay — ambulance took {format_seconds_human(actual_seconds)} "
                     f"to return to base after patient handover. "
                     f"SLA threshold not configured for this alert type."
                 )
+                hin_breach_reason = (
+                    f"बेस वापसी में देरी — एम्बुलेंस को मरीज सौंपने के बाद बेस लौटने में {format_seconds_human(actual_seconds)} लगे। "
+                    f"इस अलर्ट प्रकार के लिए SLA सीमा कॉन्फ़िगर नहीं है।"
+                )
             else:
                 breach_reason = (
                     "Back to base delay — patient handover or back to base "
                     "time data not available in rtm_dashboard."
                 )
+                hin_breach_reason = "बेस वापसी में देरी — rtm_dashboard में मरीज सौंपने या बेस वापसी का समय डेटा उपलब्ध नहीं है।"
 
         # =========================================================
         # ACK_DELAY, START_DELAY, AT_SCENE_DELAY — direct duration field
@@ -4316,6 +4531,11 @@ async def attach_sla_info_to_alerts(alerts: list) -> list:
                             f"{format_seconds_human(threshold_seconds)} SLA limit"
                             + (f" ({amb_area_type} area)" if amb_area_type else "")
                         )
+                        hin_breach_reason = (
+                            f"स्वीकृति में देरी — एम्बुलेंस को कॉल स्वीकार करने में {format_seconds_human(actual_seconds)} लगे, "
+                            f"जो {format_seconds_human(threshold_seconds)} की SLA सीमा से {format_seconds_human(breach_seconds)} अधिक है"
+                            + (f" ({amb_area_type} क्षेत्र)" if amb_area_type else "")
+                        )
                     elif alert_type == "START_DELAY":
                         breach_reason = (
                             f"Start from base delay — ambulance took {format_seconds_human(actual_seconds)} "
@@ -4323,6 +4543,11 @@ async def attach_sla_info_to_alerts(alerts: list) -> list:
                             f"{format_seconds_human(breach_seconds)} over the "
                             f"{format_seconds_human(threshold_seconds)} SLA limit"
                             + (f" ({amb_area_type} area)" if amb_area_type else "")
+                        )
+                        hin_breach_reason = (
+                            f"बेस से रवाना होने में देरी — एम्बुलेंस को बेस से निकलने में {format_seconds_human(actual_seconds)} लगे, "
+                            f"जो {format_seconds_human(threshold_seconds)} की SLA सीमा से {format_seconds_human(breach_seconds)} अधिक है"
+                            + (f" ({amb_area_type} क्षेत्र)" if amb_area_type else "")
                         )
                     elif alert_type == "AT_SCENE_DELAY":
                         breach_reason = (
@@ -4332,6 +4557,11 @@ async def attach_sla_info_to_alerts(alerts: list) -> list:
                             f"{format_seconds_human(threshold_seconds)} SLA limit"
                             + (f" ({amb_area_type} area)" if amb_area_type else "")
                         )
+                        hin_breach_reason = (
+                            f"घटनास्थल पर देरी — एम्बुलेंस ने घटनास्थल पर {format_seconds_human(actual_seconds)} बिताए, "
+                            f"जो {format_seconds_human(threshold_seconds)} की SLA सीमा से {format_seconds_human(breach_seconds)} अधिक है"
+                            + (f" ({amb_area_type} क्षेत्र)" if amb_area_type else "")
+                        )
                     else:
                         breach_reason = (
                             f"{alert_type} — actual: {format_seconds_human(actual_seconds)}, "
@@ -4339,17 +4569,29 @@ async def attach_sla_info_to_alerts(alerts: list) -> list:
                             f"breached by: {format_seconds_human(breach_seconds)}"
                             + (f" ({amb_area_type} area)" if amb_area_type else "")
                         )
+                        hin_breach_reason = (
+                            f"{alert_type} — वास्तविक: {format_seconds_human(actual_seconds)}, "
+                            f"सीमा: {format_seconds_human(threshold_seconds)}, "
+                            f"अतिरिक्त: {format_seconds_human(breach_seconds)}"
+                            + (f" ({amb_area_type} क्षेत्र)" if amb_area_type else "")
+                        )
                 elif actual_seconds is not None and threshold_seconds is None:
                     breach_reason = (
                         f"{alert_type} — ambulance took {format_seconds_human(actual_seconds)}. "
                         f"SLA threshold not configured for this alert type."
                     )
+                    hin_breach_reason = (
+                        f"{alert_type} — एम्बुलेंस को {format_seconds_human(actual_seconds)} लगे। "
+                        f"इस अलर्ट प्रकार के लिए SLA सीमा कॉन्फ़िगर नहीं है।"
+                    )
                 else:
                     breach_reason = (
                         f"{alert_type} — duration data not available in rtm_dashboard."
                     )
+                    hin_breach_reason = f"{alert_type} — rtm_dashboard में अवधि का डेटा उपलब्ध नहीं है।"
             else:
                 breach_reason = f"{alert_type} — unknown alert type, no SLA mapping available."
+                hin_breach_reason = f"{alert_type} — अज्ञात अलर्ट प्रकार, कोई SLA मैपिंग उपलब्ध नहीं है।"
 
         # breach seconds
         breach_seconds = None
@@ -4361,6 +4603,7 @@ async def attach_sla_info_to_alerts(alerts: list) -> list:
         alert["sla_actual_seconds"] = actual_seconds
         alert["sla_breach_seconds"] = breach_seconds
         alert["sla_breach_reason"] = breach_reason
+        alert["hin_sla_breach_reason"] = hin_breach_reason # 👈 HINDI KEY ADDED
         alert["amb_area"] = amb_area
         alert["amb_area_type"] = amb_area_type
 
@@ -4376,7 +4619,6 @@ async def build_all_escalation_payloads(requested_level: int = None) -> list:
     # Fetch denial records (sirf un case mein lao jab level 1 na ho)
     denial_rows = []
     if requested_level is None or requested_level != 1:
-        # 👇 FIX: DISTINCT ON use kiya taaki ek call_id ka sirf 1 latest record aaye
         denial_rows = await database2.fetch_all(
             """
             SELECT * FROM (
@@ -4470,16 +4712,20 @@ async def build_all_escalation_payloads(requested_level: int = None) -> list:
         alert["type"] = "current_escalation"
         alert["escalated_at"] = datetime.now(ist).isoformat()
 
-        # 👇 FIX: Level 1 ke liye faltu fields hata do
-        if requested_level == 1:
-            alert.pop("escalated_at", None)
-            alert.pop("updated_date", None)
-            alert.pop("current_level_minutes", None)
-
         filtered_alerts.append(alert)
 
     # SLA breach details add karo
     filtered_alerts = await attach_sla_info_to_alerts(filtered_alerts)
+
+    # 👇 FIX: Level 1 ke liye faltu fields hata do aur Hindi SLA sirf Level 1 ke liye rakho
+    for alert in filtered_alerts:
+        if requested_level == 1:
+            alert.pop("escalated_at", None)
+            alert.pop("updated_date", None)
+            alert.pop("current_level_minutes", None)
+        else:
+            # 👇 Level 1 ke alawa kisi aur level ko Hindi SLA reason nahi chahiye
+            alert.pop("hin_sla_breach_reason", None)
 
     logger.info(
         f"BUILD PAYLOADS: returning {len(filtered_alerts)} alerts "
@@ -5638,8 +5884,8 @@ async def take_escalation_action(level: int, payload: TakeActionRequest):
                     UPDATE public.central_alerts
                     SET escalate_status = '2',
                         escalated_deny_remark = :remark,
-                        cancel_by = :action_by,
-                        cancel_date = NOW(),
+                        escalated_by = :action_by,
+                        escalated_date = NOW(),
                         updated_date = NOW()
                     WHERE alert_id = :alert_id
                     """,
@@ -5709,10 +5955,14 @@ async def take_escalation_action(level: int, payload: TakeActionRequest):
             action_remark=action_remark
         )
 
+        
+
         return {
-            "status": "success",
-            "message": "Action taken, incident closed successfully.",
-            "action_details": action_details,
+            "data": {
+                "status": "success",
+                "message": "Action taken, incident closed successfully.",
+                "action_details": action_details,
+            }
         }
 
     except Exception as e:
