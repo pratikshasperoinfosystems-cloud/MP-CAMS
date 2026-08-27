@@ -2734,106 +2734,78 @@ async def download_client_report(
         df = pd.DataFrame([{"Message": "No Incident Alert Data Found"}])
  
  
-    # --------------------------------------------------------
-
+     # --------------------------------------------------------
     # 2. FETCH DENIAL RECORDS (NAYA SHEET KE LIYE)
-
     # --------------------------------------------------------
-
     denial_sql = f"""
-
     SELECT id, mysql_id, call_id, amb_no, amb_default_mobile, caller_no,
-
-           hp_name, challenge_val, meaning, denial_remark, dst_name,
-
+           hp_name, challenge_val, meaning, denial_remark, remark, dst_name,
            alert_type, added_by, added_date, escalate_status
-
     FROM public.denial_escalation_master
-
     WHERE (is_deleted = FALSE OR is_deleted IS NULL)
-
     AND {denial_date_filter}
-
     ORDER BY added_date DESC
-
     """
-
+ 
     denial_rows = await database2.fetch_all(denial_sql)
-
     df_denial = pd.DataFrame([dict(r) for r in denial_rows]) if denial_rows else pd.DataFrame()
  
     if not df_denial.empty:
-
         df_denial.insert(0, "Sr No", list(range(1, len(df_denial) + 1)))
-
+ 
         # Denial ke liye Escalation Map
-
         denial_escalation_map = {
-
             "0": "Open",
-
             "1": "In Progress",
-
             "2": "Escalated",
-
             "3": "Closed"
-
         }
-
+ 
         if "escalate_status" in df_denial.columns:
-
             df_denial["Escalation Status"] = df_denial["escalate_status"].astype(str).map(denial_escalation_map)
-
             df_denial.drop(columns=["escalate_status"], inplace=True)
  
         if "added_date" in df_denial.columns:
-
             df_denial["Added Date & Time"] = pd.to_datetime(df_denial["added_date"], errors="coerce").dt.strftime("%d-%m-%Y %H:%M")
-
             df_denial.drop(columns=["added_date"], inplace=True)
-
+ 
         if "mysql_id" in df_denial.columns:
-
             df_denial.drop(columns=["mysql_id"], inplace=True)
  
         denial_rename_map = {
-
             "Sr No": "Sr No",
-
             "id": "Denial ID",
-
             "call_id": "Call ID",
-
             "amb_no": "Ambulance Number",
-
             "amb_default_mobile": "Ambulance Mobile",
-
             "caller_no": "Caller No",
-
             "hp_name": "Hospital Name",
-
             "challenge_val": "Challenge",
-
             "meaning": "Denial Reason",
-
             "denial_remark": "Denial Remark",
-
+            "remark": "Remark",                        # ✅ NAYA
             "dst_name": "District",
-
             "alert_type": "Alert Type",
-
             "added_by": "Added By",
-
             "Added Date & Time": "Added Date & Time",
-
             "Escalation Status": "Escalation Status"
-
         }
-
+ 
         df_denial.rename(columns=denial_rename_map, inplace=True)
-
+ 
+        # ✅ NAYA: Column order — Remark ko Escalation Status ke right me rakhne ke liye
+        denial_column_order = [
+            "Sr No", "Denial ID", "Call ID", "Ambulance Number", "Ambulance Mobile",
+            "Caller No", "Hospital Name", "Challenge", "Denial Reason",
+            "Denial Remark", "District", "Alert Type", "Added By",
+            "Added Date & Time", "Escalation Status", "Remark",
+        ]
+ 
+        denial_ordered_cols = [c for c in denial_column_order if c in df_denial.columns]
+        denial_remaining_cols = [c for c in df_denial.columns if c not in denial_ordered_cols]
+        df_denial = df_denial[denial_ordered_cols + denial_remaining_cols]
+ 
     else:
-
         df_denial = pd.DataFrame([{"Message": "No Call Denial Data Found"}])
  
  
