@@ -3676,237 +3676,413 @@ async def attach_level_info_to_groups(grouped_data: list[dict]) -> list[dict]:
     return grouped_data
 
 
+# @app.websocket("/ws/denial_alerts")
+
+# async def websocket_denial_alerts(websocket: WebSocket):
+
+#     """URL se ?date=YYYY-MM-DD pass kar sakte hain.
+
+#     Date na diya to default CURRENT_DATE (aaj) use hoga."""
+ 
+#     await websocket.accept()
+ 
+#     last_sent_ids: set = set()
+
+#     notify_event = asyncio.Event()
+ 
+#     # URL se date param
+
+#     date_param = websocket.query_params.get("date")
+ 
+#     if date_param:
+
+#         try:
+
+#             selected_date = datetime.strptime(date_param, "%Y-%m-%d").date()
+
+#             date_condition = f"d.added_date::date = '{selected_date}'"
+
+#         except ValueError:
+
+#             await websocket.send_json({
+
+#                 "type": "ERROR",
+
+#                 "message": "Invalid date format! Use ?date=YYYY-MM-DD"
+
+#             })
+
+#             await websocket.close()
+
+#             return
+
+#     else:
+
+#         selected_date = None
+
+#         date_condition = "d.added_date::date = CURRENT_DATE"
+ 
+#     query = f"""
+
+#         SELECT d.*,
+
+#                af.status AS alert_flow_status
+
+#         FROM denial_escalation_master d
+
+#         LEFT JOIN LATERAL (
+
+#             SELECT status
+
+#             FROM alert_escalation_flow
+
+#             WHERE call_id = d.call_id
+
+#             LIMIT 1
+
+#         ) af ON TRUE
+
+#         WHERE d.escalate_status = '1' 
+
+#         AND (d.is_deleted = FALSE OR d.is_deleted IS NULL)
+
+#         AND {date_condition}
+
+#         ORDER BY d.added_date DESC;
+
+#     """
+ 
+#     async def send_if_changed():
+
+#         nonlocal last_sent_ids
+
+#         current_data = await fetch_current_data(query)
+
+#         current_ids = {d["id"] for d in current_data}
+ 
+#         if current_ids != last_sent_ids:
+
+#             grouped_current = group_by_call_id(current_data)
+
+#             grouped_current = await attach_level_info_to_groups(grouped_current)
+
+#             await websocket.send_json({
+
+#                 "type": "INITIAL_LOAD",
+
+#                 "count": len(grouped_current),
+
+#                 "data": grouped_current
+
+#             })
+
+#             last_sent_ids = current_ids
+ 
+#     def on_notify(conn, pid, channel, payload):
+
+#         notify_event.set()
+ 
+#     # ✅ NAYA: Ye flag se pata chalega client zinda hai ya nahi
+
+#     client_alive = True
+ 
+#     try:
+
+#         # STEP 1: Initial load
+
+#         initial_data = await fetch_current_data(query)
+
+#         last_sent_ids = {d["id"] for d in initial_data}
+ 
+#         grouped_initial = group_by_call_id(initial_data)
+
+#         grouped_initial = await attach_level_info_to_groups(grouped_initial)
+ 
+#         await websocket.send_json({
+
+#             "type": "INITIAL_LOAD",
+
+#             "count": len(grouped_initial),
+
+#             "selected_date": str(selected_date) if selected_date else "today",
+
+#             "data": grouped_initial
+
+#         })
+ 
+#         # STEP 2: Connection & LISTEN
+
+#         async with database2.connection() as db_connection:
+
+#             raw_conn = db_connection.raw_connection
+
+#             await raw_conn.add_listener("denial_escalation_channel", on_notify)
+ 
+#             try:
+
+#                 # STEP 3: Wait for notify and send changes
+
+#                 while client_alive:
+
+#                     try:
+
+#                         await asyncio.wait_for(notify_event.wait(), timeout=30)
+
+#                     except asyncio.TimeoutError:
+
+#                         pass
+ 
+#                     notify_event.clear()
+ 
+#                     # ✅ NAYA: Send ko guard karo — dead client pe crash nahi hoga
+
+#                     try:
+
+#                         await send_if_changed()
+
+#                     except (WebSocketDisconnect, RuntimeError):
+
+#                         # Client chala gaya — loop se NIKAL jao (break), error mat failao
+
+#                         print("🔌 Client disconnected during send — stopping listener loop")
+
+#                         client_alive = False
+
+#                         break
+ 
+#             finally:
+
+#                 # ✅ NAYA: Listener hamesha remove hoga — InterfaceWarning fix
+
+#                 try:
+
+#                     raw_conn.remove_listener("denial_escalation_channel", on_notify)
+
+#                 except Exception:
+
+#                     pass
+ 
+#     except WebSocketDisconnect:
+
+#         print("Frontend disconnected from WebSocket")
+ 
+#     except Exception as e:
+
+#         import traceback
+
+#         error_trace = traceback.format_exc()
+
+#         print(f"WebSocket Error: {e}\n{error_trace}")
+ 
+#         # ✅ NAYA: Transport dead ho to send_json try hi mat karo
+
+#         try:
+
+#             if client_alive:
+
+#                 await websocket.send_json({
+
+#                     "type": "ERROR",
+
+#                     "message": str(e),
+
+#                     "trace": error_trace
+
+#                 })
+
+#         except Exception:
+
+#             pass
+ 
+#     finally:
+
+#         # ✅ NAYA: Close bhi safe — BrokenPipe handle
+
+#         try:
+
+#             await websocket.close()
+
+#         except Exception:
+
+#             pass
+#################################################################################################
 @app.websocket("/ws/denial_alerts")
-
 async def websocket_denial_alerts(websocket: WebSocket):
-
     """URL se ?date=YYYY-MM-DD pass kar sakte hain.
-
     Date na diya to default CURRENT_DATE (aaj) use hoga."""
  
     await websocket.accept()
  
     last_sent_ids: set = set()
-
     notify_event = asyncio.Event()
  
     # URL se date param
-
     date_param = websocket.query_params.get("date")
  
     if date_param:
-
         try:
-
             selected_date = datetime.strptime(date_param, "%Y-%m-%d").date()
-
             date_condition = f"d.added_date::date = '{selected_date}'"
-
         except ValueError:
-
             await websocket.send_json({
-
                 "type": "ERROR",
-
                 "message": "Invalid date format! Use ?date=YYYY-MM-DD"
-
             })
-
             await websocket.close()
-
             return
-
     else:
-
         selected_date = None
-
         date_condition = "d.added_date::date = CURRENT_DATE"
  
+    # ✅ SQL Query: call_id DESC (BIGINT ke liye perfect)
     query = f"""
-
         SELECT d.*,
-
                af.status AS alert_flow_status
-
         FROM denial_escalation_master d
-
         LEFT JOIN LATERAL (
-
             SELECT status
-
             FROM alert_escalation_flow
-
             WHERE call_id = d.call_id
-
             LIMIT 1
-
         ) af ON TRUE
-
         WHERE d.escalate_status = '1' 
-
         AND (d.is_deleted = FALSE OR d.is_deleted IS NULL)
-
         AND {date_condition}
-
-        ORDER BY d.added_date DESC;
-
+        ORDER BY d.call_id DESC;
     """
  
+    # ✅ NAYA SORT: Ab 'call_id' (BIGINT) ko Number ki tarah compare karega
+    def sort_grouped_desc(grouped):
+        if isinstance(grouped, dict):
+            grouped = list(grouped.values())
+        
+        if not isinstance(grouped, list):
+            return grouped
+            
+        def get_max_call_id(group_item):
+            max_id = -1
+            
+            def search_call_id(sub_item):
+                nonlocal max_id
+                if isinstance(sub_item, dict):
+                    for k, v in sub_item.items():
+                        if k == "call_id" and v is not None:
+                            try:
+                                # String/BigInt ko Number (int) mein convert karke compare karo
+                                val = int(v)
+                                if val > max_id:
+                                    max_id = val
+                            except (ValueError, TypeError):
+                                pass
+                        else:
+                            search_call_id(v)
+                elif isinstance(sub_item, list):
+                    for v in sub_item:
+                        search_call_id(v)
+                        
+            search_call_id(group_item)
+            return max_id
+
+        try:
+            return sorted(grouped, key=get_max_call_id, reverse=True)
+        except Exception as e:
+            print(f"Sort Error: {e}")
+            return grouped
+ 
     async def send_if_changed():
-
         nonlocal last_sent_ids
-
         current_data = await fetch_current_data(query)
-
         current_ids = {d["id"] for d in current_data}
  
         if current_ids != last_sent_ids:
-
             grouped_current = group_by_call_id(current_data)
-
             grouped_current = await attach_level_info_to_groups(grouped_current)
-
+            grouped_current = sort_grouped_desc(grouped_current)
+            
+            # ✅ DEBUG PRINT: Terminal mein check karo order sahi hai ya nahi
+            print("🔵 Backend Sending Order (Call IDs):", [g.get("call_id") if isinstance(g, dict) else "?" for g in grouped_current])
+ 
             await websocket.send_json({
-
                 "type": "INITIAL_LOAD",
-
                 "count": len(grouped_current),
-
                 "data": grouped_current
-
             })
-
             last_sent_ids = current_ids
  
     def on_notify(conn, pid, channel, payload):
-
         notify_event.set()
  
-    # ✅ NAYA: Ye flag se pata chalega client zinda hai ya nahi
-
     client_alive = True
  
     try:
-
         # STEP 1: Initial load
-
         initial_data = await fetch_current_data(query)
-
         last_sent_ids = {d["id"] for d in initial_data}
  
         grouped_initial = group_by_call_id(initial_data)
-
         grouped_initial = await attach_level_info_to_groups(grouped_initial)
+        grouped_initial = sort_grouped_desc(grouped_initial)
+        
+        # ✅ DEBUG PRINT
+        print("🔵 Backend Initial Order (Call IDs):", [g.get("call_id") if isinstance(g, dict) else "?" for g in grouped_initial])
  
         await websocket.send_json({
-
             "type": "INITIAL_LOAD",
-
             "count": len(grouped_initial),
-
             "selected_date": str(selected_date) if selected_date else "today",
-
             "data": grouped_initial
-
         })
  
         # STEP 2: Connection & LISTEN
-
         async with database2.connection() as db_connection:
-
             raw_conn = db_connection.raw_connection
-
             await raw_conn.add_listener("denial_escalation_channel", on_notify)
  
             try:
-
-                # STEP 3: Wait for notify and send changes
-
                 while client_alive:
-
                     try:
-
                         await asyncio.wait_for(notify_event.wait(), timeout=30)
-
                     except asyncio.TimeoutError:
-
                         pass
  
                     notify_event.clear()
  
-                    # ✅ NAYA: Send ko guard karo — dead client pe crash nahi hoga
-
                     try:
-
                         await send_if_changed()
-
                     except (WebSocketDisconnect, RuntimeError):
-
-                        # Client chala gaya — loop se NIKAL jao (break), error mat failao
-
                         print("🔌 Client disconnected during send — stopping listener loop")
-
                         client_alive = False
-
                         break
  
             finally:
-
-                # ✅ NAYA: Listener hamesha remove hoga — InterfaceWarning fix
-
                 try:
-
                     raw_conn.remove_listener("denial_escalation_channel", on_notify)
-
                 except Exception:
-
                     pass
  
     except WebSocketDisconnect:
-
         print("Frontend disconnected from WebSocket")
  
     except Exception as e:
-
         import traceback
-
         error_trace = traceback.format_exc()
-
         print(f"WebSocket Error: {e}\n{error_trace}")
  
-        # ✅ NAYA: Transport dead ho to send_json try hi mat karo
-
         try:
-
             if client_alive:
-
                 await websocket.send_json({
-
                     "type": "ERROR",
-
                     "message": str(e),
-
                     "trace": error_trace
-
                 })
-
         except Exception:
-
             pass
  
     finally:
-
-        # ✅ NAYA: Close bhi safe — BrokenPipe handle
-
         try:
-
             await websocket.close()
-
         except Exception:
-
             pass
- 
-
 ##########################################################################################
 # ------------------------------------------------------------------
 # Config
