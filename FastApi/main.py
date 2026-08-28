@@ -1521,11 +1521,6 @@ async def denial_complaints_insert_worker():
                     inserted_count += 1
 
                     try:
-                        await insert_into_escalation_flow('denial', d)
-                    except Exception as flow_err:
-                        logger.error(f"Flow insert failed for denial: {flow_err}")
-
-                    try:
                         await broadcast_new_escalation(
                             call_id=call_id_val,
                             denial_record={
