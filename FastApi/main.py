@@ -129,35 +129,64 @@ async def redis_subscriber():
     """
     Subscribe to Redis channel and push received messages to local client queues.
     Runs in every worker process to enable cross-worker WebSocket broadcasts.
+    Auto-reconnects if Redis connection drops — task kabhi permanently nahi marta.
     """
     logger.info("Redis Subscriber STARTED")
-    try:
-        r = await init_redis()
-        pubsub = r.pubsub()
-        await pubsub.subscribe("central_alerts_channel")
 
-        async for message in pubsub.listen():
-            if message["type"] == "message":
+    while True:
+        pubsub = None
+        try:
+            r = await init_redis()
+            pubsub = r.pubsub()
+            await pubsub.subscribe("central_alerts_channel")
+            logger.info("Redis subscriber connected & subscribed to 'central_alerts_channel'")
+
+            async for message in pubsub.listen():
+                if message["type"] != "message":
+                    continue
+
                 try:
                     payload = json.loads(message["data"])
+                except (json.JSONDecodeError, TypeError) as e:
+                    logger.error(f"Redis subscriber: invalid JSON payload dropped: {e}")
+                    continue
 
-                    # 👇 Direct push to local queues (NOT via manager.broadcast — avoids loop)
-                    dead = []
-                    for ws, info in manager.active_connections.items():
-                        try:
-                            info["queue"].put_nowait(payload)
-                        except asyncio.QueueFull:
-                            logger.warning("Queue full, dropping client")
-                            dead.append(ws)
-                    for ws in dead:
+                # ---- Direct push to local queues (NOT via manager.broadcast — avoids loop) ----
+                dead = []
+                for ws, info in manager.active_connections.items():
+                    try:
+                        info["queue"].put_nowait(payload)
+                    except asyncio.QueueFull:
+                        logger.warning(
+                            f"Queue full, dropping client: {info.get('user_id', 'unknown')}"
+                        )
+                        dead.append(ws)
+
+                for ws in dead:
+                    try:
                         manager.disconnect(ws)
+                    except Exception as disc_err:
+                        logger.error(f"Disconnect failed for slow client: {disc_err}")
 
-                except Exception as e:
-                    logger.error(f"Redis subscriber parse error: {e}")
-    except asyncio.CancelledError:
-        logger.info("Redis subscriber cancelled")
-    except Exception as e:
-        logger.exception(f"Redis subscriber error: {e}")
+        except asyncio.CancelledError:
+            # Graceful shutdown
+            logger.info("Redis subscriber cancelled — shutting down")
+            if pubsub is not None:
+                try:
+                    await pubsub.close()
+                except Exception:
+                    pass
+            raise
+
+        except Exception as e:
+            # Connection drop / Redis down 
+            logger.exception(f"Redis subscriber error: {e} — reconnecting in 5s")
+            if pubsub is not None:
+                try:
+                    await pubsub.close()   
+                except Exception:
+                    pass
+            await asyncio.sleep(5)
 
 
 # ============================================================
@@ -606,7 +635,6 @@ async def rtm_alert_insert_worker():
                             "paramedic_mobile": to_int(row.get("paramedic_mobile")),
                         }
 
-                        # 👇 NAYA: fetch_one + RETURNING use karo taaki pata chale insert hua ya nahi
                         inserted_row = await database2.fetch_one(
                             """
                             INSERT INTO central_alerts (
@@ -629,7 +657,6 @@ async def rtm_alert_insert_worker():
                             params
                         )
 
-                        # 👇 Agar insert hua (conflict nahi hua) → broadcast karo
                         if inserted_row:
                             inserted_dict = serialize_row(inserted_row)
                             try:
@@ -915,7 +942,6 @@ MAPPED_COLUMNS = {
     "added_by", "added_date", "call_id"
 }
  
-# Forced defaults — ye columns hamesha isi value se bharenge
 FORCED_DEFAULTS = {
     "alert_type": "incident denial",
 }
@@ -972,8 +998,6 @@ async def get_required_default_columns():
         col = r["column_name"]
         dtype = r["data_type"]
  
-        # in columns ko hum khud fill karte hain
-        # FORCED_DEFAULTS bhi skip — warna alert_type ko "" mil jata
         if col in MAPPED_COLUMNS or col in ("id", "mysql_id") or col in FORCED_DEFAULTS:
             continue
  
@@ -1430,7 +1454,6 @@ async def denial_complaints_insert_worker():
                         skipped_no_id += 1
                         continue
 
-                    # Check karo: ye mysql_id pehle se Postgres mein hai?
                     existing = await database2.fetch_one(
                         """
                         SELECT id 
@@ -1444,7 +1467,6 @@ async def denial_complaints_insert_worker():
                         skipped_existing += 1
                         continue
 
-                    # 👇 NAYA LOGIC: Call_id ke against kitne alerts pehle se hain?
                     call_id_val = d.get("call_id")
                     alert_count = 0
                     
@@ -1480,12 +1502,10 @@ async def denial_complaints_insert_worker():
                         "denial_remark": d.get("denial_remark"),
                         "added_by": d.get("added_by"),
                         "added_date": d.get("added_date"),
-                        "severity": severity, # 👈 Yahan severity pass ho rahi hai
+                        "severity": severity, 
                     }
 
-                    # pehle NOT NULL defaults lagao
                     params.update(required_defaults)
-                    # ab forced defaults — alert_type = "incident denial" hamesha
                     params.update(FORCED_DEFAULTS)
 
                     columns = ", ".join(params.keys())
@@ -1500,13 +1520,11 @@ async def denial_complaints_insert_worker():
                     )
                     inserted_count += 1
 
-                    # NAYA: alert_escalation_flow table me insert karo
                     try:
                         await insert_into_escalation_flow('denial', d)
                     except Exception as flow_err:
                         logger.error(f"Flow insert failed for denial: {flow_err}")
 
-                    # 👈 Separate try/except — broadcast fail ho to insert count disturb na ho
                     try:
                         await broadcast_new_escalation(
                             call_id=call_id_val,
@@ -1525,7 +1543,7 @@ async def denial_complaints_insert_worker():
                                 "alert_type":        "incident denial",
                                 "added_by":          d.get("added_by"),
                                 "added_date":        d.get("added_date").isoformat() if d.get("added_date") else None,
-                                "severity":          severity, # 👈 Broadcast payload me bhi severity bhejo
+                                "severity":          severity, 
                             },
                         )
                     except Exception as b_err:
@@ -1752,7 +1770,6 @@ async def alert_ws_notifier():
         except Exception as e:
             print("❌ Alert WS Notifier Error:", e)
 
-        # 👇 0.5 sec — pehle 1 sec tha, ab fast hoga
         await asyncio.sleep(0.5)
 
 
@@ -1800,8 +1817,7 @@ async def lifespan(app: FastAPI):
     await database2.connect()
     await init_redis()
 
-    # 👇 Firebase Admin SDK initialize karo — workers start hone se PEHLE
-    # (kyunki workers FCM push bhejte hain — Firebase ready hona chahiye)
+    
     try:
         firebase_admin.get_app()  # Already initialized?
         logger.info("Firebase Admin SDK already initialized")
@@ -2174,8 +2190,8 @@ async def rtm_alerts_ws(websocket: WebSocket):
 # -------------------- Central Alerts WebSocket --------------------
 
 # ---- tuning knobs ----
-MAX_CONSECUTIVE_RECV_ERRORS = 5  # only bail if the socket is TRULY broken (not for one bad message)
-RECV_ERROR_WINDOW = 10           # errors must cluster within this many seconds to count as "truly broken"
+MAX_CONSECUTIVE_RECV_ERRORS = 5  
+RECV_ERROR_WINDOW = 10           
 
 def _bump_error(consecutive_errors: int, first_error_ts):
     """Track error bursts so a single stray error never kills a healthy connection,
@@ -2279,19 +2295,15 @@ async def central_alerts_ws(websocket: WebSocket):
         # 2️⃣ TWO CONCURRENT LOOPS — real-time updates ke liye
         # =====================================================
 
-        # 👇 YE FUNCTION AB BATCH QUERY MAREGA (100% SAFE & FAST)
         async def ensure_status(records):
             if not records:
                 return records
                 
-            # 1. Un records ko nikaalo jisme status missing hai
             missing_records = [r for r in records if "alert_flow_status" not in r or r.get("alert_flow_status") is None]
             
-            # Agar sabke paas status hai, toh kuch karne ki zaroorat nahi
             if not missing_records:
                 return records
                 
-            # 2. Missing records ke alert_ids nikaalo
             alert_ids = [r.get("alert_id") for r in missing_records if r.get("alert_id") is not None]
             
             if not alert_ids:
@@ -2300,13 +2312,11 @@ async def central_alerts_ws(websocket: WebSocket):
                 return records
                 
             try:
-                # 3. Data type issue fix karo
                 try:
                     clean_ids = [int(aid) for aid in alert_ids]
                 except (ValueError, TypeError):
                     clean_ids = alert_ids
                     
-                # 4. Ek hi query mein saare IDs ka status nikaalo (Batch Query)
                 ids_str = ",".join(str(aid) for aid in clean_ids)
                 q = f"""
                     SELECT alert_id, status 
@@ -2315,7 +2325,6 @@ async def central_alerts_ws(websocket: WebSocket):
                 """
                 rows = await database2.fetch_all(q)
                 
-                # 5. Dictionary bana lo taaki map karna fast ho
                 status_map = {}
                 for row in rows:
                     try:
@@ -2323,7 +2332,6 @@ async def central_alerts_ws(websocket: WebSocket):
                     except (ValueError, TypeError):
                         status_map[str(row["alert_id"])] = row["status"]
                         
-                # 6. Missing records mein status attach karo
                 for r in missing_records:
                     aid = r.get("alert_id")
                     status = None
@@ -2335,7 +2343,6 @@ async def central_alerts_ws(websocket: WebSocket):
                     
             except Exception as e:
                 print(f"❌ Error in ensure_status: {e}")
-                # Agar query fail ho jaye, toh None set kar do, disconnect mat karo
                 for r in missing_records:
                     r["alert_flow_status"] = None
                 
@@ -2352,7 +2359,6 @@ async def central_alerts_ws(websocket: WebSocket):
                     data = payload.get("data", {})
                     records = data.get("today_all", [])
                     
-                    # 👇 YAHAN ENSURE_STATUS CALL HO RAHA HAI
                     data["today_all"] = await ensure_status(records)
 
                     if not await manager.safe_send(websocket, payload):
@@ -2418,7 +2424,6 @@ async def central_alerts_ws(websocket: WebSocket):
 
                 today_all = [serialize_row(r) for r in rows]
                 
-                # 👇 YAHAN BHI ENSURE_STATUS CALL HO RAHA HAI
                 today_all = await ensure_status(today_all)
                 
                 by_severity = group_by_severity(rows)
@@ -2434,7 +2439,6 @@ async def central_alerts_ws(websocket: WebSocket):
 
                 print(f"📤 Sent alerts (incident_id={incident_id}, date={filter_date})")
 
-        # 👇 Dono loops concurrently chalao
         sender = asyncio.create_task(drain_loop())
         receiver = asyncio.create_task(client_listener())
 
@@ -2560,7 +2564,6 @@ async def dashboard_alerts_overview(
     range: Optional[str] = Query("today", enum=["today", "month", "all"])
 ):
     date_filter = get_date_filter(range)
-    # Denial table ke liye date filter banayein (kyunki uska column naam 'added_date' hai)
     if range == "today":
         denial_date_filter = "DATE(added_date) = CURRENT_DATE"
     elif range == "month":
@@ -2984,7 +2987,6 @@ async def download_client_report(
     if not df_denial.empty:
         df_denial.insert(0, "Sr No", list(range(1, len(df_denial) + 1)))
  
-        # Denial ke liye Escalation Map
         denial_escalation_map = {
             "0": "Open",
             "1": "In Progress",
@@ -3024,7 +3026,6 @@ async def download_client_report(
  
         df_denial.rename(columns=denial_rename_map, inplace=True)
  
-        # ✅ NAYA: Column order — Remark ko Escalation Status ke right me rakhne ke liye
         denial_column_order = [
             "Sr No", "Denial ID", "Call ID", "Ambulance Number", "Ambulance Mobile",
             "Caller No", "Hospital Name", "Challenge", "Denial Reason",
@@ -6000,7 +6001,6 @@ async def get_mdt_alerts_by_ambulance(ambulance_no: str = Query(..., description
         rows = await database2.fetch_all(query, {"amb": normalized_amb})
         
         if not rows:
-            # 👇 Direct format
             return {
                 "data": [],
                 "vehicle_filter": normalized_amb
@@ -6015,6 +6015,15 @@ async def get_mdt_alerts_by_ambulance(ambulance_no: str = Query(..., description
         for alert in alerts:
             call_id = str(alert.get("alert_id") or "")
             check_date = alert.get("created_date")
+            
+            # 👇 FIX 1: escalated_deny_remark null hone par default message set karo
+            if alert.get("escalated_deny_remark") is None:
+                alert["escalated_deny_remark"] = "Escalated to higher department/authority"
+            
+            # 👇 FIX 2: SLA threshold seconds ko human-readable format me convert karo
+            sla_threshold = alert.get("sla_threshold_seconds")
+            if sla_threshold is not None:
+                alert["sla_threshold_human"] = format_seconds_human(sla_threshold)
             
             # Check if closed
             if await is_closed(call_id):
@@ -6036,7 +6045,6 @@ async def get_mdt_alerts_by_ambulance(ambulance_no: str = Query(..., description
             
             response_data.append(alert)
             
-        # 👇 Direct format (No type, No count)
         return {
             "data": response_data,
             "vehicle_filter": normalized_amb
