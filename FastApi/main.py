@@ -1805,7 +1805,7 @@ async def run_worker_with_restart():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global alert_worker_task, notifier_task, redis_sub_task, denial_worker_task
-    global esc_bump_task
+    global esc_bump_task, reconciliation_task
 
     # --- STARTUP ---
     await database.connect()
@@ -1830,13 +1830,14 @@ async def lifespan(app: FastAPI):
     redis_sub_task = asyncio.create_task(redis_subscriber())
     denial_worker_task = asyncio.create_task(denial_complaints_insert_worker())
     esc_bump_task = asyncio.create_task(escalation_level_bump_watcher())
+    reconciliation_task = asyncio.create_task(audit_table_reconciliation_worker())
 
     logger.info("Application STARTED — all workers + escalation bump watcher running")
 
     yield
 
     # --- SHUTDOWN ---
-    for t in [alert_worker_task, notifier_task, redis_sub_task, denial_worker_task,esc_bump_task]:
+    for t in [alert_worker_task, notifier_task, redis_sub_task, denial_worker_task, esc_bump_task, reconciliation_task]:
         if t:
             t.cancel()
             try:
@@ -4535,6 +4536,7 @@ async def attach_sla_info_to_alerts(alerts: list) -> list:
     - hin_sla_breach_reason: human-readable reason (Hindi)
     - amb_area: "1" (rural) or "2" (urban)
     - amb_area_type: "Rural" or "Urban"
+    - call_type: Call type from rtm_dashboard (e.g., 108, 102)
     """
     if not alerts:
         return alerts
@@ -4757,9 +4759,12 @@ async def attach_sla_info_to_alerts(alerts: list) -> list:
         alert["sla_actual_seconds"] = actual_seconds
         alert["sla_breach_seconds"] = breach_seconds
         alert["sla_breach_reason"] = breach_reason
-        alert["hin_sla_breach_reason"] = hin_breach_reason # 👈 HINDI KEY ADDED
+        alert["hin_sla_breach_reason"] = hin_breach_reason
         alert["amb_area"] = amb_area
         alert["amb_area_type"] = amb_area_type
+        
+        # 👇 NAYA: call_type add karo (Central alerts ke liye rtm_dashboard se aayega, denial ke liye null reh jayega)
+        alert["call_type"] = rtm_row.get("call_type")
 
     return alerts
 
@@ -4767,29 +4772,25 @@ async def attach_sla_info_to_alerts(alerts: list) -> list:
 # PAYLOAD BUILDER
 # ===========================================================================
 async def build_all_escalation_payloads(requested_level: int = None) -> list:
-    """Saare alerts (central + denial) ko ek hi list mein laata hai,
-    unhe time ke hisaab se DESC (latest upar) sort karta hai."""
+    """Saare alerts (central + denial) ko ek hi list mein laata hai.
+    Denial alerts call_id ke against grouped array me aate hain."""
 
-    # Fetch denial records (sirf un case mein lao jab level 1 na ho)
+    # Fetch denial records
     denial_rows = []
     if requested_level is None or requested_level != 1:
         denial_rows = await database2.fetch_all(
             """
-            SELECT * FROM (
-                SELECT DISTINCT ON (call_id) 
-                       id, mysql_id, call_id, amb_no, amb_default_mobile, caller_no,
-                       hp_name, challenge_val, meaning, denial_remark,
-                       alert_type, added_by, added_date
-                FROM public.denial_escalation_master
-                WHERE added_date::date = CURRENT_DATE
-                ORDER BY call_id, added_date DESC
-            ) as latest_denials
+            SELECT id, mysql_id, call_id, amb_no, amb_default_mobile, caller_no,
+                   hp_name, challenge_val, meaning, denial_remark,
+                   alert_type, added_by, added_date, severity, dst_name, escalate_status
+            FROM public.denial_escalation_master
+            WHERE added_date::date = CURRENT_DATE
             ORDER BY added_date DESC
             LIMIT 5000
             """
         )
 
-    # Fetch central alerts (hamesha laao)
+    # Fetch central alerts
     central_rows = await database2.fetch_all(
         """
         SELECT *
@@ -4804,19 +4805,38 @@ async def build_all_escalation_payloads(requested_level: int = None) -> list:
 
     unified_alerts = []
 
-    # 1. Denial records ko unified list mein daalo
-    for record in denial_rows:
-        d = serialize_row(record)
-        d["record_source"] = "denial"
-        d["sort_time"] = d.get("added_date")
-        unified_alerts.append(d)
-
-    # 2. Central alerts ko unified list mein daalo
+    # 1. Central alerts ko unified list mein daalo
     for record in central_rows:
         c = serialize_row(record)
         c["record_source"] = "central"
         c["sort_time"] = c.get("created_date")
         unified_alerts.append(c)
+
+    # 2. Denial records ko GROUP karke unified list mein daalo
+    denial_groups_map = {}
+    for record in denial_rows:
+        d = serialize_row(record)
+        cid = d.get("call_id")
+        if not cid:
+            continue
+        d["district"] = d.get("dst_name")
+        
+        if cid not in denial_groups_map:
+            # Latest record (kyunki ORDER BY added_date DESC hai)
+            denial_groups_map[cid] = {
+                "call_id": cid,
+                "record_source": "denial",
+                "sort_time": d.get("added_date"),
+                "amb_no": d.get("amb_no"),
+                "alert_type": d.get("alert_type"),
+                "severity": d.get("severity"),
+                "escalate_status": d.get("escalate_status"),
+                "district": d.get("district"),
+                "records": []
+            }
+        denial_groups_map[cid]["records"].append(d)
+        
+    unified_alerts.extend(denial_groups_map.values())
 
     # 3. Saare alerts ko time ke hisaab se DESC (latest upar) sort karo
     unified_alerts.sort(key=lambda x: x.get("sort_time") or "", reverse=True)
@@ -4871,15 +4891,48 @@ async def build_all_escalation_payloads(requested_level: int = None) -> list:
     # SLA breach details add karo
     filtered_alerts = await attach_sla_info_to_alerts(filtered_alerts)
 
-    # 👇 FIX: Level 1 ke liye faltu fields hata do aur Hindi SLA sirf Level 1 ke liye rakho
+    # 👇 FIX: Field cleanup logic update kiya hai
     for alert in filtered_alerts:
         if requested_level == 1:
             alert.pop("escalated_at", None)
             alert.pop("updated_date", None)
             alert.pop("current_level_minutes", None)
-        else:
-            # 👇 Level 1 ke alawa kisi aur level ko Hindi SLA reason nahi chahiye
+            
+        # 👇 Denial alerts ke response se SLA faltu fields hata do
+        if alert.get("record_source") == "denial":
+            alert.pop("sla_breach_reason", None)
             alert.pop("hin_sla_breach_reason", None)
+            alert.pop("sla_threshold_seconds", None)
+            alert.pop("sla_actual_seconds", None)
+            alert.pop("sla_breach_seconds", None)
+            alert.pop("amb_area", None)
+            alert.pop("amb_area_type", None)
+            alert.pop("call_type", None)
+
+        # 👇 NAYA: Underscores hatao aur dates format karo (Production Ready)
+        if alert.get("alert_type"):
+            alert["alert_type"] = alert["alert_type"].replace("_", " ")
+        if alert.get("remark"):
+            alert["remark"] = alert["remark"].replace("_", " ")
+            
+        for d_key in ["created_date", "updated_date", "inc_datetime", "escalated_date", "cancel_date", "added_date", "sort_time"]:
+            d_val = alert.get(d_key)
+            if d_val and isinstance(d_val, str) and "T" in d_val:
+                try:
+                    alert[d_key] = d_val.replace("T", " ").split(".")[0]
+                except:
+                    pass
+                    
+        # 👇 NAYA: Denial ke andar ke records (array) ki dates aur underscores bhi format karo
+        if alert.get("record_source") == "denial" and "records" in alert:
+            for rec in alert["records"]:
+                if rec.get("alert_type"):
+                    rec["alert_type"] = rec["alert_type"].replace("_", " ")
+                if rec.get("added_date") and isinstance(rec.get("added_date"), str) and "T" in rec.get("added_date"):
+                    try:
+                        rec["added_date"] = rec["added_date"].replace("T", " ").split(".")[0]
+                    except:
+                        pass
 
     logger.info(
         f"BUILD PAYLOADS: returning {len(filtered_alerts)} alerts "
@@ -5046,15 +5099,13 @@ async def update_escalation_flow(
 ):
     """alert_escalation_flow table me real-time tracking maintain karta hai."""
     try:
-        # 👇 Dono ko int me convert karo
         c_id = safe_int(call_id)
         a_id = safe_int(alert_id)
         lvl = safe_int(level)
         
-        # Timestamp convert karo
         gen_dt = to_datetime(generated_at) if generated_at else None
         
-        # Build WHERE clause (Sirf wahi ID search karenge jo real me available hai aur 0 nahi hai)
+        # 👇 FIX: More robust where clause
         where_clauses = []
         params = {}
         if a_id is not None and a_id != 0:
@@ -5065,7 +5116,7 @@ async def update_escalation_flow(
             params["c_id"] = c_id
             
         if not where_clauses:
-            return # Koi real ID nahi hai track karne ke liye
+            return
 
         query = f"""
             SELECT sr_no FROM alert_escalation_flow 
@@ -5082,7 +5133,6 @@ async def update_escalation_flow(
                 cols = ["alert_id", "call_id", "alert_generated_at", "level", "status", "is_closed", "created_at", "updated_at"]
                 vals = [":alert_id", ":call_id", ":alert_generated_at", ":level", ":status", ":is_closed", "NOW()", "NOW()"]
                 
-                # 👇 Agar value None hai to Integer 0 daal do (DB NOT NULL constraint ke liye)
                 params_insert = {
                     "alert_id": a_id if a_id is not None else 0,
                     "call_id": c_id if c_id is not None else 0,
@@ -5462,23 +5512,21 @@ async def send_current_escalations(
 #   *** AGAR ACTION LIYA TO AAGE ESCALATE NAHI KAREGA ***
 # ===========================================================================
 async def init_escalation_levels_for_today():
-    """Aaj ke saare alerts scan karke Redis me level set karo."""
+    """Aaj ke saare alerts scan karke Redis me level set karo aur Audit Table sync karo."""
     try:
         # ---------- Central Alerts ----------
-        # 👇 FIX: alert_id uthao
         central_rows = await database2.fetch_all(
             """
-            SELECT alert_id, created_date
+            SELECT alert_id, created_date, escalate_status
             FROM public.central_alerts
             WHERE created_date::date = CURRENT_DATE
-            AND escalate_status = '1'
             AND is_deleted = false
             """
         )
 
         central_init = 0
         for row in central_rows:
-            call_id = str(row["alert_id"]) # 👈 FIX
+            call_id = str(row["alert_id"])
             if not call_id or call_id == "0":
                 continue
 
@@ -5486,19 +5534,29 @@ async def init_escalation_levels_for_today():
             exists = await redis_client.get(key)
 
             if exists is None:
-                await get_or_init_escalation_level(
-                    call_id,
-                    row["created_date"],
-                    is_denial=False
-                )
+                elapsed = elapsed_minutes_since(row["created_date"])
+                level = get_level_for_elapsed_minutes(elapsed)
+                level = min(level, 7)
+                
+                if await is_closed(call_id) or str(row["escalate_status"]) == "2":
+                    level = 1
+                    await set_escalation_level(call_id, level)
+                    await update_escalation_flow(call_id=0, alert_id=call_id, level=1, event_type="NEW_ALERT", generated_at=row["created_date"])
+                    await update_escalation_flow(call_id=0, alert_id=call_id, level=1, event_type="ACTION_TAKEN", action_by="System Init", action_remark="Auto Closed")
+                else:
+                    await set_escalation_level(call_id, level)
+                    await update_escalation_flow(call_id=0, alert_id=call_id, level=level, event_type="NEW_ALERT", generated_at=row["created_date"])
+                    if level > 1:
+                        await update_escalation_flow(call_id=0, alert_id=call_id, level=level, event_type="LEVEL_BUMP", generated_at=row["created_date"])
                 central_init += 1
 
         # ---------- Denial Records ----------
         denial_rows = await database2.fetch_all(
             """
-            SELECT call_id, added_date
+            SELECT DISTINCT ON (call_id) call_id, added_date, escalate_status
             FROM public.denial_escalation_master
             WHERE added_date::date = CURRENT_DATE
+            ORDER BY call_id, added_date DESC
             """
         )
 
@@ -5512,11 +5570,21 @@ async def init_escalation_levels_for_today():
             exists = await redis_client.get(key)
 
             if exists is None:
-                await get_or_init_escalation_level(
-                    call_id,
-                    row["added_date"],
-                    is_denial=True
-                )
+                elapsed = elapsed_minutes_since(row["added_date"])
+                level = get_level_for_elapsed_minutes(elapsed)
+                if level < 2: level = 2
+                level = min(level, 7)
+                
+                if await is_closed(call_id) or str(row["escalate_status"]) == "2":
+                    level = 2
+                    await set_escalation_level(call_id, level)
+                    await update_escalation_flow(call_id=call_id, alert_id=0, level=2, event_type="NEW_ALERT", generated_at=row["added_date"])
+                    await update_escalation_flow(call_id=call_id, alert_id=0, level=2, event_type="ACTION_TAKEN", action_by="System Init", action_remark="Auto Closed")
+                else:
+                    await set_escalation_level(call_id, level)
+                    await update_escalation_flow(call_id=call_id, alert_id=0, level=level, event_type="NEW_ALERT", generated_at=row["added_date"])
+                    if level > 2:
+                        await update_escalation_flow(call_id=call_id, alert_id=0, level=level, event_type="LEVEL_BUMP", generated_at=row["added_date"])
                 denial_init += 1
 
         if central_init > 0 or denial_init > 0:
@@ -5527,7 +5595,6 @@ async def init_escalation_levels_for_today():
 
     except Exception as e:
         logger.error(f"init_escalation_levels_for_today failed: {e}")
-
 
 async def escalation_level_bump_watcher():
     logger.info("Escalation Level Bump Watcher STARTED")
@@ -5667,6 +5734,96 @@ async def escalation_level_bump_watcher():
             logger.exception(f"level_bump_watcher error: {e}")
             await asyncio.sleep(10)
 
+
+# ===========================================================================
+# AUDIT TABLE RECONCILIATION WORKER (Safety Net)
+# ===========================================================================
+async def audit_table_reconciliation_worker():
+    """Background worker to fix any missed audit table updates."""
+    logger.info("Audit Table Reconciliation Worker STARTED")
+
+    while True:
+        try:
+            # 1. Fetch all active central alerts for today
+            central_rows = await database2.fetch_all(
+                """
+                SELECT alert_id, created_date, escalate_status 
+                FROM public.central_alerts 
+                WHERE created_date::date = CURRENT_DATE AND is_deleted = false
+                """
+            )
+            
+            # 2. Fetch all active denial alerts for today (grouped by call_id)
+            denial_rows = await database2.fetch_all(
+                """
+                SELECT DISTINCT ON (call_id) call_id, added_date, escalate_status
+                FROM public.denial_escalation_master
+                WHERE added_date::date = CURRENT_DATE
+                ORDER BY call_id, added_date DESC
+                """
+            )
+
+            # 3. Fetch current audit states to compare
+            audit_rows = await database2.fetch_all(
+                """
+                SELECT alert_id, call_id, level, is_closed 
+                FROM alert_escalation_flow 
+                WHERE (alert_id IS NOT NULL AND alert_id != 0) 
+                   OR (call_id IS NOT NULL AND call_id != 0)
+                """
+            )
+            
+            audit_map = {}
+            for r in audit_rows:
+                d = dict(r)
+                key = str(d.get("alert_id") or d.get("call_id"))
+                if key and key != "0":
+                    audit_map[key] = d
+
+            # 4. Check Central Alerts
+            for row in central_rows:
+                call_id = str(row["alert_id"])
+                if not call_id or call_id == "0": continue
+                
+                audit_rec = audit_map.get(call_id)
+                if not audit_rec: continue # init worker will handle missing ones
+                
+                elapsed = elapsed_minutes_since(row["created_date"])
+                expected_level = min(get_level_for_elapsed_minutes(elapsed), 7)
+                
+                # Check if closed
+                is_cl = await is_closed(call_id) or str(row["escalate_status"]) == "2"
+                
+                if is_cl:
+                    if int(audit_rec.get("is_closed", 0)) == 0:
+                        await update_escalation_flow(call_id=0, alert_id=call_id, level=int(audit_rec.get("level", 1)), event_type="ACTION_TAKEN", action_by="Reconciliation", action_remark="Auto Closed")
+                elif expected_level > int(audit_rec.get("level", 0)):
+                    await update_escalation_flow(call_id=0, alert_id=call_id, level=expected_level, event_type="LEVEL_BUMP", generated_at=row["created_date"])
+                    
+            # 5. Check Denial Alerts
+            for row in denial_rows:
+                call_id = str(row["call_id"])
+                if not call_id or call_id == "0": continue
+                
+                audit_rec = audit_map.get(call_id)
+                if not audit_rec: continue
+                
+                elapsed = elapsed_minutes_since(row["added_date"])
+                expected_level = min(get_level_for_elapsed_minutes(elapsed), 7)
+                if expected_level < 2: expected_level = 2
+                
+                is_cl = await is_closed(call_id) or str(row["escalate_status"]) == "2"
+                
+                if is_cl:
+                    if int(audit_rec.get("is_closed", 0)) == 0:
+                        await update_escalation_flow(call_id=call_id, alert_id=0, level=int(audit_rec.get("level", 2)), event_type="ACTION_TAKEN", action_by="Reconciliation", action_remark="Auto Closed")
+                elif expected_level > int(audit_rec.get("level", 0)):
+                    await update_escalation_flow(call_id=call_id, alert_id=0, level=expected_level, event_type="LEVEL_BUMP", generated_at=row["added_date"])
+
+        except Exception as e:
+            logger.error(f"Audit Reconciliation Error: {e}")
+            
+        await asyncio.sleep(120) # Run every 2 minutes
 
 # ===========================================================================
 # NAYA RECORD BROADCAST
@@ -6130,18 +6287,10 @@ async def take_escalation_action(level: int, payload: TakeActionRequest):
 async def get_mdt_alerts_by_ambulance(ambulance_no: str = Query(..., description="Ambulance Number")):
     """
     Fetch all alerts for a specific ambulance (MDT Level 1 perspective).
-    
-    URL: GET /api/mdt/alerts?ambulance_no=TT-00-MP-0001
-    
-    Returns:
-    - Direct data array (no WebSocket INITIAL_LOAD wrapper).
-    - Includes all past and present alerts.
-    - Adds 'able_to_action' boolean (True if < 10 min old & not closed).
     """
     try:
         normalized_amb = normalize_vehicle_number(ambulance_no)
         
-        # SQL query to fetch all alerts for this ambulance (normalized match)
         query = """
             SELECT * FROM public.central_alerts
             WHERE UPPER(
@@ -6159,9 +6308,7 @@ async def get_mdt_alerts_by_ambulance(ambulance_no: str = Query(..., description
                 "vehicle_filter": normalized_amb
             }
 
-        # Serialize rows
         alerts = [serialize_row(r) for r in rows]
-        # Attach SLA info to all alerts
         alerts = await attach_sla_info_to_alerts(alerts)
         
         response_data = []
@@ -6169,21 +6316,16 @@ async def get_mdt_alerts_by_ambulance(ambulance_no: str = Query(..., description
             call_id = str(alert.get("alert_id") or "")
             check_date = alert.get("created_date")
             
-            # 👇 FIX 1: escalated_deny_remark null hone par default message set karo
             if alert.get("escalated_deny_remark") is None:
                 alert["escalated_deny_remark"] = "Escalated to higher department/authority"
             
-            # 👇 FIX 2: SLA threshold seconds ko human-readable format me convert karo
-            sla_threshold = alert.get("sla_threshold_seconds")
-            if sla_threshold is not None:
-                alert["sla_threshold_human"] = format_seconds_human(sla_threshold)
+            if alert.get("sla_threshold_seconds") is not None:
+                alert["sla_threshold_human"] = format_seconds_human(alert.get("sla_threshold_seconds"))
             
-            # Check if closed
             if await is_closed(call_id):
-                current_level = 1  # Default fallback
+                current_level = 1
                 is_closed_flag = True
             else:
-                # Calculate current level based on time
                 elapsed = elapsed_minutes_since(check_date)
                 current_level = get_level_for_elapsed_minutes(elapsed)
                 is_closed_flag = False
@@ -6191,10 +6333,21 @@ async def get_mdt_alerts_by_ambulance(ambulance_no: str = Query(..., description
             alert["current_level"] = current_level
             alert["current_role"] = LEVEL_INFO_CENTRAL.get(current_level, {}).get("role", "MDT")
             alert["is_closed"] = is_closed_flag
-            
-            # 👇 MAIN LOGIC: able_to_action
-            # True only if alert is Level 1 (under 10 min) AND not closed
             alert["able_to_action"] = (current_level == 1 and not is_closed_flag)
+            
+            # 👇 NAYA: Underscores hatao aur dates format karo (Production Ready)
+            if alert.get("alert_type"):
+                alert["alert_type"] = alert["alert_type"].replace("_", " ")
+            if alert.get("remark"):
+                alert["remark"] = alert["remark"].replace("_", " ")
+                
+            for d_key in ["created_date", "updated_date", "inc_datetime", "escalated_date", "cancel_date"]:
+                d_val = alert.get(d_key)
+                if d_val and isinstance(d_val, str) and "T" in d_val:
+                    try:
+                        alert[d_key] = d_val.replace("T", " ").split(".")[0]
+                    except:
+                        pass
             
             response_data.append(alert)
             
@@ -6205,4 +6358,247 @@ async def get_mdt_alerts_by_ambulance(ambulance_no: str = Query(..., description
 
     except Exception as e:
         logger.exception(f"get_mdt_alerts_by_ambulance FAILED: {e}")
+        return {"status": "error", "message": str(e)}
+
+
+
+@app.get("/api/alerts/all")
+async def get_all_alerts(
+    filter_type: str = Query("today", enum=["today", "month", "all", "custom"]),
+    start_date: Optional[str] = Query(None, description="YYYY-MM-DD (for custom filter)"),
+    end_date: Optional[str] = Query(None, description="YYYY-MM-DD (for custom filter)")
+):
+    """
+    Fetch all alerts (Central + Denial) with action details.
+    Denial alerts are grouped by call_id in an array.
+    """
+    try:
+        # 1. Date Filters Setup
+        if filter_type == "custom":
+            if not start_date or not end_date:
+                return {"status": "error", "message": "start_date and end_date required for custom filter"}
+            end_date_obj = (datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+            central_date_filter = f"c.created_date >= '{start_date}' AND c.created_date < '{end_date_obj}'"
+            denial_date_filter = f"d.added_date >= '{start_date}' AND d.added_date < '{end_date_obj}'"
+        elif filter_type == "today":
+            central_date_filter = "c.created_date::date = CURRENT_DATE"
+            denial_date_filter = "d.added_date::date = CURRENT_DATE"
+        elif filter_type == "month":
+            central_date_filter = "DATE_TRUNC('month', c.created_date) = DATE_TRUNC('month', CURRENT_DATE)"
+            denial_date_filter = "DATE_TRUNC('month', d.added_date) = DATE_TRUNC('month', CURRENT_DATE)"
+        else: # all
+            central_date_filter = "1=1"
+            denial_date_filter = "1=1"
+
+        # 2. Fetch Central Alerts
+        central_query = f"""
+            SELECT * FROM public.central_alerts c
+            WHERE {central_date_filter}
+            ORDER BY c.created_date DESC
+            LIMIT 5000
+        """
+        central_rows = await database2.fetch_all(central_query)
+
+        # 3. Fetch Denial Alerts (Fetch all records to group them)
+        denial_query = f"""
+            SELECT id, mysql_id, call_id, amb_no, amb_default_mobile, caller_no,
+                   hp_name, challenge_val, meaning, denial_remark,
+                   alert_type, added_by, added_date, severity, dst_name, escalate_status
+            FROM public.denial_escalation_master d
+            WHERE {denial_date_filter}
+            ORDER BY d.added_date DESC
+            LIMIT 5000
+        """
+        denial_rows = await database2.fetch_all(denial_query)
+
+        unified_alerts = []
+
+        # Process Central Alerts
+        for record in central_rows:
+            c = serialize_row(record)
+            c["record_source"] = "central"
+            c["sort_time"] = c.get("created_date")
+            unified_alerts.append(c)
+
+        # Process and Group Denial Alerts
+        denial_groups_map = {}
+        for record in denial_rows:
+            d = serialize_row(record)
+            cid = d.get("call_id")
+            if not cid:
+                continue
+            d["district"] = d.get("dst_name")
+            
+            if cid not in denial_groups_map:
+                denial_groups_map[cid] = {
+                    "call_id": cid,
+                    "record_source": "denial",
+                    "sort_time": d.get("added_date"), # Latest because of ORDER BY DESC
+                    "records": []
+                }
+            denial_groups_map[cid]["records"].append(d)
+            
+        unified_alerts.extend(denial_groups_map.values())
+
+        # Sort by time (latest first)
+        unified_alerts.sort(key=lambda x: x.get("sort_time") or "", reverse=True)
+
+        # 4. Batch Fetch Audit (Action) Details
+        alert_ids = [str(a.get("alert_id")) for a in unified_alerts if a.get("record_source") == "central" and a.get("alert_id")]
+        call_ids = [str(a.get("call_id")) for a in unified_alerts if a.get("record_source") == "denial" and a.get("call_id")]
+        
+        audit_map = {}
+        if alert_ids or call_ids:
+            q_parts = []
+            if alert_ids:
+                q_parts.append(f"alert_id IN ({','.join(alert_ids)})")
+            if call_ids:
+                q_parts.append(f"call_id IN ({','.join(call_ids)})")
+                
+            audit_q = f"""
+                SELECT alert_id, call_id, action_by, 
+                       pilot_action, dm_action, zm_action, om_action, sh_action, coo_action, cbo_action,
+                       pilot_action_datetime, dm_action_datetime, zm_action_datetime, om_action_datetime, sh_action_datetime, coo_action_datetime, cbo_action_datetime
+                FROM alert_escalation_flow 
+                WHERE {' OR '.join(q_parts)}
+            """
+            audit_rows = await database2.fetch_all(audit_q)
+            
+            for row in audit_rows:
+                row_d = dict(row)
+                key = str(row_d.get("alert_id") or row_d.get("call_id"))
+                if key:
+                    action_remark = None
+                    action_datetime = None
+                    
+                    for role in ["pilot", "dm", "zm", "om", "sh", "coo", "cbo"]:
+                        if row_d.get(f"{role}_action"):
+                            action_remark = row_d.get(f"{role}_action")
+                            if row_d.get(f"{role}_action_datetime"):
+                                action_datetime = row_d.get(f"{role}_action_datetime")
+                    
+                    audit_map[key] = {
+                        "action_by": row_d.get("action_by"),
+                        "action_taken_at": action_datetime,
+                        "action_remark": action_remark
+                    }
+
+        # 5. Attach SLA info for Central Alerts
+        central_alerts_for_sla = [a for a in unified_alerts if a.get("record_source") == "central"]
+        if central_alerts_for_sla:
+            central_alerts_for_sla = await attach_sla_info_to_alerts(central_alerts_for_sla)
+            sla_map = {str(a.get("alert_id") or a.get("incident_id")): a for a in central_alerts_for_sla}
+            for a in unified_alerts:
+                if a.get("record_source") == "central":
+                    uid = str(a.get("alert_id"))
+                    if uid in sla_map:
+                        for k, v in sla_map[uid].items():
+                            a[k] = v
+
+        # 6. Build Response
+        response_data = []
+        for alert in unified_alerts:
+            if alert.get("record_source") == "central":
+                call_id = str(alert.get("alert_id") or "")
+            else:
+                call_id = str(alert.get("call_id") or "")
+
+            if not call_id or call_id == "0":
+                continue
+
+            # Action Taken Boolean
+            action_taken = False
+            if str(alert.get("escalate_status")) == "2" or await is_closed(call_id):
+                action_taken = True
+
+            # Merge Audit Info
+            audit_info = audit_map.get(call_id, {})
+            alert["action_by"] = audit_info.get("action_by") or alert.get("escalated_by")
+            alert["action_taken_at"] = audit_info.get("action_taken_at") or alert.get("escalated_date")
+            alert["action_remark"] = audit_info.get("action_remark") or alert.get("escalated_deny_remark") or alert.get("remark")
+            
+            alert["action_taken"] = action_taken
+
+            # Calculate current level
+            if action_taken:
+                current_level = 1
+                alert["is_closed"] = True
+            else:
+                is_denial = (alert.get("record_source") == "denial")
+                current_level = await get_or_init_escalation_level(call_id, alert.get("sort_time"), is_denial=is_denial)
+                alert["is_closed"] = False
+
+            level_info = get_level_info_for_level(current_level)
+            alert["current_level"] = current_level
+            alert["current_role"] = level_info["role"]
+            alert["current_level_minutes"] = level_info["minutes"]
+            alert["severity"] = SEVERITY_BY_LEVEL.get(current_level, "LOW")
+
+            response_data.append(alert)
+
+        return {
+            "status": "success",
+            "count": len(response_data),
+            "filter": filter_type,
+            "data": response_data
+        }
+
+    except Exception as e:
+        logger.exception(f"get_all_alerts FAILED: {e}")
+        return {"status": "error", "message": str(e)}
+
+
+
+@app.get("/api/fix/audit_table")
+async def fix_audit_table():
+    """Ek baar run karne se audit table me saare records fresh ho jayenge."""
+    try:
+        logger.info("🛠️ Starting Audit Table Cleanup & Fix...")
+        
+        # 1. Aaj ke saare records delete karo
+        await database2.execute("DELETE FROM alert_escalation_flow WHERE alert_generated_at::date = CURRENT_DATE OR created_at::date = CURRENT_DATE")
+        
+        # 2. Central Alerts ko sahi se wapas insert karo
+        central_rows = await database2.fetch_all(
+            "SELECT alert_id, created_date, escalate_status FROM public.central_alerts WHERE created_date::date = CURRENT_DATE"
+        )
+        
+        for row in central_rows:
+            call_id_str = str(row["alert_id"])
+            elapsed = elapsed_minutes_since(row["created_date"])
+            level = get_level_for_elapsed_minutes(elapsed)
+            
+            if await is_closed(call_id_str) or str(row["escalate_status"]) == "2":
+                level = 1
+                await update_escalation_flow(call_id=0, alert_id=call_id_str, level=1, event_type="NEW_ALERT", generated_at=row["created_date"])
+                await update_escalation_flow(call_id=0, alert_id=call_id_str, level=1, event_type="ACTION_TAKEN", action_by="System Cleanup", action_remark="Closed")
+            else:
+                await update_escalation_flow(call_id=0, alert_id=call_id_str, level=level, event_type="NEW_ALERT", generated_at=row["created_date"])
+                if level > 1:
+                    await update_escalation_flow(call_id=0, alert_id=call_id_str, level=level, event_type="LEVEL_BUMP", generated_at=row["created_date"])
+
+        # 3. Denial Alerts ko sahi se wapas insert karo
+        denial_rows = await database2.fetch_all(
+            "SELECT DISTINCT ON (call_id) call_id, added_date, escalate_status FROM public.denial_escalation_master WHERE added_date::date = CURRENT_DATE ORDER BY call_id, added_date DESC"
+        )
+        
+        for row in denial_rows:
+            call_id_str = str(row["call_id"])
+            elapsed = elapsed_minutes_since(row["added_date"])
+            level = get_level_for_elapsed_minutes(elapsed)
+            if level < 2: level = 2
+            
+            if await is_closed(call_id_str) or str(row["escalate_status"]) == "2":
+                level = 2
+                await update_escalation_flow(call_id=call_id_str, alert_id=0, level=2, event_type="NEW_ALERT", generated_at=row["added_date"])
+                await update_escalation_flow(call_id=call_id_str, alert_id=0, level=2, event_type="ACTION_TAKEN", action_by="System Cleanup", action_remark="Closed")
+            else:
+                await update_escalation_flow(call_id=call_id_str, alert_id=0, level=level, event_type="NEW_ALERT", generated_at=row["added_date"])
+                if level > 2:
+                    await update_escalation_flow(call_id=call_id_str, alert_id=0, level=level, event_type="LEVEL_BUMP", generated_at=row["added_date"])
+
+        return {"status": "success", "message": "Audit table cleaned and rebuilt successfully!"}
+        
+    except Exception as e:
+        logger.exception(f"Fix Audit Table FAILED: {e}")
         return {"status": "error", "message": str(e)}
