@@ -3934,7 +3934,7 @@ async def websocket_denial_alerts(websocket: WebSocket):
         selected_date = None
         date_condition = "d.added_date::date = CURRENT_DATE"
  
-    # ✅ SQL Query: call_id DESC (BIGINT ke liye perfect)
+    # SQL Query
     query = f"""
         SELECT d.*,
                af.status AS alert_flow_status
@@ -3948,10 +3948,10 @@ async def websocket_denial_alerts(websocket: WebSocket):
         WHERE d.escalate_status = '1' 
         AND (d.is_deleted = FALSE OR d.is_deleted IS NULL)
         AND {date_condition}
-        ORDER BY d.call_id DESC;
+        ORDER BY d.added_date DESC;
     """
  
-    # ✅ NAYA SORT: Ab 'call_id' (BIGINT) ko Number ki tarah compare karega
+    # ✅ NAYA SORT: Added_date ke hisaab se DESC sort karega (Latest Upar)
     def sort_grouped_desc(grouped):
         if isinstance(grouped, dict):
             grouped = list(grouped.values())
@@ -3959,32 +3959,20 @@ async def websocket_denial_alerts(websocket: WebSocket):
         if not isinstance(grouped, list):
             return grouped
             
-        def get_max_call_id(group_item):
-            max_id = -1
-            
-            def search_call_id(sub_item):
-                nonlocal max_id
-                if isinstance(sub_item, dict):
-                    for k, v in sub_item.items():
-                        if k == "call_id" and v is not None:
-                            try:
-                                # String/BigInt ko Number (int) mein convert karke compare karo
-                                val = int(v)
-                                if val > max_id:
-                                    max_id = val
-                            except (ValueError, TypeError):
-                                pass
-                        else:
-                            search_call_id(v)
-                elif isinstance(sub_item, list):
-                    for v in sub_item:
-                        search_call_id(v)
-                        
-            search_call_id(group_item)
-            return max_id
+        def get_latest_date(group_item):
+            if isinstance(group_item, dict):
+                records = group_item.get("records", [])
+                if records and len(records) > 0:
+                    val = records[0].get("added_date")
+                    if val:
+                        try:
+                            return datetime.fromisoformat(str(val))
+                        except:
+                            return datetime.min
+            return datetime.min
 
         try:
-            return sorted(grouped, key=get_max_call_id, reverse=True)
+            return sorted(grouped, key=get_latest_date, reverse=True)
         except Exception as e:
             print(f"Sort Error: {e}")
             return grouped
@@ -3999,9 +3987,6 @@ async def websocket_denial_alerts(websocket: WebSocket):
             grouped_current = await attach_level_info_to_groups(grouped_current)
             grouped_current = sort_grouped_desc(grouped_current)
             
-            # ✅ DEBUG PRINT: Terminal mein check karo order sahi hai ya nahi
-            print("🔵 Backend Sending Order (Call IDs):", [g.get("call_id") if isinstance(g, dict) else "?" for g in grouped_current])
- 
             await websocket.send_json({
                 "type": "INITIAL_LOAD",
                 "count": len(grouped_current),
@@ -4023,9 +4008,6 @@ async def websocket_denial_alerts(websocket: WebSocket):
         grouped_initial = await attach_level_info_to_groups(grouped_initial)
         grouped_initial = sort_grouped_desc(grouped_initial)
         
-        # ✅ DEBUG PRINT
-        print("🔵 Backend Initial Order (Call IDs):", [g.get("call_id") if isinstance(g, dict) else "?" for g in grouped_initial])
- 
         await websocket.send_json({
             "type": "INITIAL_LOAD",
             "count": len(grouped_initial),
