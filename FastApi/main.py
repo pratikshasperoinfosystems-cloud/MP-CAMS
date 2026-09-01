@@ -15,7 +15,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, date, timedelta, timezone
 from typing import List, Optional, Dict, Union
 from decimal import Decimal
-
+from fastapi.responses import HTMLResponse
 import pytz
 import pandas as pd
 from fastapi import (
@@ -1923,7 +1923,6 @@ async def get_districts(division_id: Optional[int] = Query(None)):
             SELECT dst_code, dst_name
             FROM ems_mas_districts
             WHERE div_id = :division_id
-            AND dst_state='MH'
             AND dstis_deleted = '0'
             ORDER BY dst_name
         """
@@ -1932,8 +1931,7 @@ async def get_districts(division_id: Optional[int] = Query(None)):
         query = """
             SELECT dst_code, dst_name
             FROM ems_mas_districts
-            WHERE dst_state='MH'
-            AND dstis_deleted = '0'
+            WHERE dstis_deleted = '0'
             ORDER BY dst_name
         """
         rows = await cached_query(query, ttl=10)
@@ -4773,7 +4771,8 @@ async def attach_sla_info_to_alerts(alerts: list) -> list:
 # ===========================================================================
 async def build_all_escalation_payloads(requested_level: int = None) -> list:
     """Saare alerts (central + denial) ko ek hi list mein laata hai.
-    Denial alerts call_id ke against grouped array me aate hain."""
+    Denial alerts call_id ke against grouped array me aate hain.
+    Optimized with Batch Redis (MGET) + Time-based Upgrade Logic."""
 
     # Fetch denial records
     denial_rows = []
@@ -4822,7 +4821,6 @@ async def build_all_escalation_payloads(requested_level: int = None) -> list:
         d["district"] = d.get("dst_name")
         
         if cid not in denial_groups_map:
-            # Latest record (kyunki ORDER BY added_date DESC hai)
             denial_groups_map[cid] = {
                 "call_id": cid,
                 "record_source": "denial",
@@ -4846,10 +4844,27 @@ async def build_all_escalation_payloads(requested_level: int = None) -> list:
         f"central={len(central_rows)}, requested_level={requested_level}"
     )
 
-    # 4. Level info attach karo aur filter lagao
+    # 👇 4. BATCH REDIS FETCHING (MGET) - 10x Faster!
+    all_ids = [str(a.get("alert_id") or a.get("call_id") or "") for a in unified_alerts]
+    
+    closed_map = {}
+    level_map = {}
+    
+    if all_ids:
+        closed_keys = [f"{ESC_CLOSED_PREFIX}{id}" for id in all_ids]
+        level_keys = [f"{ESC_LEVEL_REDIS_PREFIX}{id}" for id in all_ids]
+        
+        closed_vals, level_vals = await asyncio.gather(
+            redis_client.mget(closed_keys),
+            redis_client.mget(level_keys)
+        )
+        
+        closed_map = {all_ids[i]: closed_vals[i] for i in range(len(all_ids))}
+        level_map = {all_ids[i]: level_vals[i] for i in range(len(all_ids))}
+
+    # 5. Level info attach karo aur filter lagao
     filtered_alerts = []
     for alert in unified_alerts:
-        # Central alert ke liye alert_id use karo, Denial ke liye call_id
         if alert.get("record_source") == "central":
             call_id = str(alert.get("alert_id") or "")
         else:
@@ -4858,25 +4873,39 @@ async def build_all_escalation_payloads(requested_level: int = None) -> list:
         if not call_id or call_id == "0":
             continue
 
-        if await is_closed(call_id):
-            action_details = await get_closed_details(call_id)
-            current_level = to_int(action_details.get("action_by_level")) or 1
-            alert["is_closed"] = True
-            alert["action_details"] = action_details
-
-            if requested_level is not None and current_level != requested_level:
-                continue
+        # Check if closed
+        closed_json = closed_map.get(call_id)
+        if closed_json:
+            try:
+                action_details = json.loads(closed_json)
+                current_level = to_int(action_details.get("action_by_level")) or 1
+                alert["is_closed"] = True
+                alert["action_details"] = action_details
+            except Exception:
+                current_level = 1
+                alert["is_closed"] = True
         else:
-            is_denial = (alert.get("record_source") == "denial")
-            current_level = await get_or_init_escalation_level(
-                call_id,
-                alert.get("sort_time"),
-                is_denial=is_denial
-            )
             alert["is_closed"] = False
+            current_level = to_int(level_map.get(call_id))
+            
+            # 👇 FIX: Time-based level calculate karo (Sticky hone ka fix)
+            elapsed = elapsed_minutes_since(alert.get("sort_time"))
+            time_based_level = get_level_for_elapsed_minutes(elapsed)
+            if alert.get("record_source") == "denial" and time_based_level < 2:
+                time_based_level = 2
+            time_based_level = min(time_based_level, 7)
 
-            if requested_level is not None and current_level != requested_level:
-                continue
+            if current_level is None:
+                current_level = time_based_level
+                # Agar Redis me nahi tha to set kar do
+                await redis_client.set(f"{ESC_LEVEL_REDIS_PREFIX}{call_id}", str(current_level))
+            elif time_based_level > current_level:
+                # Agar time cross ho gaya to upgrade kar do (YAH PEHLE MISS HO RAHA THA)
+                current_level = time_based_level
+                await redis_client.set(f"{ESC_LEVEL_REDIS_PREFIX}{call_id}", str(current_level))
+
+        if requested_level is not None and current_level != requested_level:
+            continue
 
         level_info = get_level_info_for_level(current_level)
         alert["current_level"] = current_level
@@ -4891,25 +4920,19 @@ async def build_all_escalation_payloads(requested_level: int = None) -> list:
     # SLA breach details add karo
     filtered_alerts = await attach_sla_info_to_alerts(filtered_alerts)
 
-    # 👇 FIX: Field cleanup logic update kiya hai
+    # 👇 FIX: Field cleanup logic
     for alert in filtered_alerts:
         if requested_level == 1:
             alert.pop("escalated_at", None)
             alert.pop("updated_date", None)
             alert.pop("current_level_minutes", None)
             
-        # 👇 Denial alerts ke response se SLA faltu fields hata do
         if alert.get("record_source") == "denial":
-            alert.pop("sla_breach_reason", None)
-            alert.pop("hin_sla_breach_reason", None)
-            alert.pop("sla_threshold_seconds", None)
-            alert.pop("sla_actual_seconds", None)
-            alert.pop("sla_breach_seconds", None)
-            alert.pop("amb_area", None)
-            alert.pop("amb_area_type", None)
-            alert.pop("call_type", None)
+            keys_to_remove = ["sla_breach_reason", "hin_sla_breach_reason", "sla_threshold_seconds", "sla_actual_seconds", "sla_breach_seconds", "amb_area", "amb_area_type", "call_type"]
+            for k in keys_to_remove:
+                alert.pop(k, None)
 
-        # 👇 NAYA: Underscores hatao aur dates format karo (Production Ready)
+        # Underscores hatao aur dates format karo
         if alert.get("alert_type"):
             alert["alert_type"] = alert["alert_type"].replace("_", " ")
         if alert.get("remark"):
@@ -4923,7 +4946,6 @@ async def build_all_escalation_payloads(requested_level: int = None) -> list:
                 except:
                     pass
                     
-        # 👇 NAYA: Denial ke andar ke records (array) ki dates aur underscores bhi format karo
         if alert.get("record_source") == "denial" and "records" in alert:
             for rec in alert["records"]:
                 if rec.get("alert_type"):
@@ -6297,7 +6319,7 @@ async def get_mdt_alerts_by_ambulance(ambulance_no: str = Query(..., description
                 REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(ambulance_no, ' ', ''), '-', ''), '.', ''), '_', ''), '/', '')
             ) = :amb
             ORDER BY created_date DESC
-            LIMIT 500
+            LIMIT 10
         """
         
         rows = await database2.fetch_all(query, {"amb": normalized_amb})
@@ -6417,7 +6439,7 @@ async def get_all_alerts(
         for record in central_rows:
             c = serialize_row(record)
             c["record_source"] = "central"
-            c["sort_time"] = c.get("created_date")
+            c["sort_time"] = c.get("updated_date") or c.get("created_date")
             unified_alerts.append(c)
 
         # Process and Group Denial Alerts
@@ -6515,7 +6537,7 @@ async def get_all_alerts(
             audit_info = audit_map.get(call_id, {})
             alert["action_by"] = audit_info.get("action_by") or alert.get("escalated_by")
             alert["action_taken_at"] = audit_info.get("action_taken_at") or alert.get("escalated_date")
-            alert["action_remark"] = audit_info.get("action_remark") or alert.get("escalated_deny_remark") or alert.get("remark")
+            alert["action_remark"] = audit_info.get("action_remark") or alert.get("escalated_deny_remark")
             
             alert["action_taken"] = action_taken
 
@@ -6602,3 +6624,9 @@ async def fix_audit_table():
     except Exception as e:
         logger.exception(f"Fix Audit Table FAILED: {e}")
         return {"status": "error", "message": str(e)}
+    
+
+
+
+
+#<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<Monitor>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
