@@ -2506,6 +2506,7 @@ async def central_alerts_ws(websocket: WebSocket):
             WHERE c.inc_datetime >= CURRENT_DATE
               AND c.inc_datetime < CURRENT_DATE + INTERVAL '1 day'
             ORDER BY c.inc_datetime DESC, c.alert_id DESC
+            LIMIT 1000
             """,
             ttl=3,
             fetch="all",
@@ -2678,6 +2679,7 @@ async def central_alerts_ws(websocket: WebSocket):
                     ) af ON TRUE
                     WHERE {where_clause}
                     ORDER BY c.inc_datetime DESC, c.alert_id DESC
+                    LIMIT 1000
                 """
 
                 if filter_date:
