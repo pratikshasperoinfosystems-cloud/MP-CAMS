@@ -5031,6 +5031,12 @@ async def attach_sla_info_to_alerts(alerts: list) -> list:
         # 👇 NAYA: call_type add karo
         alert["call_type"] = rtm_row.get("call_type")
 
+        alert["acknowledge_time"] = rtm_row.get("acknowledge")
+        alert["start_time"] = rtm_row.get("start_from_base_loc")
+        alert["scene_time"] = rtm_row.get("at_scene")
+        alert["handover_time"] = rtm_row.get("patient_handover")
+        alert["back_to_base_time"] = rtm_row.get("back_to_base_loc")
+
     return alerts
 
 # ===========================================================================
@@ -6792,6 +6798,8 @@ async def get_all_alerts(
                     }
 
         # 5. Attach SLA info for Central Alerts
+        # Yahan attach_sla_info_to_alerts call hoga, jisme humne MySQL data merge karke
+        # acknowledge_time, start_time, scene_time, back_to_base_time add kiya hai.
         central_alerts_for_sla = [a for a in unified_alerts if a.get("record_source") == "central"]
         if central_alerts_for_sla:
             central_alerts_for_sla = await attach_sla_info_to_alerts(central_alerts_for_sla)
@@ -6803,7 +6811,7 @@ async def get_all_alerts(
                         for k, v in sla_map[uid].items():
                             a[k] = v
 
-        # 👇 6. BATCH REDIS FETCHING (MGET) - 10x Faster! No more Gateway Timeout
+        # 6. BATCH REDIS FETCHING (MGET) - 10x Faster!
         all_ids = [str(a.get("alert_id") or a.get("call_id") or "") for a in unified_alerts]
         closed_keys = [f"{ESC_CLOSED_PREFIX}{id}" for id in all_ids]
         level_keys = [f"{ESC_LEVEL_REDIS_PREFIX}{id}" for id in all_ids]
@@ -6816,27 +6824,6 @@ async def get_all_alerts(
         closed_map = {all_ids[i]: closed_vals[i] for i in range(len(all_ids))}
         level_map = {all_ids[i]: level_vals[i] for i in range(len(all_ids))}
 
-        # 👇 NAYA: MySQL se real-time action times fetch karo for closing_status
-        central_incident_ids = [str(a.get("incident_id")) for a in unified_alerts if a.get("record_source") == "central" and a.get("incident_id")]
-        mysql_action_map = {}
-        if central_incident_ids:
-            try:
-                placeholders = ", ".join([f":id{i}" for i in range(len(central_incident_ids))])
-                params = {f"id{i}": central_incident_ids[i] for i in range(len(central_incident_ids))}
-                mysql_q = f"""
-                    SELECT incident_id, acknowledge, start_from_base_loc, at_scene, patient_handover, back_to_base_loc
-                    FROM ems_driver_parameters
-                    WHERE incident_id IN ({placeholders})
-                """
-                mysql_rows = await database.fetch_all(mysql_q, params)
-                for r in mysql_rows:
-                    rec = dict(r)
-                    inc_id = str(rec.get('incident_id'))
-                    if inc_id:
-                        mysql_action_map[inc_id] = rec
-            except Exception as e:
-                logger.error(f"Failed to fetch MySQL actions for closing_status: {e}")
-
         # 7. Build Response
         response_data = []
         for alert in unified_alerts:
@@ -6848,7 +6835,7 @@ async def get_all_alerts(
             if not call_id or call_id == "0":
                 continue
 
-            # Action Taken Boolean (Using Batch Map instead of individual Redis calls)
+            # Action Taken Boolean
             action_taken = False
             closed_json = closed_map.get(call_id)
             
@@ -6881,31 +6868,31 @@ async def get_all_alerts(
             alert["current_level_minutes"] = level_info["minutes"]
             alert["severity"] = SEVERITY_BY_LEVEL.get(current_level, "LOW")
 
-            # 👇 NAYA: closing_status generate karo
+            # 👇 NAYA: closing_status generate karo (Alert object se read karo)
+            # attach_sla_info_to_alerts ne pehle hi in fields ko set kar diya hai
+            # (MySQL se ya RTM se fallback)
             closing_status = "N/A"
             if alert.get("record_source") == "central":
-                inc_id = str(alert.get("incident_id") or "")
-                mysql_rec = mysql_action_map.get(inc_id, {})
                 a_type = alert.get("alert_type", "")
                 
                 def get_valid_dt_str(val):
-                    if not val or str(val) == '0000-00-00 00:00:00':
+                    if not val or str(val) == '0000-00-00 00:00:00' or str(val) == 'None':
                         return None
                     if isinstance(val, datetime):
                         return val.strftime("%Y-%m-%d %H:%M:%S")
                     return str(val)
                 
                 if a_type == "ACK_DELAY":
-                    dt = get_valid_dt_str(mysql_rec.get("acknowledge"))
+                    dt = get_valid_dt_str(alert.get("acknowledge_time"))
                     closing_status = f"Acknowledged at {dt}" if dt else "Acknowledge still pending"
                 elif a_type == "START_DELAY":
-                    dt = get_valid_dt_str(mysql_rec.get("start_from_base_loc"))
+                    dt = get_valid_dt_str(alert.get("start_time"))
                     closing_status = f"Started from base at {dt}" if dt else "Start from base still pending"
                 elif a_type == "AT_SCENE_DELAY":
-                    dt = get_valid_dt_str(mysql_rec.get("at_scene"))
+                    dt = get_valid_dt_str(alert.get("scene_time"))
                     closing_status = f"At scene at {dt}" if dt else "At scene still pending"
                 elif a_type == "BACK_TO_BASE_DELAY":
-                    dt = get_valid_dt_str(mysql_rec.get("back_to_base_loc"))
+                    dt = get_valid_dt_str(alert.get("back_to_base_time"))
                     closing_status = f"Back to base at {dt}" if dt else "Back to base still pending"
                 elif a_type == "MDT_NOT_LOGGED_IN":
                     closing_status = "MDT not logged in"
