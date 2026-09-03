@@ -6816,6 +6816,27 @@ async def get_all_alerts(
         closed_map = {all_ids[i]: closed_vals[i] for i in range(len(all_ids))}
         level_map = {all_ids[i]: level_vals[i] for i in range(len(all_ids))}
 
+        # 👇 NAYA: MySQL se real-time action times fetch karo for closing_status
+        central_incident_ids = [str(a.get("incident_id")) for a in unified_alerts if a.get("record_source") == "central" and a.get("incident_id")]
+        mysql_action_map = {}
+        if central_incident_ids:
+            try:
+                placeholders = ", ".join([f":id{i}" for i in range(len(central_incident_ids))])
+                params = {f"id{i}": central_incident_ids[i] for i in range(len(central_incident_ids))}
+                mysql_q = f"""
+                    SELECT incident_id, acknowledge, start_from_base_loc, at_scene, patient_handover, back_to_base_loc
+                    FROM ems_driver_parameters
+                    WHERE incident_id IN ({placeholders})
+                """
+                mysql_rows = await database.fetch_all(mysql_q, params)
+                for r in mysql_rows:
+                    rec = dict(r)
+                    inc_id = str(rec.get('incident_id'))
+                    if inc_id:
+                        mysql_action_map[inc_id] = rec
+            except Exception as e:
+                logger.error(f"Failed to fetch MySQL actions for closing_status: {e}")
+
         # 7. Build Response
         response_data = []
         for alert in unified_alerts:
@@ -6859,6 +6880,37 @@ async def get_all_alerts(
             alert["current_role"] = level_info["role"]
             alert["current_level_minutes"] = level_info["minutes"]
             alert["severity"] = SEVERITY_BY_LEVEL.get(current_level, "LOW")
+
+            # 👇 NAYA: closing_status generate karo
+            closing_status = "N/A"
+            if alert.get("record_source") == "central":
+                inc_id = str(alert.get("incident_id") or "")
+                mysql_rec = mysql_action_map.get(inc_id, {})
+                a_type = alert.get("alert_type", "")
+                
+                def get_valid_dt_str(val):
+                    if not val or str(val) == '0000-00-00 00:00:00':
+                        return None
+                    if isinstance(val, datetime):
+                        return val.strftime("%Y-%m-%d %H:%M:%S")
+                    return str(val)
+                
+                if a_type == "ACK_DELAY":
+                    dt = get_valid_dt_str(mysql_rec.get("acknowledge"))
+                    closing_status = f"Acknowledged at {dt}" if dt else "Acknowledge still pending"
+                elif a_type == "START_DELAY":
+                    dt = get_valid_dt_str(mysql_rec.get("start_from_base_loc"))
+                    closing_status = f"Started from base at {dt}" if dt else "Start from base still pending"
+                elif a_type == "AT_SCENE_DELAY":
+                    dt = get_valid_dt_str(mysql_rec.get("at_scene"))
+                    closing_status = f"At scene at {dt}" if dt else "At scene still pending"
+                elif a_type == "BACK_TO_BASE_DELAY":
+                    dt = get_valid_dt_str(mysql_rec.get("back_to_base_loc"))
+                    closing_status = f"Back to base at {dt}" if dt else "Back to base still pending"
+                elif a_type == "MDT_NOT_LOGGED_IN":
+                    closing_status = "MDT not logged in"
+            
+            alert["closing_status"] = closing_status
 
             response_data.append(alert)
 
