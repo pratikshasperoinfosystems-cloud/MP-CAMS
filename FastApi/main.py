@@ -3063,51 +3063,406 @@ async def dashboard_alerts_overview(
 #         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 #         headers={"Content-Disposition": f"attachment; filename={file_name}"}
 #     )
+##########################################################################################
+##########################################################################
+# @app.get("/api/dashboard/download-client-report")
 
+# async def download_client_report(
+
+#     range_type: str = Query("today", enum=["today", "month", "all"])
+
+# ):
+
+#     # 1. Central Alerts ke liye date filter
+
+#     date_filter = get_date_filter(range_type)
+
+#     # 2. Denial Alerts ke liye alag date filter (kyunki column naam 'added_date' hai)
+
+#     if range_type == "today":
+
+#         denial_date_filter = "DATE(added_date) = CURRENT_DATE"
+
+#     elif range_type == "month":
+
+#         denial_date_filter = "DATE_TRUNC('month', added_date) = DATE_TRUNC('month', CURRENT_DATE)"
+
+#     else:
+
+#         denial_date_filter = "1=1"
+ 
+#     # --------------------------------------------------------
+
+#     # 1. FETCH CENTRAL ALERTS
+
+#     # --------------------------------------------------------
+
+#     full_sql = f"""
+
+#     SELECT *
+
+#     FROM public.central_alerts
+
+#     WHERE is_deleted = false
+
+#     AND {date_filter}
+
+#     ORDER BY created_date DESC
+
+#     """
+
+#     rows = await database2.fetch_all(full_sql)
+ 
+#     df = pd.DataFrame([dict(r) for r in rows]) if rows else pd.DataFrame()
+ 
+#     if not df.empty:
+
+#         df.insert(0, "Sr No", list(range(1, len(df) + 1)))
+ 
+#         escalation_map = {
+
+#             "0": "Open",
+
+#             "1": "In Progress",
+
+#             "2": "Escalated",
+
+#             "3": "Closed"
+
+#         }
+ 
+#         if "escalate_status" in df.columns:
+
+#             df["Escalation Status"] = df["escalate_status"].astype(str).map(escalation_map)
+
+#             df.drop(columns=["escalate_status"], inplace=True)
+ 
+#         if "is_deleted" in df.columns:
+
+#             df.drop(columns=["is_deleted"], inplace=True)
+ 
+#         date_cols = ["created_date", "updated_date", "cancel_date", "escalated_date"]
+
+#         for col in date_cols:
+
+#             if col in df.columns:
+
+#                 df[col] = pd.to_datetime(df[col], errors="coerce").dt.strftime("%d-%m-%Y %H:%M")
+ 
+#         rename_map = {
+
+#             "severity": "Severity",
+
+#             "created_date": "Created Date & Time",
+
+#             "updated_date": "Updated Date & Time",
+
+#             "division": "Division",
+
+#             "district": "District",
+
+#             "inc_latitude": "Incidence Latitude",
+
+#             "inc_longitude": "Incidence Longitude",
+
+#             "amb_lat": "Ambulance Lattitude",
+
+#             "amb_long": "Ambulance Longitude",
+
+#             "paramedic_name": "EMT Name",
+
+#             "paramedic_mobile": "EMT Mobile",
+
+#             "inc_datetime": "Incidence Datetime",
+
+#             "alert_type": "Alert Type",
+
+#             "incident_id": "Incident Id",
+
+#             "ambulance_no": "Ambulance Number",
+
+#             "remark": "Remark",
+
+#             "escalated_deny_remark": "Escalated/Deny Remark",
+
+#             "pilot_name": "Pilot Name",
+
+#             "pilot_mobile": "Pilot Mobile",
+
+#             "escalated_date": "Escalated Date",
+
+#             "cancel_date": "Cancel Date",
+
+#             "escalated_by": "Escalated By",
+
+#             "cancel_by": "Cancel By",
+
+#             "Escalation Status": "Escalation Status",
+
+#             "system_type": "System Type",
+
+#             "alert_id": "Alert ID",
+
+#             "Sr No": "Sr No",
+
+#         }
+ 
+#         df.rename(columns=rename_map, inplace=True)
+ 
+#         column_order = [
+
+#             "Sr No", "Alert ID", "Alert Type", "System Type", "Severity",
+
+#             "Incident Id", "Incidence Datetime", "Division", "District",
+
+#             "Incidence Latitude", "Incidence Longitude", "Ambulance Number",
+
+#             "Ambulance Lattitude", "Ambulance Longitude", "Pilot Name",
+
+#             "Pilot Mobile", "EMT Name", "EMT Mobile",
+
+#             "Created Date & Time", "Updated Date & Time",
+
+#             "Escalation Status", "Escalated Date", "Escalated By",
+
+#             "Escalated/Deny Remark", "Cancel Date", "Cancel By", "Remark",
+
+#         ]
+ 
+#         existing_ordered_cols = [c for c in column_order if c in df.columns]
+
+#         remaining_cols = [c for c in df.columns if c not in existing_ordered_cols]
+
+#         df = df[existing_ordered_cols + remaining_cols]
+
+#     else:
+
+#         df = pd.DataFrame([{"Message": "No Incident Alert Data Found"}])
+ 
+ 
+#      # --------------------------------------------------------
+#     # 2. FETCH DENIAL RECORDS (NAYA SHEET KE LIYE)
+#     # --------------------------------------------------------
+#     denial_sql = f"""
+#     SELECT id, mysql_id, call_id, amb_no, amb_default_mobile, caller_no,
+#            hp_name, challenge_val, meaning, denial_remark, remark, dst_name,
+#            alert_type, added_by, added_date, escalate_status
+#     FROM public.denial_escalation_master
+#     WHERE (is_deleted = FALSE OR is_deleted IS NULL)
+#     AND {denial_date_filter}
+#     ORDER BY added_date DESC
+#     """
+ 
+#     denial_rows = await database2.fetch_all(denial_sql)
+#     df_denial = pd.DataFrame([dict(r) for r in denial_rows]) if denial_rows else pd.DataFrame()
+ 
+#     if not df_denial.empty:
+#         df_denial.insert(0, "Sr No", list(range(1, len(df_denial) + 1)))
+ 
+#         denial_escalation_map = {
+#             "0": "Open",
+#             "1": "In Progress",
+#             "2": "Escalated",
+#             "3": "Closed"
+#         }
+ 
+#         if "escalate_status" in df_denial.columns:
+#             df_denial["Escalation Status"] = df_denial["escalate_status"].astype(str).map(denial_escalation_map)
+#             df_denial.drop(columns=["escalate_status"], inplace=True)
+ 
+#         if "added_date" in df_denial.columns:
+#             df_denial["Added Date & Time"] = pd.to_datetime(df_denial["added_date"], errors="coerce").dt.strftime("%d-%m-%Y %H:%M")
+#             df_denial.drop(columns=["added_date"], inplace=True)
+ 
+#         if "mysql_id" in df_denial.columns:
+#             df_denial.drop(columns=["mysql_id"], inplace=True)
+ 
+#         denial_rename_map = {
+#             "Sr No": "Sr No",
+#             "id": "Denial ID",
+#             "call_id": "Call ID",
+#             "amb_no": "Ambulance Number",
+#             "amb_default_mobile": "Ambulance Mobile",
+#             "caller_no": "Caller No",
+#             "hp_name": "Hospital Name",
+#             "challenge_val": "Challenge",
+#             "meaning": "Denial Reason",
+#             "denial_remark": "Denial Remark",
+#             "remark": "Action Remark",                        # ✅ NAYA
+#             "dst_name": "District",
+#             "alert_type": "Alert Type",
+#             "added_by": "Added By",
+#             "Added Date & Time": "Added Date & Time",
+#             "Escalation Status": "Escalation Status"
+#         }
+ 
+#         df_denial.rename(columns=denial_rename_map, inplace=True)
+ 
+#         denial_column_order = [
+#             "Sr No", "Denial ID", "Call ID", "Ambulance Number", "Ambulance Mobile",
+#             "Caller No", "Hospital Name", "Challenge", "Denial Reason",
+#             "Denial Remark", "District", "Alert Type", "Added By",
+#             "Added Date & Time", "Escalation Status", "Action Remark",
+#         ]
+ 
+#         denial_ordered_cols = [c for c in denial_column_order if c in df_denial.columns]
+#         denial_remaining_cols = [c for c in df_denial.columns if c not in denial_ordered_cols]
+#         df_denial = df_denial[denial_ordered_cols + denial_remaining_cols]
+ 
+#     else:
+#         df_denial = pd.DataFrame([{"Message": "No Call Denial Data Found"}])
+ 
+ 
+#     # --------------------------------------------------------
+
+#     # 3. COMBINED SUMMARY CALCULATIONS
+
+#     # --------------------------------------------------------
+
+#     # Central Counts
+
+#     summary_sql = f"""
+
+#     SELECT
+
+#         COUNT(*) as total_alerts,
+
+#         COUNT(*) FILTER (WHERE escalate_status='2') as escalated_alerts,
+
+#         COUNT(*) FILTER (WHERE system_type='108') as system_108
+
+#     FROM public.central_alerts
+
+#     WHERE is_deleted = false
+
+#     AND {date_filter}
+
+#     """
+
+#     summary_row = await database2.fetch_one(summary_sql)
+
+#     summary_data = dict(summary_row) if summary_row else {"total_alerts": 0, "escalated_alerts": 0, "system_108": 0}
+ 
+#     # Denial Counts (Distinct call_id)
+
+#     denial_summary_sql = f"""
+
+#     SELECT
+
+#         COUNT(DISTINCT call_id) as denial_total,
+
+#         COUNT(DISTINCT call_id) FILTER (WHERE escalate_status='2') as denial_escalated
+
+#     FROM public.denial_escalation_master
+
+#     WHERE (is_deleted = FALSE OR is_deleted IS NULL)
+
+#     AND {denial_date_filter}
+
+#     """
+
+#     denial_summary_row = await database2.fetch_one(denial_summary_sql)
+
+#     denial_summary_data = dict(denial_summary_row) if denial_summary_row else {"denial_total": 0, "denial_escalated": 0}
+ 
+#     # Final Summary DataFrame
+
+#     final_summary = {
+
+#         "Total Incident Alerts": summary_data.get("total_alerts", 0),
+
+#         "Total Call Denial Alerts (Distinct Call ID)": denial_summary_data.get("denial_total", 0),
+
+#         "Grand Total (Incident + Denial)": summary_data.get("total_alerts", 0) + denial_summary_data.get("denial_total", 0),
+
+#         "Escalated Incident Alerts": summary_data.get("escalated_alerts", 0),
+
+#         "Escalated Call Denial Alerts": denial_summary_data.get("denial_escalated", 0),
+
+#         "Total System 108 (Incident + Denial)": summary_data.get("system_108", 0) + denial_summary_data.get("denial_total", 0)
+
+#     }
+
+#     df_summary = pd.DataFrame([final_summary])
+ 
+ 
+#     # --------------------------------------------------------
+
+#     # 4. EXCEL GENERATION WITH MULTIPLE SHEETS
+
+#     # --------------------------------------------------------
+
+#     output = io.BytesIO()
+
+#     with pd.ExcelWriter(output, engine="openpyxl") as writer:
+
+#         # 👇 Sheet 1 ka naam change kiya gaya hai
+
+#         df.to_excel(writer, sheet_name="Incident Alerts", index=False)
+
+#         # 👇 Sheet 2 ka naam change kiya gaya hai
+
+#         df_denial.to_excel(writer, sheet_name="Call Denial Alerts", index=False)
+
+#         df_summary.to_excel(writer, sheet_name="Summary", index=False)
+
+#         workbook = writer.book
+
+#         # 👇 Yahan bhi same naam use karna padega
+
+#         format_worksheet(workbook["Incident Alerts"])
+
+#         format_worksheet(workbook["Call Denial Alerts"])
+
+#         format_worksheet(workbook["Summary"])
+ 
+#     output.seek(0)
+
+#     file_name = f"Central_Alerts_Client_Report_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
+ 
+#     return StreamingResponse(
+
+#         output,
+
+#         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+
+#         headers={"Content-Disposition": f"attachment; filename={file_name}"}
+
+#     )
+ 
+#################################################################################################
 @app.get("/api/dashboard/download-client-report")
-
 async def download_client_report(
-
     range_type: str = Query("today", enum=["today", "month", "all"])
-
 ):
-
     # 1. Central Alerts ke liye date filter
-
     date_filter = get_date_filter(range_type)
 
     # 2. Denial Alerts ke liye alag date filter (kyunki column naam 'added_date' hai)
-
     if range_type == "today":
-
         denial_date_filter = "DATE(added_date) = CURRENT_DATE"
-
     elif range_type == "month":
-
         denial_date_filter = "DATE_TRUNC('month', added_date) = DATE_TRUNC('month', CURRENT_DATE)"
-
     else:
-
         denial_date_filter = "1=1"
  
     # --------------------------------------------------------
-
     # 1. FETCH CENTRAL ALERTS
-
     # --------------------------------------------------------
-
     full_sql = f"""
-
-    SELECT *
-
+    SELECT *,
+           CASE 
+               WHEN alert_type = 'AT_SCENE_DELAY' THEN rd.at_scene
+               WHEN alert_type = 'START_DELAY' THEN rd.start_from_base_loc
+               WHEN alert_type = 'ACK_DELAY' THEN rd.acknowledge
+               WHEN alert_type = 'BACK_TO_BASE_DELAY' THEN rd.back_to_base_loc
+               ELSE NULL
+           END AS alert_closed_datetime
     FROM public.central_alerts
-
+    LEFT JOIN public.rtm_dashboard rd ON central_alerts.incident_id = rd.inc_ref_id
     WHERE is_deleted = false
-
     AND {date_filter}
-
     ORDER BY created_date DESC
-
     """
 
     rows = await database2.fetch_all(full_sql)
@@ -3115,131 +3470,85 @@ async def download_client_report(
     df = pd.DataFrame([dict(r) for r in rows]) if rows else pd.DataFrame()
  
     if not df.empty:
-
         df.insert(0, "Sr No", list(range(1, len(df) + 1)))
  
         escalation_map = {
-
             "0": "Open",
-
             "1": "In Progress",
-
             "2": "Escalated",
-
             "3": "Closed"
-
         }
  
         if "escalate_status" in df.columns:
-
             df["Escalation Status"] = df["escalate_status"].astype(str).map(escalation_map)
-
             df.drop(columns=["escalate_status"], inplace=True)
  
         if "is_deleted" in df.columns:
-
             df.drop(columns=["is_deleted"], inplace=True)
  
+        # Naye column ka datetime format
+        if "alert_closed_datetime" in df.columns:
+            df["alert_closed_datetime"] = pd.to_datetime(df["alert_closed_datetime"], errors="coerce").dt.strftime("%d-%m-%Y %H:%M")
+
         date_cols = ["created_date", "updated_date", "cancel_date", "escalated_date"]
-
         for col in date_cols:
-
             if col in df.columns:
-
                 df[col] = pd.to_datetime(df[col], errors="coerce").dt.strftime("%d-%m-%Y %H:%M")
  
         rename_map = {
-
             "severity": "Severity",
-
-            "created_date": "Created Date & Time",
-
+            "created_date": "Alert Generated Date",          # ✅ Renamed
             "updated_date": "Updated Date & Time",
-
             "division": "Division",
-
             "district": "District",
-
             "inc_latitude": "Incidence Latitude",
-
             "inc_longitude": "Incidence Longitude",
-
             "amb_lat": "Ambulance Lattitude",
-
             "amb_long": "Ambulance Longitude",
-
             "paramedic_name": "EMT Name",
-
             "paramedic_mobile": "EMT Mobile",
-
             "inc_datetime": "Incidence Datetime",
-
             "alert_type": "Alert Type",
-
             "incident_id": "Incident Id",
-
             "ambulance_no": "Ambulance Number",
-
             "remark": "Remark",
-
             "escalated_deny_remark": "Escalated/Deny Remark",
-
             "pilot_name": "Pilot Name",
-
             "pilot_mobile": "Pilot Mobile",
-
             "escalated_date": "Escalated Date",
-
             "cancel_date": "Cancel Date",
-
             "escalated_by": "Escalated By",
-
             "cancel_by": "Cancel By",
-
             "Escalation Status": "Escalation Status",
-
             "system_type": "System Type",
-
             "alert_id": "Alert ID",
-
             "Sr No": "Sr No",
-
+            "alert_closed_datetime": "Alert Closed Datetime",  # ✅ Naya Column
         }
  
         df.rename(columns=rename_map, inplace=True)
  
         column_order = [
-
             "Sr No", "Alert ID", "Alert Type", "System Type", "Severity",
-
             "Incident Id", "Incidence Datetime", "Division", "District",
-
             "Incidence Latitude", "Incidence Longitude", "Ambulance Number",
-
             "Ambulance Lattitude", "Ambulance Longitude", "Pilot Name",
-
             "Pilot Mobile", "EMT Name", "EMT Mobile",
-
-            "Created Date & Time", "Updated Date & Time",
-
+            "Alert Generated Date",          # ✅ Renamed
+            "Alert Closed Datetime",         # ✅ Naya Column Add
+            "Updated Date & Time",
             "Escalation Status", "Escalated Date", "Escalated By",
-
             "Escalated/Deny Remark", "Cancel Date", "Cancel By", "Remark",
-
         ]
  
         existing_ordered_cols = [c for c in column_order if c in df.columns]
-
         remaining_cols = [c for c in df.columns if c not in existing_ordered_cols]
-
         df = df[existing_ordered_cols + remaining_cols]
-
     else:
-
         df = pd.DataFrame([{"Message": "No Incident Alert Data Found"}])
  
  
-     # --------------------------------------------------------
+    # --------------------------------------------------------
     # 2. FETCH DENIAL RECORDS (NAYA SHEET KE LIYE)
     # --------------------------------------------------------
     denial_sql = f"""
@@ -3313,124 +3622,70 @@ async def download_client_report(
  
  
     # --------------------------------------------------------
-
     # 3. COMBINED SUMMARY CALCULATIONS
-
     # --------------------------------------------------------
-
     # Central Counts
-
     summary_sql = f"""
-
     SELECT
-
         COUNT(*) as total_alerts,
-
         COUNT(*) FILTER (WHERE escalate_status='2') as escalated_alerts,
-
         COUNT(*) FILTER (WHERE system_type='108') as system_108
-
     FROM public.central_alerts
-
     WHERE is_deleted = false
-
     AND {date_filter}
-
     """
-
     summary_row = await database2.fetch_one(summary_sql)
-
     summary_data = dict(summary_row) if summary_row else {"total_alerts": 0, "escalated_alerts": 0, "system_108": 0}
  
     # Denial Counts (Distinct call_id)
-
     denial_summary_sql = f"""
-
     SELECT
-
         COUNT(DISTINCT call_id) as denial_total,
-
         COUNT(DISTINCT call_id) FILTER (WHERE escalate_status='2') as denial_escalated
-
     FROM public.denial_escalation_master
-
     WHERE (is_deleted = FALSE OR is_deleted IS NULL)
-
     AND {denial_date_filter}
-
     """
-
     denial_summary_row = await database2.fetch_one(denial_summary_sql)
-
     denial_summary_data = dict(denial_summary_row) if denial_summary_row else {"denial_total": 0, "denial_escalated": 0}
  
     # Final Summary DataFrame
-
     final_summary = {
-
         "Total Incident Alerts": summary_data.get("total_alerts", 0),
-
         "Total Call Denial Alerts (Distinct Call ID)": denial_summary_data.get("denial_total", 0),
-
         "Grand Total (Incident + Denial)": summary_data.get("total_alerts", 0) + denial_summary_data.get("denial_total", 0),
-
         "Escalated Incident Alerts": summary_data.get("escalated_alerts", 0),
-
         "Escalated Call Denial Alerts": denial_summary_data.get("denial_escalated", 0),
-
         "Total System 108 (Incident + Denial)": summary_data.get("system_108", 0) + denial_summary_data.get("denial_total", 0)
-
     }
-
     df_summary = pd.DataFrame([final_summary])
  
  
     # --------------------------------------------------------
-
     # 4. EXCEL GENERATION WITH MULTIPLE SHEETS
-
     # --------------------------------------------------------
-
     output = io.BytesIO()
-
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-
         # 👇 Sheet 1 ka naam change kiya gaya hai
-
         df.to_excel(writer, sheet_name="Incident Alerts", index=False)
-
         # 👇 Sheet 2 ka naam change kiya gaya hai
-
         df_denial.to_excel(writer, sheet_name="Call Denial Alerts", index=False)
-
         df_summary.to_excel(writer, sheet_name="Summary", index=False)
-
         workbook = writer.book
-
         # 👇 Yahan bhi same naam use karna padega
-
         format_worksheet(workbook["Incident Alerts"])
-
         format_worksheet(workbook["Call Denial Alerts"])
-
         format_worksheet(workbook["Summary"])
  
     output.seek(0)
-
     file_name = f"Central_Alerts_Client_Report_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
  
     return StreamingResponse(
-
         output,
-
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-
         headers={"Content-Disposition": f"attachment; filename={file_name}"}
-
     )
- 
-
-
+###################################################################################
 # -------------------- Severity Update API --------------------
 @app.put("/api/severity")
 async def update_severity(data: SeverityUpdate):
