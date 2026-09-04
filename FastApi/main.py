@@ -5342,6 +5342,7 @@ async def attach_sla_info_to_alerts(alerts: list) -> list:
 async def build_all_escalation_payloads(requested_level: int = None) -> list:
     """Saare alerts (central + denial) ko ek hi list mein laata hai.
     Dono central aur denial alerts apne respective IDs (incident_id / call_id) ke against grouped array me aate hain.
+    Level 1 ke liye central alerts grouped nahi honge (har alert alag hoga).
     Optimized with Batch Redis (MGET) + Time-based Upgrade Logic + Short-TTL Cache."""
 
     # 👇 NAYA: 1 Second Short-TTL Cache to prevent per-client DB recomputation
@@ -5381,7 +5382,7 @@ async def build_all_escalation_payloads(requested_level: int = None) -> list:
 
     unified_alerts = []
 
-    # 1. Central alerts ko incident_id se GROUP karke unified list mein daalo
+    # 1. Central alerts ko GROUP karke unified list mein daalo
     central_groups_map = {}
     for record in central_rows:
         c = serialize_row(record)
@@ -5389,8 +5390,12 @@ async def build_all_escalation_payloads(requested_level: int = None) -> list:
         c["sort_time"] = c.get("created_date")
         
         inc_id = str(c.get("incident_id") or "")
-        # Agar incident_id nahi hai, to alag group bana lo (fallback to alert_id)
-        group_key = inc_id if inc_id and inc_id != "0" else f"alert_{c.get('alert_id')}"
+        
+        # 👇 NAYA: Level 1 ke liye incident_id grouping mat karo, har alert ka apna alag group banao
+        if requested_level == 1:
+            group_key = f"alert_{c.get('alert_id')}"
+        else:
+            group_key = inc_id if inc_id and inc_id != "0" else f"alert_{c.get('alert_id')}"
         
         if group_key not in central_groups_map:
             central_groups_map[group_key] = {
@@ -5398,9 +5403,9 @@ async def build_all_escalation_payloads(requested_level: int = None) -> list:
                 "group_key": group_key,
                 "record_source": "central",
                 "sort_time": c.get("sort_time"),
-                "district": c.get("district"),       # 👈 Group level pe district
-                "division": c.get("division"),        # 👈 Group level pe division
-                "ambulance_no": c.get("ambulance_no"),# 👈 Group level pe ambulance
+                "district": c.get("district"),        # Group level pe district
+                "division": c.get("division"),       # Group level pe division
+                "ambulance_no": c.get("ambulance_no"),# Group level pe ambulance
                 "records": []
             }
         central_groups_map[group_key]["records"].append(c)
@@ -5444,8 +5449,6 @@ async def build_all_escalation_payloads(requested_level: int = None) -> list:
     )
 
     # 👇 4. BATCH REDIS FETCHING (MGET) - 10x Faster!
-    # Central groups ke andar ke records ke alert_id nikalo
-    # Denial groups ke call_id nikalo
     all_ids = []
     for a in unified_alerts:
         if a.get("record_source") == "central":
@@ -5525,8 +5528,7 @@ async def build_all_escalation_payloads(requested_level: int = None) -> list:
             filtered_alerts.append(alert)
             
         else:
-            # --- NAYA: CENTRAL GROUP LOGIC ---
-            # Group ke andar ke har alert record ka level check karo
+            # --- CENTRAL GROUP LOGIC (Max Level) ---
             max_level = 1
             any_closed = False
             action_details = None
@@ -5565,7 +5567,6 @@ async def build_all_escalation_payloads(requested_level: int = None) -> list:
                 if lvl > max_level:
                     max_level = lvl
                 
-                # Har record pe level info lagao
                 rec_lvl_info = get_level_info_for_level(lvl)
                 rec["current_level"] = lvl
                 rec["current_role"] = rec_lvl_info["role"]
@@ -5578,7 +5579,7 @@ async def build_all_escalation_payloads(requested_level: int = None) -> list:
             if any_closed and action_details:
                 alert["action_details"] = action_details
                 
-            current_level = max_level # Group ka level = sabse highest level
+            current_level = max_level
             
             if requested_level is not None and current_level != requested_level:
                 continue
