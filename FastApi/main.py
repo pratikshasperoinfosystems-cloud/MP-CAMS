@@ -56,10 +56,11 @@ ALLOWED_ORIGINS = os.getenv(
 
 
 # ============================================================
-# Logging Configuration
+# Logging Configuration (Production Ready)
 # ============================================================
+# INFO level ki wajah WARNING par set kiya, taaki faltu logs disk ko slow na kare
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.WARNING,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger("central_alerts")
@@ -78,7 +79,7 @@ logger.info(f"Server time: {formatted_time}")
 # Constants
 # ============================================================
 MAX_CACHE_ENTRIES = 2000
-WS_QUEUE_MAX_SIZE = 500
+WS_QUEUE_MAX_SIZE = 1000
 
 
 # ============================================================
@@ -87,6 +88,7 @@ WS_QUEUE_MAX_SIZE = 500
 _cache = {}
 _cache_expiry = {}
 _payload_cache = {}
+_payload_locks = {}
 redis_client = None
 connected_clients: dict[str, List[WebSocket]] = {}
 
@@ -113,7 +115,7 @@ async def init_redis():
             "redis://localhost",
             encoding="utf-8",
             decode_responses=True,
-            max_connections=20  
+            max_connections=100  
         )
     return redis_client
 
@@ -2143,7 +2145,7 @@ async def lifespan(app: FastAPI):
                 pass
 
     if redis_client:
-        await redis_client.aclose()
+        await redis_client.close()
     if database.is_connected:
         await database.disconnect()
     if database2.is_connected:
@@ -2572,7 +2574,7 @@ async def central_alerts_ws(websocket: WebSocket):
             counts["total"][system] += total
             counts["severity"][system][severity] = total
 
-        await websocket.send_json({
+        await manager.safe_send(websocket, {
             "type": "ALL_ALERTS",
             "data": {
                 "today_all": today_all,
@@ -2586,6 +2588,8 @@ async def central_alerts_ws(websocket: WebSocket):
         # =====================================================
         # 2️⃣ TWO CONCURRENT LOOPS — real-time updates ke liye
         # =====================================================
+
+        current_filter = {}
 
         async def ensure_status(records):
             if not records:
@@ -2634,12 +2638,79 @@ async def central_alerts_ws(websocket: WebSocket):
                     r["alert_flow_status"] = status
                     
             except Exception as e:
-                print(f"❌ Error in ensure_status: {e}")
+                logger.error(f"Error in ensure_status: {e}")
                 for r in missing_records:
                     r["alert_flow_status"] = None
                 
             return records
 
+        # 👇 NAYA: Filter aur fetch logic ko ek function me nikal diya taaki dono loops use kar sakein
+        async def fetch_and_send_filtered_data(incident_id=None, filter_date=None):
+            nonlocal current_filter
+            
+            if incident_id or filter_date:
+                current_filter = {"incident_id": incident_id, "date": filter_date}
+            else:
+                current_filter = {} # Filter clear ho gaya
+
+            conditions = []
+            params = {}
+            limit_clause = "LIMIT 1000"
+
+            if incident_id:
+                conditions.append("c.incident_id = :incident_id")
+                params["incident_id"] = str(incident_id)
+                limit_clause = "LIMIT 5000"
+                
+                if filter_date:
+                    start_dt = datetime.strptime(filter_date, "%Y-%m-%d")
+                    end_dt = start_dt + timedelta(days=1)
+                    conditions.append("c.created_date >= :start_date AND c.created_date < :end_date")
+                    params["start_date"] = start_dt
+                    params["end_date"] = end_dt
+            else:
+                if filter_date:
+                    start_dt = datetime.strptime(filter_date, "%Y-%m-%d")
+                    end_dt = start_dt + timedelta(days=1)
+                    conditions.append("c.created_date >= :start_date AND c.created_date < :end_date")
+                    params["start_date"] = start_dt
+                    params["end_date"] = end_dt
+                else:
+                    conditions.append("c.inc_datetime >= CURRENT_DATE AND c.inc_datetime < CURRENT_DATE + INTERVAL '1 day'")
+
+            where_clause = " AND ".join(conditions)
+
+            query = f"""
+                SELECT c.*, af.status AS alert_flow_status
+                FROM central_alerts c
+                LEFT JOIN LATERAL (
+                    SELECT status
+                    FROM alert_escalation_flow
+                    WHERE alert_id = c.alert_id
+                    LIMIT 1
+                ) af ON TRUE
+                WHERE {where_clause}
+                ORDER BY c.inc_datetime DESC, c.alert_id DESC
+                {limit_clause}
+            """
+
+            if filter_date or incident_id:
+                rows = await database2.fetch_all(query, params)
+            else:
+                rows = await cached_query(query, params=params, ttl=3, fetch="all", db=database2)
+
+            today_all = [serialize_row(r) for r in rows]
+            today_all = await ensure_status(today_all)
+            by_severity = group_by_severity(rows)
+
+            await manager.safe_send(websocket, {
+                "type": "ALL_ALERTS",
+                "data": {
+                    "today_all": today_all,
+                    "by_severity": by_severity,
+                    "counts": counts
+                }
+            })
 
         async def drain_loop():
             """Queue se broadcast messages nikal ke client pe bhejo."""
@@ -2648,6 +2719,16 @@ async def central_alerts_ws(websocket: WebSocket):
                 msg_type = payload.get("type")
 
                 if msg_type == "ALL_ALERTS":
+                    # 👇 FIX: Agar user ne filter lagaya hai, toh global broadcast mat bhejo
+                    if current_filter:
+                        # Filter active hai, toh usi filter ka fresh data DB se laao
+                        await fetch_and_send_filtered_data(
+                            incident_id=current_filter.get("incident_id"),
+                            filter_date=current_filter.get("date")
+                        )
+                        continue
+
+                    # Agar filter nahi hai, toh normal global broadcast bhejo
                     data = payload.get("data", {})
                     records = data.get("today_all", [])
                     records = records[:1000]
@@ -2661,77 +2742,11 @@ async def central_alerts_ws(websocket: WebSocket):
             """Client se filter requests receive karo."""
             while True:
                 msg = await websocket.receive_json()
-
                 incident_id = msg.get("incident_id")
                 filter_date = msg.get("date")  # YYYY-MM-DD
-
-                conditions = []
-                params = {}
-
-                if incident_id:
-                    conditions.append("c.incident_id = :incident_id")
-                    params["incident_id"] = str(incident_id)
-
-                if filter_date:
-                    start_dt = datetime.strptime(filter_date, "%Y-%m-%d")
-                    end_dt = start_dt + timedelta(days=1)
-
-                    conditions.append("""
-                        c.created_date >= :start_date
-                        AND c.created_date < :end_date
-                    """)
-
-                    params["start_date"] = start_dt
-                    params["end_date"] = end_dt
-                else:
-                    conditions.append("""
-                        c.inc_datetime >= CURRENT_DATE
-                        AND c.inc_datetime < CURRENT_DATE + INTERVAL '1 day'
-                    """)
-
-                where_clause = " AND ".join(conditions)
-
-                query = f"""
-                    SELECT c.*, af.status AS alert_flow_status
-                    FROM central_alerts c
-                    LEFT JOIN LATERAL (
-                        SELECT status
-                        FROM alert_escalation_flow
-                        WHERE alert_id = c.alert_id
-                        LIMIT 1
-                    ) af ON TRUE
-                    WHERE {where_clause}
-                    ORDER BY c.inc_datetime DESC, c.alert_id DESC
-                    LIMIT 1000
-                """
-
-                if filter_date:
-                    rows = await database2.fetch_all(query, params)
-                else:
-                    rows = await cached_query(
-                        query,
-                        params=params,
-                        ttl=3,
-                        fetch="all",
-                        db=database2
-                    )
-
-                today_all = [serialize_row(r) for r in rows]
                 
-                today_all = await ensure_status(today_all)
-                
-                by_severity = group_by_severity(rows)
-
-                await manager.safe_send(websocket, {
-                    "type": "ALL_ALERTS",
-                    "data": {
-                        "today_all": today_all,
-                        "by_severity": by_severity,
-                        "counts": counts
-                    }
-                })
-
-                print(f"📤 Sent alerts (incident_id={incident_id}, date={filter_date})")
+                # 👇 NAYA: Common function call karke data bhejo
+                await fetch_and_send_filtered_data(incident_id=incident_id, filter_date=filter_date)
 
         sender = asyncio.create_task(drain_loop())
         receiver = asyncio.create_task(client_listener())
@@ -2743,7 +2758,8 @@ async def central_alerts_ws(websocket: WebSocket):
             t.cancel()
         for t in done:
             if t.exception():
-                logger.exception(f"central_alerts WS task FAILED: {t.exception()}")
+                if not isinstance(t.exception(), WebSocketDisconnect):
+                    logger.exception(f"central_alerts WS task FAILED: {t.exception()}")
 
     except WebSocketDisconnect:
         print("❌ WebSocket client disconnected")
@@ -4562,7 +4578,7 @@ async def websocket_denial_alerts(websocket: WebSocket):
  
             finally:
                 try:
-                    raw_conn.remove_listener("denial_escalation_channel", on_notify)
+                    await raw_conn.remove_listener("denial_escalation_channel", on_notify)
                 except Exception:
                     pass
  
@@ -4697,21 +4713,19 @@ import httpx
 
 # FCM_SERVER_KEY = "AAAAdHbcA2w:APA91bGpaFIHWqD35tEQR0suCf_IRdOysTOvMsObjFgeIzGS_G2daBJjmRJrNyzQ13R5wrqBI9iVUTm-Ns_pIcs2R__m1s48RBNl__1FkFoQWAyUMZ4OPsDHNFg0a_rd2F9lXhHfInQB"   # 👈 yahan apni FCM key daalo
 
-async def send_fcm_push(token: str, title: str, body: str, data: dict = None):
+async def send_fcm_push(token: str, title: str, body: str, data: dict = None, vehicle_number: str = None):
     """Firebase Cloud Messaging — SIRF data field bhejta hai.
-    Android OS isko background me drop nahi karega, onMessageReceived call hoga."""
+    Agar token invalid hai, toh Redis se automatically delete kar deta hai."""
     if not token:
-        logger.warning("FCM push skipped: no token provided")
         return
 
     try:
         firebase_admin.get_app()
     except ValueError:
-        logger.error("❌ FCM ERROR: Firebase Admin SDK not initialized. Check service account JSON file.")
+        logger.error("❌ FCM ERROR: Firebase Admin SDK not initialized.")
         return
 
     try:
-        # 👇 SIRF data field — NO notification field
         clean_data = {
             "type": "Late",
             "title": title,
@@ -4723,40 +4737,36 @@ async def send_fcm_push(token: str, title: str, body: str, data: dict = None):
             for k, v in data.items():
                 clean_data[k] = str(v) if v is not None else ""
 
-        # 👇 No notification object inside AndroidConfig, just high priority
         message = messaging.Message(
             token=token,
             data=clean_data,
-            android=messaging.AndroidConfig(
-                priority="high"
-            ),
+            android=messaging.AndroidConfig(priority="high"),
             apns=messaging.APNSConfig(
                 headers={"apns-priority": "10"},
-                payload=messaging.APNSPayload(
-                    aps=messaging.Aps(
-                        content_available=True
-                    )
-                )
+                payload=messaging.APNSPayload(aps=messaging.Aps(content_available=True))
             )
         )
 
         loop = asyncio.get_event_loop()
-        response = await loop.run_in_executor(
-            None,
-            lambda: messaging.send(message)
-        )
-
-        logger.info(f"✅ FCM SUCCESS (Data-only): token={token[:20]}... msg_id={response} type=Late")
+        response = await loop.run_in_executor(None, lambda: messaging.send(message))
+        logger.info(f"✅ FCM SUCCESS: token={token[:20]}... msg_id={response}")
 
     except Exception as e:
-        error_str = str(e)
-
-        if "NOT_REGISTERED" in error_str or "invalid-registration-token" in error_str:
-            logger.error(f"❌ FCM ERROR: Token invalid/expired: token={token[:20]}... error={error_str}")
-        elif "permission-denied" in error_str:
-            logger.error(f"❌ FCM ERROR: Permission denied: {error_str}")
+        error_str = str(e).lower()
+        
+        # 👇 FIX: "notregistered" check karo (case-insensitive)
+        if "notregistered" in error_str or "invalid-registration-token" in error_str:
+            logger.warning(f"⚠️ FCM Token Expired. Auto-removing from Redis: token={token[:20]}...")
+            
+            # 👇 Redis se faltu token hata do taaki aage push na mare
+            if vehicle_number:
+                try:
+                    await redis_client.delete(f"fcm_token:{vehicle_number}")
+                    logger.info(f"🧹 Removed invalid FCM token from Redis for vehicle: {vehicle_number}")
+                except Exception as del_err:
+                    logger.error(f"Failed to delete invalid FCM token from Redis: {del_err}")
         else:
-            logger.exception(f"❌ send_fcm_push FAILED: {e}")
+            logger.error(f"❌ send_fcm_push FAILED: {error_str}")
 
 # ===========================================================================
 # HELPERS (time → level)
@@ -5314,336 +5324,357 @@ async def attach_sla_info_to_alerts(alerts: list) -> list:
 # ===========================================================================
 async def build_all_escalation_payloads(requested_level: int = None) -> list:
     """Saare alerts (central + denial) ko ek hi list mein laata hai.
-    N+1 Query Fix + JSON Caching for 10x performance."""
+    N+1 Query Fix + JSON Caching + Mutex Lock for 10x performance."""
 
-    global _payload_cache
+    global _payload_cache, _payload_locks # 👈 Yahan _payload_locks add kiya
     cache_key = f"esc_payloads_{requested_level}"
     now = time.time()
+    
+    # 1. Fast path: Agar cache valid hai toh sidha return karo
     if cache_key in _payload_cache and now < _payload_cache[cache_key]["expiry"]:
         return _payload_cache[cache_key]["data"]
 
-    # Fetch denial records
-    denial_rows = []
-    if requested_level is None or requested_level != 1:
-        denial_rows = await database2.fetch_all(
+    # 2. 👇 NAYA: Lock acquire karo taaki 10,000 clients ek saath DB na maren
+    if cache_key not in _payload_locks:
+        _payload_locks[cache_key] = asyncio.Lock()
+        
+    async with _payload_locks[cache_key]:
+        # 3. Double-check cache (Lock wait karte time koi aur thread cache bhar chuka ho toh)
+        if cache_key in _payload_cache and time.time() < _payload_cache[cache_key]["expiry"]:
+            return _payload_cache[cache_key]["data"]
+        
+        # --- Yahan se actual DB Query aur processing shuru ---
+
+        # Fetch denial records
+        denial_rows = []
+        if requested_level is None or requested_level != 1:
+            denial_rows = await database2.fetch_all(
+                """
+                SELECT id, mysql_id, call_id, amb_no, amb_default_mobile, caller_no,
+                       hp_name, challenge_val, meaning, denial_remark,
+                       alert_type, added_by, added_date, severity, dst_name, escalate_status
+                FROM public.denial_escalation_master
+                WHERE added_date >= CURRENT_DATE AND added_date < CURRENT_DATE + INTERVAL '1 day'
+                ORDER BY added_date DESC
+                LIMIT 5000
+                """
+            )
+
+        # Fetch central alerts
+        central_rows = await database2.fetch_all(
             """
-            SELECT id, mysql_id, call_id, amb_no, amb_default_mobile, caller_no,
-                   hp_name, challenge_val, meaning, denial_remark,
-                   alert_type, added_by, added_date, severity, dst_name, escalate_status
-            FROM public.denial_escalation_master
-            WHERE added_date::date = CURRENT_DATE
-            ORDER BY added_date DESC
+            SELECT *
+            FROM public.central_alerts
+            WHERE created_date >= CURRENT_DATE AND created_date < CURRENT_DATE + INTERVAL '1 day'
+            AND escalate_status = '1'
+            AND is_deleted = false
+            ORDER BY created_date DESC
             LIMIT 5000
             """
         )
 
-    # Fetch central alerts
-    central_rows = await database2.fetch_all(
-        """
-        SELECT *
-        FROM public.central_alerts
-        WHERE created_date::date = CURRENT_DATE
-        AND escalate_status = '1'
-        AND is_deleted = false
-        ORDER BY created_date DESC
-        LIMIT 5000
-        """
-    )
+        unified_alerts = []
 
-    unified_alerts = []
-
-    # 1. Central alerts ko GROUP karke unified list mein daalo
-    central_groups_map = {}
-    for record in central_rows:
-        c = serialize_row(record)
-        c["record_source"] = "central"
-        c["sort_time"] = c.get("created_date")
-        
-        inc_id = str(c.get("incident_id") or "")
-        
-        if requested_level == 1:
-            group_key = f"alert_{c.get('alert_id')}"
-        else:
-            group_key = inc_id if inc_id and inc_id != "0" else f"alert_{c.get('alert_id')}"
-        
-        if group_key not in central_groups_map:
-            central_groups_map[group_key] = {
-                "incident_id": inc_id if inc_id and inc_id != "0" else None,
-                "group_key": group_key,
-                "record_source": "central",
-                "sort_time": c.get("sort_time"),
-                "district": c.get("district"),
-                "division": c.get("division"),
-                "ambulance_no": c.get("ambulance_no"),
-                "records": []
-            }
-        central_groups_map[group_key]["records"].append(c)
-        if c.get("sort_time") and (not central_groups_map[group_key].get("sort_time") or c["sort_time"] > central_groups_map[group_key]["sort_time"]):
-            central_groups_map[group_key]["sort_time"] = c["sort_time"]
+        # 1. Central alerts ko GROUP karke unified list mein daalo
+        central_groups_map = {}
+        for record in central_rows:
+            c = serialize_row(record)
+            c["record_source"] = "central"
+            c["sort_time"] = c.get("created_date")
             
-    unified_alerts.extend(central_groups_map.values())
-
-    # 2. Denial records ko GROUP karke unified list mein daalo
-    denial_groups_map = {}
-    for record in denial_rows:
-        d = serialize_row(record)
-        cid = d.get("call_id")
-        if not cid:
-            continue
-        d["district"] = d.get("dst_name")
-        
-        if cid not in denial_groups_map:
-            denial_groups_map[cid] = {
-                "call_id": cid,
-                "record_source": "denial",
-                "sort_time": d.get("added_date"),
-                "amb_no": d.get("amb_no"),
-                "alert_type": d.get("alert_type"),
-                "severity": d.get("severity"),
-                "escalate_status": d.get("escalate_status"),
-                "district": d.get("district"),
-                "records": []
-            }
-        denial_groups_map[cid]["records"].append(d)
-        
-    unified_alerts.extend(denial_groups_map.values())
-
-    # 3. Sort by time DESC
-    unified_alerts.sort(key=lambda x: x.get("sort_time") or "", reverse=True)
-
-    # 4. BATCH REDIS FETCHING (MGET)
-    all_ids = []
-    for a in unified_alerts:
-        if a.get("record_source") == "central":
-            for rec in a.get("records", []):
-                aid = str(rec.get("alert_id") or "")
-                if aid and aid != "0":
-                    all_ids.append(aid)
-        else:
-            cid = str(a.get("call_id") or "")
-            if cid and cid != "0":
-                all_ids.append(cid)
-    
-    closed_map = {}
-    level_map = {}
-    if all_ids:
-        closed_keys = [f"{ESC_CLOSED_PREFIX}{id}" for id in all_ids]
-        level_keys = [f"{ESC_LEVEL_REDIS_PREFIX}{id}" for id in all_ids]
-        
-        closed_vals, level_vals = await asyncio.gather(
-            redis_client.mget(closed_keys),
-            redis_client.mget(level_keys)
-        )
-        closed_map = {all_ids[i]: closed_vals[i] for i in range(len(all_ids))}
-        level_map = {all_ids[i]: level_vals[i] for i in range(len(all_ids))}
-
-    # 5. Level info attach karo aur filter lagao
-    filtered_alerts = []
-    for alert in unified_alerts:
-        is_denial = (alert.get("record_source") == "denial")
-        
-        if is_denial:
-            call_id = str(alert.get("call_id") or "")
-            if not call_id or call_id == "0": continue
-
-            closed_json = closed_map.get(call_id)
-            if closed_json:
-                try:
-                    action_details = json.loads(closed_json)
-                    current_level = to_int(action_details.get("action_by_level")) or 1
-                    alert["is_closed"] = True
-                    alert["action_details"] = action_details
-                except Exception:
-                    current_level = 1
-                    alert["is_closed"] = True
+            inc_id = str(c.get("incident_id") or "")
+            
+            if requested_level == 1:
+                group_key = f"alert_{c.get('alert_id')}"
             else:
-                alert["is_closed"] = False
-                current_level = to_int(level_map.get(call_id))
-                elapsed = elapsed_minutes_since(alert.get("sort_time"))
-                time_based_level = get_level_for_elapsed_minutes(elapsed)
-                if time_based_level < 2: time_based_level = 2
-                time_based_level = min(time_based_level, 7)
+                group_key = inc_id if inc_id and inc_id != "0" else f"alert_{c.get('alert_id')}"
+            
+            if group_key not in central_groups_map:
+                central_groups_map[group_key] = {
+                    "incident_id": inc_id if inc_id and inc_id != "0" else None,
+                    "group_key": group_key,
+                    "record_source": "central",
+                    "sort_time": c.get("sort_time"),
+                    "district": c.get("district"),
+                    "division": c.get("division"),
+                    "ambulance_no": c.get("ambulance_no"),
+                    "records": []
+                }
+            central_groups_map[group_key]["records"].append(c)
+            if c.get("sort_time") and (not central_groups_map[group_key].get("sort_time") or c["sort_time"] > central_groups_map[group_key]["sort_time"]):
+                central_groups_map[group_key]["sort_time"] = c["sort_time"]
+                
+        unified_alerts.extend(central_groups_map.values())
 
-                if current_level is None:
-                    current_level = time_based_level
-                    await redis_client.set(f"{ESC_LEVEL_REDIS_PREFIX}{call_id}", str(current_level))
-                elif time_based_level > current_level:
-                    current_level = time_based_level
-                    await redis_client.set(f"{ESC_LEVEL_REDIS_PREFIX}{call_id}", str(current_level))
+        # 2. Denial records ko GROUP karke unified list mein daalo
+        denial_groups_map = {}
+        for record in denial_rows:
+            d = serialize_row(record)
+            cid = d.get("call_id")
+            if not cid:
+                continue
+            d["district"] = d.get("dst_name")
             
-            if requested_level is not None and current_level != requested_level: continue
+            if cid not in denial_groups_map:
+                denial_groups_map[cid] = {
+                    "call_id": cid,
+                    "record_source": "denial",
+                    "sort_time": d.get("added_date"),
+                    "amb_no": d.get("amb_no"),
+                    "alert_type": d.get("alert_type"),
+                    "severity": d.get("severity"),
+                    "escalate_status": d.get("escalate_status"),
+                    "district": d.get("district"),
+                    "records": []
+                }
+            denial_groups_map[cid]["records"].append(d)
+            
+        unified_alerts.extend(denial_groups_map.values())
 
-            level_info = get_level_info_for_level(current_level)
-            alert["current_level"] = current_level
-            alert["current_role"] = level_info["role"]
-            alert["current_level_minutes"] = level_info["minutes"]
-            alert["severity"] = SEVERITY_BY_LEVEL.get(current_level, "LOW")
-            alert["type"] = "current_escalation"
-            alert["escalated_at"] = datetime.now(ist).isoformat()
-            filtered_alerts.append(alert)
+        # 3. Sort by time DESC
+        unified_alerts.sort(key=lambda x: x.get("sort_time") or "", reverse=True)
+
+        # 4. BATCH REDIS FETCHING (MGET)
+        all_ids = []
+        for a in unified_alerts:
+            if a.get("record_source") == "central":
+                for rec in a.get("records", []):
+                    aid = str(rec.get("alert_id") or "")
+                    if aid and aid != "0":
+                        all_ids.append(aid)
+            else:
+                cid = str(a.get("call_id") or "")
+                if cid and cid != "0":
+                    all_ids.append(cid)
+        
+        closed_map = {}
+        level_map = {}
+        if all_ids:
+            closed_keys = [f"{ESC_CLOSED_PREFIX}{id}" for id in all_ids]
+            level_keys = [f"{ESC_LEVEL_REDIS_PREFIX}{id}" for id in all_ids]
             
-        else:
-            max_level = 1
-            any_closed = False
-            action_details = None
+            closed_vals, level_vals = await asyncio.gather(
+                redis_client.mget(closed_keys),
+                redis_client.mget(level_keys)
+            )
+            closed_map = {all_ids[i]: closed_vals[i] for i in range(len(all_ids))}
+            level_map = {all_ids[i]: level_vals[i] for i in range(len(all_ids))}
+
+        # 5. Level info attach karo aur filter lagao
+        filtered_alerts = []
+        for alert in unified_alerts:
+            is_denial = (alert.get("record_source") == "denial")
             
-            for rec in alert.get("records", []):
-                aid = str(rec.get("alert_id") or "")
-                if not aid or aid == "0": continue
-                    
-                closed_json = closed_map.get(aid)
+            if is_denial:
+                call_id = str(alert.get("call_id") or "")
+                if not call_id or call_id == "0": continue
+
+                closed_json = closed_map.get(call_id)
                 if closed_json:
-                    any_closed = True
                     try:
-                        ad = json.loads(closed_json)
-                        if ad: action_details = ad
-                        lvl = to_int(ad.get("action_by_level")) or 1
+                        action_details = json.loads(closed_json)
+                        current_level = to_int(action_details.get("action_by_level")) or 1
+                        alert["is_closed"] = True
+                        alert["action_details"] = action_details
                     except Exception:
-                        lvl = 1
-                    rec["is_closed"] = True
-                    rec["action_details"] = ad
+                        current_level = 1
+                        alert["is_closed"] = True
                 else:
-                    rec["is_closed"] = False
-                    lvl = to_int(level_map.get(aid))
-                    elapsed = elapsed_minutes_since(rec.get("sort_time"))
+                    alert["is_closed"] = False
+                    current_level = to_int(level_map.get(call_id))
+                    elapsed = elapsed_minutes_since(alert.get("sort_time"))
                     time_based_level = get_level_for_elapsed_minutes(elapsed)
+                    if time_based_level < 2: time_based_level = 2
                     time_based_level = min(time_based_level, 7)
 
-                    if lvl is None:
-                        lvl = time_based_level
-                        await redis_client.set(f"{ESC_LEVEL_REDIS_PREFIX}{aid}", str(lvl))
-                    elif time_based_level > lvl:
-                        lvl = time_based_level
-                        await redis_client.set(f"{ESC_LEVEL_REDIS_PREFIX}{aid}", str(lvl))
+                    if current_level is None:
+                        current_level = time_based_level
+                        await redis_client.set(f"{ESC_LEVEL_REDIS_PREFIX}{call_id}", str(current_level))
+                    elif time_based_level > current_level:
+                        current_level = time_based_level
+                        await redis_client.set(f"{ESC_LEVEL_REDIS_PREFIX}{call_id}", str(current_level))
                 
-                if lvl > max_level: max_level = lvl
-                
-                rec_lvl_info = get_level_info_for_level(lvl)
-                rec["current_level"] = lvl
-                rec["current_role"] = rec_lvl_info["role"]
-                rec["current_level_minutes"] = rec_lvl_info["minutes"]
-                rec["severity"] = SEVERITY_BY_LEVEL.get(lvl, "LOW")
-                rec["type"] = "current_escalation"
-                rec["escalated_at"] = datetime.now(ist).isoformat()
+                if requested_level is not None and current_level != requested_level: continue
 
-            alert["is_closed"] = any_closed
-            if any_closed and action_details:
-                alert["action_details"] = action_details
+                level_info = get_level_info_for_level(current_level)
+                alert["current_level"] = current_level
+                alert["current_role"] = level_info["role"]
+                alert["current_level_minutes"] = level_info["minutes"]
+                alert["severity"] = SEVERITY_BY_LEVEL.get(current_level, "LOW")
+                alert["type"] = "current_escalation"
+                alert["escalated_at"] = datetime.now(ist).isoformat()
+                filtered_alerts.append(alert)
                 
-            current_level = max_level
-            if requested_level is not None and current_level != requested_level: continue
+            else:
+                max_level = 1
+                any_closed = False
+                action_details = None
                 
-            level_info = get_level_info_for_level(current_level)
-            alert["current_level"] = current_level
-            alert["current_role"] = level_info["role"]
-            alert["current_level_minutes"] = level_info["minutes"]
-            alert["severity"] = SEVERITY_BY_LEVEL.get(current_level, "LOW")
-            alert["type"] = "current_escalation"
-            alert["escalated_at"] = datetime.now(ist).isoformat()
-            filtered_alerts.append(alert)
+                for rec in alert.get("records", []):
+                    aid = str(rec.get("alert_id") or "")
+                    if not aid or aid == "0": continue
+                        
+                    closed_json = closed_map.get(aid)
+                    if closed_json:
+                        any_closed = True
+                        try:
+                            ad = json.loads(closed_json)
+                            if ad: action_details = ad
+                            lvl = to_int(ad.get("action_by_level")) or 1
+                        except Exception:
+                            lvl = 1
+                        rec["is_closed"] = True
+                        rec["action_details"] = ad
+                    else:
+                        rec["is_closed"] = False
+                        lvl = to_int(level_map.get(aid))
+                        elapsed = elapsed_minutes_since(rec.get("sort_time"))
+                        time_based_level = get_level_for_elapsed_minutes(elapsed)
+                        time_based_level = min(time_based_level, 7)
 
-    # 👇 FIX: N+1 Query Fix - SLA info ONCE attach karo for all central records
-    all_central_records_flat = []
-    for alert in filtered_alerts:
-        if alert.get("record_source") == "central":
-            all_central_records_flat.extend(alert.get("records", []))
-            
-    if all_central_records_flat:
-        await attach_sla_info_to_alerts(all_central_records_flat)
-
-    # Field cleanup logic
-    FIELDS_TO_LIFT = [
-        "system_type", "inc_latitude", "inc_longitude", "amb_lat", "amb_long", 
-        "inc_datetime", "pilot_name", "pilot_mobile", "paramedic_name", "paramedic_mobile", 
-        "amb_area", "amb_area_type", "call_type", "acknowledge_time", "start_time", 
-        "scene_time", "handover_time", "back_to_base_time"
-    ]
-
-    for alert in filtered_alerts:
-        is_denial = alert.get("record_source") == "denial"
-        
-        if requested_level == 1:
-            alert.pop("escalated_at", None)
-            alert.pop("updated_date", None)
-            alert.pop("current_level_minutes", None)
-            
-        if is_denial:
-            keys_to_remove = ["sla_breach_reason", "hin_sla_breach_reason", "sla_threshold_seconds", "sla_actual_seconds", "sla_breach_seconds", "amb_area", "amb_area_type", "call_type"]
-            for k in keys_to_remove:
-                alert.pop(k, None)
-        else:
-            if requested_level != 1 and alert.get("records"):
-                first_rec = alert["records"][0]
-                for field in FIELDS_TO_LIFT:
-                    if field in first_rec:
-                        val = first_rec.get(field)
-                        if isinstance(val, datetime):
-                            val = val.strftime("%Y-%m-%d %H:%M:%S")
-                        alert[field] = val
-                        for rec in alert["records"]:
-                            rec.pop(field, None)
-            
-            for rec in alert.get("records", []):
-                if requested_level == 1:
-                    rec.pop("escalated_at", None)
-                    rec.pop("updated_date", None)
-                    rec.pop("current_level_minutes", None)
-                
-                if rec.get("alert_type"):
-                    rec["alert_type"] = rec["alert_type"].replace("_", " ")
-                if rec.get("remark"):
-                    rec["remark"] = rec["remark"].replace("_", " ")
+                        if lvl is None:
+                            lvl = time_based_level
+                            await redis_client.set(f"{ESC_LEVEL_REDIS_PREFIX}{aid}", str(lvl))
+                        elif time_based_level > lvl:
+                            lvl = time_based_level
+                            await redis_client.set(f"{ESC_LEVEL_REDIS_PREFIX}{aid}", str(lvl))
                     
-                for d_key in ["created_date", "updated_date", "inc_datetime", "escalated_date", "cancel_date", "added_date", "sort_time"]:
-                    d_val = rec.get(d_key)
-                    if d_val and isinstance(d_val, str) and "T" in d_val:
-                        try: rec[d_key] = d_val.replace("T", " ").split(".")[0]
+                    if lvl > max_level: max_level = lvl
+                    
+                    rec_lvl_info = get_level_info_for_level(lvl)
+                    rec["current_level"] = lvl
+                    rec["current_role"] = rec_lvl_info["role"]
+                    rec["current_level_minutes"] = rec_lvl_info["minutes"]
+                    rec["severity"] = SEVERITY_BY_LEVEL.get(lvl, "LOW")
+                    rec["type"] = "current_escalation"
+                    rec["escalated_at"] = datetime.now(ist).isoformat()
+
+                alert["is_closed"] = any_closed
+                if any_closed and action_details:
+                    alert["action_details"] = action_details
+                    
+                current_level = max_level
+                if requested_level is not None and current_level != requested_level: continue
+                    
+                level_info = get_level_info_for_level(current_level)
+                alert["current_level"] = current_level
+                alert["current_role"] = level_info["role"]
+                alert["current_level_minutes"] = level_info["minutes"]
+                alert["severity"] = SEVERITY_BY_LEVEL.get(current_level, "LOW")
+                alert["type"] = "current_escalation"
+                alert["escalated_at"] = datetime.now(ist).isoformat()
+                filtered_alerts.append(alert)
+
+        # 👇 FIX: N+1 Query Fix - SLA info ONCE attach karo for all central records
+        all_central_records_flat = []
+        for alert in filtered_alerts:
+            if alert.get("record_source") == "central":
+                all_central_records_flat.extend(alert.get("records", []))
+                
+        if all_central_records_flat:
+            await attach_sla_info_to_alerts(all_central_records_flat)
+
+        # Field cleanup logic
+        FIELDS_TO_LIFT = [
+            "system_type", "inc_latitude", "inc_longitude", "amb_lat", "amb_long", 
+            "inc_datetime", "pilot_name", "pilot_mobile", "paramedic_name", "paramedic_mobile", 
+            "amb_area", "amb_area_type", "call_type", "acknowledge_time", "start_time", 
+            "scene_time", "handover_time", "back_to_base_time"
+        ]
+
+        for alert in filtered_alerts:
+            is_denial = alert.get("record_source") == "denial"
+            
+            if requested_level == 1:
+                alert.pop("escalated_at", None)
+                alert.pop("updated_date", None)
+                alert.pop("current_level_minutes", None)
+                
+            if is_denial:
+                keys_to_remove = ["sla_breach_reason", "hin_sla_breach_reason", "sla_threshold_seconds", "sla_actual_seconds", "sla_breach_seconds", "amb_area", "amb_area_type", "call_type"]
+                for k in keys_to_remove:
+                    alert.pop(k, None)
+            else:
+                if requested_level != 1 and alert.get("records"):
+                    first_rec = alert["records"][0]
+                    for field in FIELDS_TO_LIFT:
+                        if field in first_rec:
+                            val = first_rec.get(field)
+                            if isinstance(val, datetime):
+                                val = val.strftime("%Y-%m-%d %H:%M:%S")
+                            alert[field] = val
+                            for rec in alert["records"]:
+                                rec.pop(field, None)
+                
+                for rec in alert.get("records", []):
+                    if requested_level == 1:
+                        rec.pop("escalated_at", None)
+                        rec.pop("updated_date", None)
+                        rec.pop("current_level_minutes", None)
+                    
+                    if rec.get("alert_type"):
+                        rec["alert_type"] = rec["alert_type"].replace("_", " ")
+                    if rec.get("remark"):
+                        rec["remark"] = rec["remark"].replace("_", " ")
+                        
+                    for d_key in ["created_date", "updated_date", "inc_datetime", "escalated_date", "cancel_date", "added_date", "sort_time"]:
+                        d_val = rec.get(d_key)
+                        if d_val and isinstance(d_val, str) and "T" in d_val:
+                            try: rec[d_key] = d_val.replace("T", " ").split(".")[0]
+                            except: pass
+
+            if alert.get("alert_type") and is_denial:
+                alert["alert_type"] = alert["alert_type"].replace("_", " ")
+                
+            for d_key in ["created_date", "updated_date", "inc_datetime", "escalated_date", "cancel_date", "added_date", "sort_time"]:
+                d_val = alert.get(d_key)
+                if d_val and isinstance(d_val, str) and "T" in d_val:
+                    try: alert[d_key] = d_val.replace("T", " ").split(".")[0]
+                    except: pass
+
+            if is_denial and "records" in alert:
+                for rec in alert["records"]:
+                    if rec.get("alert_type"):
+                        rec["alert_type"] = rec["alert_type"].replace("_", " ")
+                    if rec.get("added_date") and isinstance(rec.get("added_date"), str) and "T" in rec.get("added_date"):
+                        try: rec["added_date"] = rec["added_date"].replace("T", " ").split(".")[0]
                         except: pass
 
-        if alert.get("alert_type") and is_denial:
-            alert["alert_type"] = alert["alert_type"].replace("_", " ")
-            
-        for d_key in ["created_date", "updated_date", "inc_datetime", "escalated_date", "cancel_date", "added_date", "sort_time"]:
-            d_val = alert.get(d_key)
-            if d_val and isinstance(d_val, str) and "T" in d_val:
-                try: alert[d_key] = d_val.replace("T", " ").split(".")[0]
-                except: pass
+        if requested_level == 1:
+            flat_alerts = []
+            for group in filtered_alerts:
+                if group.get("record_source") == "central":
+                    records = group.pop("records", [])
+                    for rec in records:
+                        merged_rec = {**group, **rec}
+                        flat_alerts.append(merged_rec)
+                else:
+                    flat_alerts.append(group)
+            filtered_alerts = flat_alerts
 
-        if is_denial and "records" in alert:
-            for rec in alert["records"]:
-                if rec.get("alert_type"):
-                    rec["alert_type"] = rec["alert_type"].replace("_", " ")
-                if rec.get("added_date") and isinstance(rec.get("added_date"), str) and "T" in rec.get("added_date"):
-                    try: rec["added_date"] = rec["added_date"].replace("T", " ").split(".")[0]
-                    except: pass
-    if requested_level == 1:
-        flat_alerts = []
-        for group in filtered_alerts:
-            if group.get("record_source") == "central":
-                # Group level aur Record level ke fields ko merge karke direct top level par rakh do
-                records = group.pop("records", [])
-                for rec in records:
-                    merged_rec = {**group, **rec}
-                    flat_alerts.append(merged_rec)
-            else:
-                # Agar koi denial alert Level 1 pe aaya ho to waise hi rakh do
-                flat_alerts.append(group)
-        filtered_alerts = flat_alerts
-    msg_dict = {
-        "type": "INITIAL_LOAD",
-        "count": len(filtered_alerts),
-        "data": filtered_alerts,
-        "vehicle_filter": None,
-        "district_filter": None
-    }
-    _payload_cache[cache_key] = {
-        "data": filtered_alerts,
-        "json_str": json.dumps(msg_dict, default=str),
-        "expiry": now + 1.0
-    }
+        sig_set = set()
+        for p in filtered_alerts:
+            uid = str(p.get("group_key") or p.get("call_id") or p.get("alert_id") or p.get("incident_id"))
+            lvl = p.get("current_level")
+            is_cl = p.get("is_closed")
+            sig_set.add(f"{uid}_{lvl}_{is_cl}")
 
-    logger.info(f"BUILD PAYLOADS: returning {len(filtered_alerts)} alerts for level={requested_level}")
-    return filtered_alerts
+        msg_dict = {
+            "type": "INITIAL_LOAD",
+            "count": len(filtered_alerts),
+            "data": filtered_alerts,
+            "vehicle_filter": None,
+            "district_filter": None
+        }
+        _payload_cache[cache_key] = {
+            "data": filtered_alerts,
+            "json_str": json.dumps(msg_dict, default=str),
+            "signature": sig_set,  
+            "expiry": time.time() + 1.0 # 👈 Fix: time.time() use kiya
+        }
+
+        logger.info(f"BUILD PAYLOADS: returning {len(filtered_alerts)} alerts for level={requested_level}")
+        return filtered_alerts
 # ===========================================================================
 # REDIS STATE — per call_id current level + closed flag
 # ===========================================================================
@@ -6045,7 +6076,7 @@ async def _handle_escalation_ws(websocket: WebSocket, requested_level: int, user
             
             last_refresh_time = 0
             notified_alert_ids = deque(maxlen=50)
-            last_sent_signature = None
+            last_sent_signature = None  # 👈 SPAM STOPPER
 
             while True:
                 payload = await queue.get()
@@ -6072,11 +6103,19 @@ async def _handle_escalation_ws(websocket: WebSocket, requested_level: int, user
                 last_refresh_time = now
 
                 try:
-                    # 👇 NAYA: Agar koi filter nahi hai, to cached JSON string use karo (10x Fast)
+                    # 👇 NAYA: Agar koi vehicle/district filter nahi hai, to cached JSON + Signature use karo
                     if not vehicle_number and not district_filter:
                         cache_key = f"esc_payloads_{requested_level}"
                         if cache_key in _payload_cache and time.time() < _payload_cache[cache_key]["expiry"]:
-                            json_str = _payload_cache[cache_key].get("json_str")
+                            cached = _payload_cache[cache_key]
+                            current_signature = cached.get("signature")
+                            
+                            # Spam Stopper Check
+                            if current_signature == last_sent_signature:
+                                continue
+                            last_sent_signature = current_signature
+                            
+                            json_str = cached.get("json_str")
                             if json_str:
                                 try:
                                     await websocket.send_text(json_str)
@@ -6085,6 +6124,7 @@ async def _handle_escalation_ws(websocket: WebSocket, requested_level: int, user
                                     break
                                 continue
 
+                    # Agar filter hai ya cache miss hua, to DB se fresh laao
                     payloads = await build_all_escalation_payloads(requested_level)
 
                     if district_filter:
@@ -6099,29 +6139,31 @@ async def _handle_escalation_ws(websocket: WebSocket, requested_level: int, user
                                 filtered.append(p)
                         payloads = filtered
 
-                        current_signature = set()
-                        for p in payloads:
-                            uid = str(p.get("alert_id") or p.get("call_id") or p.get("incident_id"))
-                            lvl = p.get("current_level")
-                            is_cl = p.get("is_closed")
-                            current_signature.add(f"{uid}_{lvl}_{is_cl}")
-                        
-                        if current_signature == last_sent_signature:
-                            continue
-                        last_sent_signature = current_signature
+                    # 👇 NAYA: Spam Stopper for filtered payloads (Level 1 or District filtered)
+                    current_signature = set()
+                    for p in payloads:
+                        uid = str(p.get("group_key") or p.get("call_id") or p.get("alert_id") or p.get("incident_id"))
+                        lvl = p.get("current_level")
+                        is_cl = p.get("is_closed")
+                        current_signature.add(f"{uid}_{lvl}_{is_cl}")
+                    
+                    if current_signature == last_sent_signature:
+                        continue
+                    last_sent_signature = current_signature
 
-                        if fcm_token and len(payloads) > 0:
-                            for p in payloads:
-                                unique_id = str(p.get("alert_id") or p.get("call_id") or p.get("incident_id") or "")
-                                if unique_id and unique_id not in notified_alert_ids:
-                                    logger.info(f"🚀 Triggering FCM from WS loop for ID={unique_id}")
-                                    await send_fcm_push(
-                                        token=fcm_token,
-                                        title=f"Ambulance {vehicle_number_raw} - New Alert",
-                                        body=f"Alert: {p.get('alert_type', 'Escalation')}",
-                                        data={"alert_id": unique_id, "type": "Late"}
-                                    )
-                                    notified_alert_ids.append(unique_id)
+                    # FCM PUSH LOGIC (Only Level 1 with vehicle filter)
+                    if requested_level == 1 and fcm_token and len(payloads) > 0:
+                        for p in payloads:
+                            unique_id = str(p.get("alert_id") or p.get("call_id") or p.get("incident_id") or "")
+                            if unique_id and unique_id not in notified_alert_ids:
+                                logger.info(f"🚀 Triggering FCM from WS loop for ID={unique_id}")
+                                await send_fcm_push(
+                                    token=fcm_token,
+                                    title=f"Ambulance {vehicle_number_raw} - New Alert",
+                                    body=f"Alert: {p.get('alert_type', 'Escalation')}",
+                                    data={"alert_id": unique_id, "type": "Late"}
+                                )
+                                notified_alert_ids.append(unique_id)
 
                     await manager.safe_send(websocket, {
                         "type": "INITIAL_LOAD",
@@ -6632,7 +6674,8 @@ async def broadcast_new_central_alert(central_alert_row: dict):
                     data={
                         "alert_id": str(call_id),
                         "type": "Late",
-                    }
+                    },
+                    vehicle_number=amb_normalized  
                 )
             else:
                 logger.info(f"SKIP FCM: No token found in Redis for amb={amb_normalized}")
@@ -7555,3 +7598,21 @@ async def fix_audit_table():
 #     except Exception as e:
 #         logger.exception(f"False Alerts Cleanup FAILED: {e}")
 #         return {"status": "error", "message": str(e)}
+
+
+@app.get("/api/maintenance/clear-cache")
+async def clear_memory_cache():
+    """Clears Python in-memory caches and runs Garbage Collector. Zero Downtime!"""
+    import gc
+    global _cache, _cache_expiry, _payload_cache
+    
+    # Dicts ko khali karo
+    _cache.clear()
+    _cache_expiry.clear()
+    _payload_cache.clear()
+    
+    # Python ko force karo memory cleanup karne ke liye
+    gc.collect()
+    
+    logger.info("🧹 In-memory caches cleared and Garbage Collector run successfully.")
+    return {"status": "success", "message": "Memory caches cleared. Server is fresh now!"}
