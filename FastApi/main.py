@@ -58,7 +58,6 @@ ALLOWED_ORIGINS = os.getenv(
 # ============================================================
 # Logging Configuration (Production Ready)
 # ============================================================
-# INFO level ki wajah WARNING par set kiya, taaki faltu logs disk ko slow na kare
 logging.basicConfig(
     level=logging.WARNING,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -98,9 +97,6 @@ redis_sub_task = None
 denial_worker_task = None
 esc_bump_task = None
 
-# last_sent_updated = None
-# last_sent_alert_id = None
-
 security = HTTPBearer()
 
 
@@ -130,11 +126,6 @@ async def publish_to_redis(channel: str, payload: dict):
 
 
 async def redis_subscriber():
-    """
-    Subscribe to Redis channel and push received messages to local client queues.
-    Runs in every worker process to enable cross-worker WebSocket broadcasts.
-    Auto-reconnects if Redis connection drops — task kabhi permanently nahi marta.
-    """
     logger.info("Redis Subscriber STARTED")
 
     while True:
@@ -155,12 +146,9 @@ async def redis_subscriber():
                     logger.error(f"Redis subscriber: invalid JSON payload dropped: {e}")
                     continue
 
-                # ---- Direct push to local queues ----
                 dead = []
                 for ws, info in manager.active_connections.items():
                     try:
-                        # 👈 FIX: Full payload bhejo, taaki central_alerts_ws ko 'data' mil jaye.
-                        # Python me ye RAM me copy nahi hoga, sab same object point karenge (Memory Safe).
                         info["queue"].put_nowait(payload)
                     except asyncio.QueueFull:
                         logger.warning(
@@ -175,7 +163,6 @@ async def redis_subscriber():
                         logger.error(f"Disconnect failed for slow client: {disc_err}")
 
         except asyncio.CancelledError:
-            # Graceful shutdown
             logger.info("Redis subscriber cancelled — shutting down")
             if pubsub is not None:
                 try:
@@ -185,7 +172,6 @@ async def redis_subscriber():
             raise
 
         except Exception as e:
-            # Connection drop / Redis down 
             logger.exception(f"Redis subscriber error: {e} — reconnecting in 5s")
             if pubsub is not None:
                 try:
@@ -199,11 +185,6 @@ async def redis_subscriber():
 # Cached Query (Redis + Memory with eviction)
 # ============================================================
 async def cached_query(sql, params=None, ttl=15, fetch="all", db=database):
-    """
-    Hybrid cache: local memory + Redis.
-    Falls back to direct DB query if both caches miss.
-    Automatically evicts oldest entries when cache exceeds MAX_CACHE_ENTRIES.
-    """
     await init_redis()
 
     key_data = {"db": id(db), "sql": sql, "params": params, "fetch": fetch}
@@ -212,11 +193,9 @@ async def cached_query(sql, params=None, ttl=15, fetch="all", db=database):
 
     now = time.time()
 
-    # 1. Local memory cache
     if cache_key in _cache and now < _cache_expiry.get(cache_key, 0):
         return _cache[cache_key]
 
-    # 2. Redis cache
     try:
         redis_data = await redis_client.get(cache_key)
         if redis_data:
@@ -227,7 +206,6 @@ async def cached_query(sql, params=None, ttl=15, fetch="all", db=database):
     except Exception as e:
         logger.warning(f"Redis cache read error, falling back to DB: {e}")
 
-    # 3. DB query
     if fetch == "one":
         row = await db.fetch_one(sql, params)
         result = dict(row) if row else None
@@ -235,11 +213,9 @@ async def cached_query(sql, params=None, ttl=15, fetch="all", db=database):
         rows = await db.fetch_all(sql, params)
         result = [dict(r) for r in rows]
 
-    # 4. Save to local cache
     _cache[cache_key] = result
     _cache_expiry[cache_key] = now + ttl
 
-    # Evict oldest entries if cache exceeds limit
     if len(_cache) > MAX_CACHE_ENTRIES:
         sorted_keys = sorted(_cache_expiry.items(), key=lambda x: x[1])
         keys_to_remove = [k for k, _ in sorted_keys[:MAX_CACHE_ENTRIES // 4]]
@@ -248,7 +224,6 @@ async def cached_query(sql, params=None, ttl=15, fetch="all", db=database):
             _cache_expiry.pop(k, None)
         logger.info(f"Cache evicted {len(keys_to_remove)} entries (remaining: {len(_cache)})")
 
-    # Save to Redis (best effort)
     try:
         await redis_client.set(cache_key, json.dumps(result, default=str), ex=ttl)
     except Exception:
@@ -311,7 +286,6 @@ def format_seconds_to_hhmmss(total_seconds):
 
 
 def normalize_row(row):
-    """Convert a DB row into a plain dictionary with datetime handling."""
     if not row:
         return {}
     try:
@@ -331,7 +305,6 @@ def normalize_row(row):
 
 
 def serialize_row(row):
-    """Convert a database row to a JSON-serializable dict."""
     if hasattr(row, '_mapping'):
         data = dict(row._mapping)
     elif hasattr(row, 'keys'):
@@ -373,7 +346,6 @@ def to_int(val):
 
 
 def hhmmss_to_seconds(value: str) -> int:
-    """Convert HH:MM:SS text to seconds safely. Returns 0 for invalid values."""
     try:
         if not value:
             return 0
@@ -383,16 +355,6 @@ def hhmmss_to_seconds(value: str) -> int:
         return 0
 
 def format_seconds_human(seconds):
-    """Seconds ko human-readable format me convert karta hai.
-    
-    Examples:
-        45     → "45 sec"
-        90     → "1 min 30 sec"
-        300    → "5 min"
-        3600   → "1 hr"
-        3900   → "1 hr 5 min"
-        2880   → "48 min"
-    """
     if seconds is None:
         return "N/A"
 
@@ -424,7 +386,6 @@ def hash_filter(data: dict):
 
 
 def group_by_severity(rows):
-    """Group alerts by severity."""
     severity_order = ["CRITICAL", "HIGH", "MEDIUM", "LOW"]
     grouped = {sev: [] for sev in severity_order}
 
@@ -540,8 +501,6 @@ async def get_active_thresholds():
 
 
 async def fetch_and_merge_driver_parameters(incident_ids: list, rows: list):
-    """MySQL (ems_driver_parameters) se real-time action times uthata hai 
-    aur Postgres (rtm_dashboard) ke rows me overwrite karta hai."""
     if not incident_ids or not rows:
         return rows
         
@@ -557,7 +516,6 @@ async def fetch_and_merge_driver_parameters(incident_ids: list, rows: list):
         """
         mysql_rows = await database.fetch_all(query, params)
         
-        # 👇 FIX: Record object ko dict me convert karo for safety
         mysql_map = {}
         for r in mysql_rows:
             rec_dict = dict(r)
@@ -569,28 +527,16 @@ async def fetch_and_merge_driver_parameters(incident_ids: list, rows: list):
         logger.error(f"Failed to fetch ems_driver_parameters: {e}")
         return rows
 
-    # Postgres rows me MySQL ka real-time data daalo (overwrite)
     for row in rows:
         inc_id = str(row.get('inc_ref_id') or row.get('incident_id') or "")
         mysql_rec = mysql_map.get(inc_id)
         
         if mysql_rec:
-
-            raw_ack = mysql_rec.get('acknowledge')
-            
-            # 👇 Yeh log laga temporarily
-            logger.info(
-                f"MERGE CHECK: inc_id={inc_id}, "
-                f"raw_ack={raw_ack!r}, "
-                f"type={type(raw_ack)}, "
-                f"skip_condition={str(raw_ack) == '0000-00-00 00:00:00'}"
-            )
             def _safe_str(val):
                 if isinstance(val, datetime):
                     return val.strftime("%Y-%m-%d %H:%M:%S")
                 return val
 
-            # 👇 Ab ye 100% dict hai, isliye .get() safely chalega
             if mysql_rec.get('acknowledge') and str(mysql_rec.get('acknowledge')) != '0000-00-00 00:00:00':
                 row['acknowledge'] = _safe_str(mysql_rec['acknowledge'])
 
@@ -607,6 +553,46 @@ async def fetch_and_merge_driver_parameters(incident_ids: list, rows: list):
                 row['back_to_base_loc'] = _safe_str(mysql_rec['back_to_base_loc'])
                 
     return rows
+
+async def fetch_mdt_login_status_batch(ambulance_numbers: list) -> dict:
+    """
+    MySQL ke ems_app_login_session table se latest login status fetch karta hai.
+    Returns: { "MH12AB1234": "1", ... } (status '1' = Active, '2'/'None' = Inactive)
+    """
+    if not ambulance_numbers:
+        return {}
+
+    # Normalize ambulance numbers (spaces, hyphens, uppercase) for matching
+    valid_ambs = [normalize_vehicle_number(a) for a in ambulance_numbers if a]
+    if not valid_ambs:
+        return {}
+
+    # Remove duplicates to avoid SQL payload bloat
+    unique_ambs = list(set(valid_ambs))
+    placeholders = ", ".join([f":amb{i}" for i in range(len(unique_ambs))])
+    params = {f"amb{i}": unique_ambs[i] for i in range(len(unique_ambs))}
+
+    query = f"""
+        SELECT vehicle_no, status, modify_sync_data
+        FROM ems_app_login_session
+        WHERE REPLACE(REPLACE(REPLACE(REPLACE(vehicle_no, ' ', ''), '-', ''), '.', ''), '_', '') IN ({placeholders})
+        ORDER BY modify_sync_data DESC, id DESC
+    """
+    try:
+        rows = await database.fetch_all(query, params)
+    except Exception as e:
+        logger.error(f"fetch_mdt_login_status_batch failed: {e}")
+        return {}
+
+    status_map = {}
+    for r in rows:
+        amb = normalize_vehicle_number(r["vehicle_no"]) # Normalize here too
+        # Because of ORDER BY modify_sync_data DESC, the first occurrence is the latest
+        if amb not in status_map:
+            status_map[amb] = str(r["status"])
+
+    return status_map
+
 
 def resolve_alerts(row, thresholds):
     now = datetime.now(ist)
@@ -629,12 +615,10 @@ def resolve_alerts(row, thresholds):
     scene_done     = scene_dt is not None
     back_base_done = back_base_dt is not None
 
-    pilot_login_out_val = row.get("pilot_login_out")
-    mdt_not_found = pilot_login_out_val is None or pilot_login_out_val == "No"
-
-    # KEY LOGIC:
-    # Agar action complete ho gaya → metric = None → alert nahi banega
-    # Alert sirf tab banta hai jab action PENDING ho aur time exceed ho
+    # MDT Login Status MySQL table (ems_app_login_session) se check hoga
+    # Status '1' matlab logged in hai, warna logged out
+    mdt_status = str(row.get("mdt_login_status") or "")
+    mdt_not_found = mdt_status != '1'
 
     # ACK: sirf tab check karo jab acknowledge NAHI hua
     ack_sec = None
@@ -676,7 +660,9 @@ def resolve_alerts(row, thresholds):
             continue
 
         if alert_type == "MDT_NOT_LOGGED_IN":
-            if ack_done and mdt_not_found:
+            # FIX: Agar driver ne ACK kar liya hai, toh MDT login pakka hai. 
+            # Agar ACK nahi hua hai, tabhi TURANT check karo ki MDT login hai ya nahi.
+            if not ack_done and mdt_not_found:
                 matched_alerts.append((alert_type, t["severity"]))
                 seen_alert_types.add(alert_type)
             continue
@@ -687,7 +673,6 @@ def resolve_alerts(row, thresholds):
         if threshold_val <= 0:
             continue
 
-        # metric_value = None matlab action complete ho gaya — skip
         if metric_value is None:
             continue
 
@@ -726,20 +711,59 @@ async def rtm_alert_insert_worker():
             inc_ids = [r['inc_ref_id'] for r in rows if r.get('inc_ref_id')]
             rows = await fetch_and_merge_driver_parameters(inc_ids, rows)
 
+            # NEW: Fetch MDT Login Status from MySQL ems_app_login_session
+            amb_numbers = [r.get("ambulance_no") for r in rows if r.get("ambulance_no")]
+            mdt_status_map = await fetch_mdt_login_status_batch(amb_numbers)
+
+            # NEW: Aaj ke un incidents ki list nikalo jinka MDT_NOT_LOGGED_IN alert pehle se ban chuka hai
+            # Taaki us incident ka koi aur alert (ACK/START/AT_SCENE) aage generate na ho
+            mdt_incidents = set()
+            if inc_ids:
+                try:
+                    ph = ", ".join([f":id{i}" for i in range(len(inc_ids))])
+                    params_mdt = {f"id{i}": str(inc_ids[i]).strip() for i in range(len(inc_ids))}
+                    mdt_check_query = f"""
+                        SELECT DISTINCT incident_id 
+                        FROM central_alerts 
+                        WHERE alert_type = 'MDT_NOT_LOGGED_IN' 
+                        AND inc_datetime >= CURRENT_DATE
+                        AND incident_id IN ({ph})
+                    """
+                    mdt_rows = await database2.fetch_all(mdt_check_query, params_mdt)
+                    for mr in mdt_rows:
+                        mdt_incidents.add(str(mr["incident_id"]).strip())
+                except Exception as e:
+                    logger.error(f"Failed to fetch existing MDT incidents: {e}")
+
             for row in rows:
                 try:
+                    # Attach latest login status to the row before normalize (Normalize vehicle no here too)
+                    amb_val = normalize_vehicle_number(row.get("ambulance_no"))
+                    row['mdt_login_status'] = mdt_status_map.get(amb_val) 
+                    
                     row = normalize_row(row)
+                    
+                    inc_ref_id = str(row.get("inc_ref_id") or "").strip()
+                    
+                    # NEW: Agar is incident ka MDT_NOT_LOGGED_IN alert pehle hi ban chuka hai, toh skip karo
+                    if inc_ref_id and inc_ref_id in mdt_incidents:
+                        continue
+
                     alerts = resolve_alerts(row, thresholds)
                     if not alerts:
                         continue
+                        
+                    # NEW: Agar is cycle me MDT_NOT_LOGGED_IN alert ban raha hai, 
+                    # toh baaki alerts ko is list se hata do, sirf MDT alert hi insert hoga
+                    has_mdt_alert = any(a[0] == "MDT_NOT_LOGGED_IN" for a in alerts)
+                    if has_mdt_alert:
+                        alerts = [a for a in alerts if a[0] == "MDT_NOT_LOGGED_IN"]
+                        mdt_incidents.add(inc_ref_id) # Add to set so we don't generate others in this run
 
                     for alert_type, severity in alerts:
 
                         # ============================================
                         # RACE CONDITION FIX:
-                        # Insert se bilkul pehle MySQL se fresh data lo
-                        # aur dobara validate karo — agar driver ne
-                        # SLA ke andar action le liya to skip karo
                         # ============================================
                         inc_id = row.get("inc_ref_id")
                         amb_area = row.get("amb_working_area")
@@ -759,7 +783,6 @@ async def rtm_alert_insert_worker():
                             fresh_dict = dict(fresh)
 
                             def is_valid_dt(val):
-                                """None ya 0000-00-00 nahi hai to valid datetime hai."""
                                 if not val:
                                     return False
                                 if str(val) == '0000-00-00 00:00:00':
@@ -767,7 +790,6 @@ async def rtm_alert_insert_worker():
                                 return True
 
                             def to_aware_dt(val):
-                                """Any value ko IST-aware datetime banao."""
                                 if not val:
                                     return None
                                 if isinstance(val, datetime):
@@ -779,14 +801,8 @@ async def rtm_alert_insert_worker():
                                 return dt
 
                             def within_sla(action_val, base_dt, threshold_sec):
-                                """
-                                Action hua aur SLA ke andar tha to True return karo.
-                                action_val  : driver ne kab action liya (raw value)
-                                base_dt     : base time (inc_datetime ya handover_dt)
-                                threshold_sec: SLA limit seconds mein
-                                """
                                 if not is_valid_dt(action_val):
-                                    return False  # Action hua hi nahi
+                                    return False
                                 if not base_dt or threshold_sec <= 0:
                                     return False
 
@@ -798,12 +814,9 @@ async def rtm_alert_insert_worker():
 
                                 elapsed = (action_aware - base_aware).total_seconds()
 
-                                # elapsed > 0 : valid (base ke baad hua)
-                                # elapsed <= threshold : SLA ke andar hua
                                 return 0 < elapsed <= threshold_sec
 
                             def get_threshold(a_type, a_area, thresh_list):
-                                """alert_type + amb_area ke liye threshold seconds nikalo."""
                                 for t in thresh_list:
                                     if t["alert_type"] != a_type:
                                         continue
@@ -813,7 +826,6 @@ async def rtm_alert_insert_worker():
                                     return int(t.get("threshold_seconds") or 0)
                                 return 0
 
-                            # Handover time (BACK_TO_BASE ke liye base time)
                             handover_raw = fresh_dict.get("patient_handover")
                             handover_dt = to_aware_dt(handover_raw) if is_valid_dt(handover_raw) else None
 
@@ -864,7 +876,7 @@ async def rtm_alert_insert_worker():
                                     )
 
                             if skip_alert:
-                                continue  # Insert mat karo — SLA ke andar tha
+                                continue
 
                         # ============================================
                         # Ab safe hai — insert karo
@@ -928,265 +940,6 @@ async def rtm_alert_insert_worker():
             logger.exception(f"RTM Alert Worker Error: {e}")
 
         await asyncio.sleep(5)
-    ######################################################################################
-
-# import uuid
-
-# # Columns jo hum MySQL se map kar rahe hain
-# MAPPED_COLUMNS = {
-#     "amb_no", "amb_default_mobile", "caller_no",
-#     "hp_name", "challenge_val", "meaning", "denial_remark",
-#     "added_by", "added_date", "call_id"        # 👈 call_id add kiya
-# }
-
-# _required_defaults_cache = None
-
-# DENIAL_WORKER_LOCK_KEY = "denial_worker_leader_lock"
-# DENIAL_WORKER_LOCK_TTL_MS = 15000
-# _worker_instance_id = str(uuid.uuid4())
-
-
-# async def try_acquire_denial_worker_leadership() -> bool:
-#     """Redis leader lock — sirf ek process actual kaam kare."""
-#     acquired = await redis_client.set(
-#         DENIAL_WORKER_LOCK_KEY,
-#         _worker_instance_id,
-#         nx=True,
-#         px=DENIAL_WORKER_LOCK_TTL_MS
-#     )
-#     if acquired:
-#         return True
-
-#     current_holder = await redis_client.get(DENIAL_WORKER_LOCK_KEY)
-#     if isinstance(current_holder, bytes):
-#         current_holder = current_holder.decode()
-
-#     if current_holder == _worker_instance_id:
-#         await redis_client.pexpire(DENIAL_WORKER_LOCK_KEY, DENIAL_WORKER_LOCK_TTL_MS)
-#         return True
-
-#     return False
-
-
-# async def get_required_default_columns():
-#     """Postgres ke NOT NULL (bina default) columns ke liye safe defaults."""
-#     global _required_defaults_cache
-
-#     if _required_defaults_cache is not None:
-#         return _required_defaults_cache
-
-#     rows = await database2.fetch_all(
-#         """
-#         SELECT column_name, data_type
-#         FROM information_schema.columns
-#         WHERE table_schema = 'public'
-#           AND table_name = 'denial_escalation_master'
-#           AND is_nullable = 'NO'
-#           AND column_default IS NULL
-#         """
-#     )
-
-#     defaults = {}
-#     for r in rows:
-#         col = r["column_name"]
-#         dtype = r["data_type"]
-
-#         # in columns ko hum khud fill karte hain
-#         if col in MAPPED_COLUMNS or col in ("id", "mysql_id"):
-#             continue
-
-#         if dtype in ("integer", "bigint", "smallint", "numeric"):
-#             defaults[col] = 0
-#         elif dtype == "boolean":
-#             defaults[col] = False
-#         elif dtype in ("character varying", "text", "varchar", "char"):
-#             defaults[col] = ""
-#         elif dtype in ("timestamp without time zone", "timestamp with time zone", "date"):
-#             defaults[col] = datetime.utcnow()
-#         else:
-#             defaults[col] = None
-
-#     _required_defaults_cache = defaults
-#     logger.info(f"Denial worker: required NOT NULL defaults resolved -> {defaults}")
-#     return defaults
-
-
-# async def denial_complaints_insert_worker():
-#     """
-#     Background worker: MySQL (ems_denial_complaints) -> Postgres (denial_escalation_master).
-#     Current month only. Uses MySQL `id` for uniqueness check.
-#     inc_ref_id is intentionally SKIPPED. call_id is included.
-#     """
-#     logger.info(f"Denial Complaints Insert Worker STARTED (instance={_worker_instance_id})")
-
-#     while True:
-#         try:
-#             is_leader = await try_acquire_denial_worker_leadership()
-
-#             if not is_leader:
-#                 await asyncio.sleep(5)
-#                 continue
-
-#             required_defaults = await get_required_default_columns()
-
-#             # ------------------------------------------------
-#             # STEP 1: MySQL se current month rows lao
-#             # ------------------------------------------------
-#             query = """
-#                 SELECT
-#                     id, call_id, amb_no, amb_default_mobile, caller_no,
-#                     hp_name, challenge_val, meaning, denial_remark,
-#                     added_by, added_date
-#                 FROM ems_denial_complaints
-#                 WHERE YEAR(added_date) = YEAR(NOW())
-#                   AND MONTH(added_date) = MONTH(NOW())
-#                 ORDER BY added_date DESC
-#                 LIMIT 1000;
-#             """
-
-#             rows = await database.fetch_all(query)
-
-#             logger.info("=" * 60)
-#             logger.info(f"Denial worker: MySQL returned {len(rows)} rows (current month filter)")
-
-#             if len(rows) == 0:
-#                 try:
-#                     sample = await database.fetch_one(
-#                         "SELECT MIN(added_date) AS min_dt, MAX(added_date) AS max_dt, "
-#                         "COUNT(*) AS total FROM ems_denial_complaints"
-#                     )
-#                     if sample:
-#                         logger.warning(
-#                             f"Denial worker: 0 rows for current month! "
-#                             f"Table has min_date={sample['min_dt']}, "
-#                             f"max_date={sample['max_dt']}, total_rows={sample['total']}"
-#                         )
-#                 except Exception as e:
-#                     logger.error(f"Denial worker: sample date check failed: {e}")
-#                 await asyncio.sleep(10)
-#                 continue
-
-#             # ------------------------------------------------
-#             # STEP 2: Sample 3 rows ka data log karo
-#             # ------------------------------------------------
-#             for idx, r in enumerate(rows[:3]):
-#                 try:
-#                     d = dict(r)
-#                     logger.info(
-#                         f"Denial worker: sample row {idx} -> "
-#                         f"id={d.get('id')!r}, "
-#                         f"call_id={d.get('call_id')!r}, "
-#                         f"amb_no={d.get('amb_no')!r}, "
-#                         f"challenge_val={d.get('challenge_val')!r}, "
-#                         f"added_date={d.get('added_date')!r}"
-#                     )
-#                 except Exception as e:
-#                     logger.error(f"Denial worker: sample log error: {e}")
-
-#             # ------------------------------------------------
-#             # STEP 3: Per-row processing
-#             # ------------------------------------------------
-#             inserted_count = 0
-#             skipped_existing = 0
-#             skipped_no_id = 0
-#             failed_insert = 0
-#             failed_examples = []
-
-#             for row in rows:
-#                 try:
-#                     d = dict(row)
-#                     mysql_id = d.get("id")
-
-#                     if not mysql_id:
-#                         skipped_no_id += 1
-#                         continue
-
-#                     # ------------------------------------------------
-#                     # Check karo: ye mysql_id pehle se Postgres mein hai?
-#                     # ------------------------------------------------
-#                     existing = await database2.fetch_one(
-#                         """
-#                         SELECT id
-#                         FROM denial_escalation_master
-#                         WHERE mysql_id = :mysql_id
-#                         """,
-#                         {"mysql_id": mysql_id}
-#                     )
-
-#                     if existing:
-#                         skipped_existing += 1
-#                         continue
-
-#                     # ------------------------------------------------
-#                     # Insert karlo
-#                     # ------------------------------------------------
-#                     params = {
-#                         "id": mysql_id,
-#                         "mysql_id": mysql_id,
-#                         "call_id": d.get("call_id"),                       # 👈 call_id add kiya
-#                         "amb_no": d.get("amb_no"),
-#                         "amb_default_mobile": d.get("amb_default_mobile"),
-#                         "caller_no": d.get("caller_no"),
-#                         "hp_name": d.get("hp_name"),
-#                         "challenge_val": d.get("challenge_val"),
-#                         "meaning": d.get("meaning"),
-#                         "denial_remark": d.get("denial_remark"),
-#                         "added_by": d.get("added_by"),
-#                         "added_date": d.get("added_date"),
-#                     }
-#                     params.update(required_defaults)
-
-#                     columns = ", ".join(params.keys())
-#                     placeholders = ", ".join(f":{k}" for k in params.keys())
-
-#                     await database2.execute(
-#                         f"""
-#                         INSERT INTO denial_escalation_master ({columns})
-#                         VALUES ({placeholders})
-#                         """,
-#                         params
-#                     )
-#                     inserted_count += 1
-
-#                 except Exception as row_err:
-#                     failed_insert += 1
-#                     if len(failed_examples) < 5:
-#                         try:
-#                             d_err = dict(row)
-#                             failed_examples.append({
-#                                 "id": d_err.get("id"),
-#                                 "call_id": d_err.get("call_id"),
-#                                 "amb_no": d_err.get("amb_no"),
-#                                 "error": str(row_err),
-#                             })
-#                         except Exception:
-#                             failed_examples.append({"error": str(row_err)})
-#                     continue
-
-#             # ------------------------------------------------
-#             # STEP 4: Final summary
-#             # ------------------------------------------------
-#             logger.info(
-#                 f"Denial worker SUMMARY: "
-#                 f"fetched={len(rows)}, "
-#                 f"inserted={inserted_count}, "
-#                 f"existing={skipped_existing}, "
-#                 f"no_id={skipped_no_id}, "
-#                 f"failed={failed_insert}"
-#             )
-
-#             if failed_examples:
-#                 logger.warning(
-#                     f"Denial worker: failed insert examples -> {failed_examples}"
-#                 )
-
-#             if inserted_count:
-#                 logger.info(f"Denial worker: ✅ inserted {inserted_count} new rows")
-
-#         except Exception as e:
-#             logger.error(f"Denial Complaints Insert Worker Error: {e}", exc_info=True)
-
-#         await asyncio.sleep(10)
 
 ########################################################################################
 
@@ -1208,7 +961,6 @@ _worker_instance_id = str(uuid.uuid4())
  
  
 async def try_acquire_denial_worker_leadership() -> bool:
-    """Redis leader lock — sirf ek process actual kaam kare."""
     acquired = await redis_client.set(
         DENIAL_WORKER_LOCK_KEY,
         _worker_instance_id,
@@ -1228,16 +980,12 @@ async def try_acquire_denial_worker_leadership() -> bool:
  
     return False
  
-# ===========================================================================
-# GENERIC WORKER LEADER LOCKS (RTM, Notifier, Audit)
-# ===========================================================================
 RTM_WORKER_LOCK_KEY = "rtm_worker_leader_lock"
 NOTIFIER_WORKER_LOCK_KEY = "notifier_worker_leader_lock"
 RECON_WORKER_LOCK_KEY = "audit_recon_leader_lock"
 WORKER_LOCK_TTL_MS = 30000
 
 async def try_acquire_worker_leadership(lock_key: str) -> bool:
-    """Generic leader lock for background workers."""
     acquired = await redis_client.set(
         lock_key,
         _worker_instance_id,
@@ -1259,7 +1007,6 @@ async def try_acquire_worker_leadership(lock_key: str) -> bool:
 
 
 async def get_required_default_columns():
-    """Postgres ke NOT NULL (bina default) columns ke liye safe defaults."""
     global _required_defaults_cache
  
     if _required_defaults_cache is not None:
@@ -1300,356 +1047,7 @@ async def get_required_default_columns():
     return defaults
  
  
-# async def denial_complaints_insert_worker():
-#     """
-#     Background worker: MySQL (ems_denial_complaints) -> Postgres (denial_escalation_master).
-#     """
-#     logger.info(f"Denial Complaints Insert Worker STARTED (instance={_worker_instance_id})")
-#     while True:
-#         try:
-#             is_leader = await try_acquire_denial_worker_leadership()
-#             if not is_leader:
-#                 await asyncio.sleep(5)
-#                 continue
-#             required_defaults = await get_required_default_columns()
-#             # ------------------------------------------------
-#             # STEP 1: MySQL se current month rows lao (WITH JOINS)
-#             # ------------------------------------------------
-#             # 👇 NAYA QUERY: dst_id ki jagah dst_code use kiya gaya hai
-#             query = """
-#                 SELECT
-#                     edc.id, edc.call_id, edc.amb_no, edc.amb_default_mobile, edc.caller_no,
-#                     edc.hp_name, edc.challenge_val, edc.denial_remark,
-#                     edc.added_by, edc.added_date,
-#                     dr.meaning AS reason_meaning,
-#                     dist.dst_name AS dst_name
-#                 FROM ems_denial_complaints edc
-#                 LEFT JOIN ems_denial_reason dr 
-#                     ON edc.meaning = dr.id
-#                 LEFT JOIN ems_mas_districts dist 
-#                     ON edc.amb_district = dist.dst_code  -- 👈 YAHAN FIX KIYA GAYA HAI
-#                 WHERE YEAR(edc.added_date) = YEAR(NOW())
-#                   AND MONTH(edc.added_date) = MONTH(NOW())
-#                 ORDER BY edc.added_date DESC
-#                 LIMIT 1000;
-#             """
-#             rows = await database.fetch_all(query)
-
-
-#             logger.info("=" * 60)
-
-#             logger.info(f"Denial worker: MySQL returned {len(rows)} rows (current month filter)")
-
-#             if len(rows) == 0:
-
-#                 try:
-
-#                     sample = await database.fetch_one(
-
-#                         "SELECT MIN(added_date) AS min_dt, MAX(added_date) AS max_dt, "
-
-#                         "COUNT(*) AS total FROM ems_denial_complaints"
-
-#                     )
-
-#                     if sample:
-
-#                         logger.warning(
-
-#                             f"Denial worker: 0 rows for current month! "
-
-#                             f"Table has min_date={sample['min_dt']}, "
-
-#                             f"max_date={sample['max_date']}, total_rows={sample['total']}"
-
-#                         )
-
-#                 except Exception as e:
-
-#                     logger.error(f"Denial worker: sample date check failed: {e}")
-
-#                 await asyncio.sleep(10)
-
-#                 continue
-
-#             # ------------------------------------------------
-
-#             # STEP 2: Sample 3 rows ka data log karo
-
-#             # ------------------------------------------------
-
-#             for idx, r in enumerate(rows[:3]):
-
-#                 try:
-
-#                     d = dict(r)
-
-#                     logger.info(
-
-#                         f"Denial worker: sample row {idx} -> "
-
-#                         f"id={d.get('id')!r}, "
-
-#                         f"call_id={d.get('call_id')!r}, "
-
-#                         f"amb_no={d.get('amb_no')!r}, "
-
-#                         f"reason_meaning={d.get('reason_meaning')!r}, " # 👈 Changed
-
-#                         f"dst_name={d.get('dst_name')!r}, "            # 👈 Changed
-
-#                         f"added_date={d.get('added_date')!r}"
-
-#                     )
-
-#                 except Exception as e:
-
-#                     logger.error(f"Denial worker: sample log error: {e}")
-
-#             # ------------------------------------------------
-
-#             # STEP 3: Per-row processing
-
-#             # ------------------------------------------------
-
-#             inserted_count = 0
-
-#             skipped_existing = 0
-
-#             skipped_no_id = 0
-
-#             failed_insert = 0
-
-#             failed_examples = []
-
-#             for row in rows:
-
-#                 try:
-
-#                     d = dict(row)
-
-#                     mysql_id = d.get("id")
-
-#                     if not mysql_id:
-
-#                         skipped_no_id += 1
-
-#                         continue
-
-#                     # Check karo: ye mysql_id pehle se Postgres mein hai?
-
-#                     existing = await database2.fetch_one(
-
-#                         """
-
-#                         SELECT id
-
-#                         FROM denial_escalation_master
-
-#                         WHERE mysql_id = :mysql_id
-
-#                         """,
-
-#                         {"mysql_id": mysql_id}
-
-#                     )
-
-#                     if existing:
-
-#                         skipped_existing += 1
-
-#                         continue
-
-#                     # Insert karlo
-
-#                     # 👇 NAYA: meaning ki jagah reason_meaning, aur dst_name add kiya
-
-#                     params = {
-
-#                         "id": mysql_id,
-
-#                         "mysql_id": mysql_id,
-
-#                         "call_id": d.get("call_id"),
-
-#                         "amb_no": d.get("amb_no"),
-
-#                         "amb_default_mobile": d.get("amb_default_mobile"),
-
-#                         "caller_no": d.get("caller_no"),
-
-#                         "hp_name": d.get("hp_name"),
-
-#                         "challenge_val": d.get("challenge_val"),
-
-#                         "meaning": d.get("reason_meaning"),  # 👈 Ab ye text aayega ID nahi
-
-#                         "dst_name": d.get("dst_name"),       # 👈 District naam add kiya
-
-#                         "denial_remark": d.get("denial_remark"),
-
-#                         "added_by": d.get("added_by"),
-
-#                         "added_date": d.get("added_date"),
-
-#                     }
-
-#                     # pehle NOT NULL defaults lagao
-
-#                     params.update(required_defaults)
-
-#                     # ab forced defaults — alert_type = "incident deny" hamesha
-
-#                     params.update(FORCED_DEFAULTS)
-
-#                     columns = ", ".join(params.keys())
-
-#                     placeholders = ", ".join(f":{k}" for k in params.keys())
-
-#                     await database2.execute(
-
-#                         f"""
-
-#                         INSERT INTO denial_escalation_master ({columns})
-
-#                         VALUES ({placeholders})
-
-#                         """,
-
-#                         params
-
-#                     )
-
-#                     inserted_count += 1
-
-#                     # NAYA: alert_escalation_flow table me insert karo
-
-#                     try:
-
-#                         await insert_into_escalation_flow('denial', d)
-
-#                     except Exception as flow_err:
-
-#                         logger.error(f"Flow insert failed for denial: {flow_err}")
-
-#                     # 👈 Separate try/except — broadcast fail ho to insert count disturb na ho
-
-#                     try:
-
-#                         await broadcast_new_escalation(
-
-#                             call_id=d.get("call_id"),
-
-#                             denial_record={
-
-#                                 "id":                mysql_id,
-
-#                                 "mysql_id":          mysql_id,
-
-#                                 "call_id":           d.get("call_id"),
-
-#                                 "amb_no":            d.get("amb_no"),
-
-#                                 "amb_default_mobile": d.get("amb_default_mobile"),
-
-#                                 "caller_no":         d.get("caller_no"),
-
-#                                 "hp_name":           d.get("hp_name"),
-
-#                                 "challenge_val":     d.get("challenge_val"),
-
-#                                 "meaning":           d.get("reason_meaning"), # 👈 Text bheja
-
-#                                 "dst_name":          d.get("dst_name"),       # 👈 Naam bheja
-
-#                                 "denial_remark":     d.get("denial_remark"),
-
-#                                 "alert_type":        "incident denial",
-
-#                                 "added_by":          d.get("added_by"),
-
-#                                 "added_date":        d.get("added_date").isoformat() if d.get("added_date") else None,
-
-#                             },
-
-#                         )
-
-#                     except Exception as b_err:
-
-#                         logger.error(f"Denial worker: broadcast failed for id={mysql_id}: {b_err}")
-
-#                 except Exception as row_err:
-
-#                     failed_insert += 1
-
-#                     if len(failed_examples) < 5:
-
-#                         try:
-
-#                             d_err = dict(row)
-
-#                             failed_examples.append({
-
-#                                 "id": d_err.get("id"),
-
-#                                 "call_id": d_err.get("call_id"),
-
-#                                 "amb_no": d_err.get("amb_no"),
-
-#                                 "error": str(row_err),
-
-#                             })
-
-#                         except Exception:
-
-#                             failed_examples.append({"error": str(row_err)})
-
-#                     continue
-
-#             # ------------------------------------------------
-
-#             # STEP 4: Final summary
-
-#             # ------------------------------------------------
-
-#             logger.info(
-
-#                 f"Denial worker SUMMARY: "
-
-#                 f"fetched={len(rows)}, "
-
-#                 f"inserted={inserted_count}, "
-
-#                 f"existing={skipped_existing}, "
-
-#                 f"no_id={skipped_no_id}, "
-
-#                 f"failed={failed_insert}"
-
-#             )
-
-#             if failed_examples:
-
-#                 logger.warning(
-
-#                     f"Denial worker: failed insert examples -> {failed_examples}"
-
-#                 )
-
-#             if inserted_count:
-
-#                 logger.info(f"Denial worker: ✅ inserted {inserted_count} new rows")
-
-#         except Exception as e:
-
-#             logger.error(f"Denial Complaints Insert Worker Error: {e}", exc_info=True)
-
-#         await asyncio.sleep(10)
-
 async def denial_complaints_insert_worker():
-    """
-    Background worker: MySQL (ems_denial_complaints) -> Postgres (denial_escalation_master).
-    """
     logger.info(f"Denial Complaints Insert Worker STARTED (instance={_worker_instance_id})")
     while True:
         try:
@@ -1659,9 +1057,6 @@ async def denial_complaints_insert_worker():
                 continue
             required_defaults = await get_required_default_columns()
             
-            # ------------------------------------------------
-            # STEP 1: MySQL se current month rows lao (WITH JOINS)
-            # ------------------------------------------------
             query = """
                 SELECT 
                     edc.id, edc.call_id, edc.amb_no, edc.amb_default_mobile, edc.caller_no, 
@@ -1701,9 +1096,6 @@ async def denial_complaints_insert_worker():
                 await asyncio.sleep(10)
                 continue
 
-            # ------------------------------------------------
-            # STEP 2: Sample 3 rows ka data log karo
-            # ------------------------------------------------
             for idx, r in enumerate(rows[:3]):
                 try:
                     d = dict(r)
@@ -1719,9 +1111,6 @@ async def denial_complaints_insert_worker():
                 except Exception as e:
                     logger.error(f"Denial worker: sample log error: {e}")
 
-            # ------------------------------------------------
-            # STEP 3: Per-row processing
-            # ------------------------------------------------
             inserted_count = 0
             skipped_existing = 0
             skipped_no_id = 0
@@ -1760,7 +1149,6 @@ async def denial_complaints_insert_worker():
                         )
                         alert_count = count_row["cnt"] if count_row else 0
 
-                    # 1 -> LOW, 2 -> MEDIUM, 3 -> HIGH, 4+ -> CRITICAL
                     if alert_count == 0:
                         severity = "LOW"
                     elif alert_count == 1:
@@ -1770,7 +1158,6 @@ async def denial_complaints_insert_worker():
                     else:
                         severity = "CRITICAL"
 
-                    # Insert karlo
                     params = {
                         "id": mysql_id,
                         "mysql_id": mysql_id,
@@ -1842,9 +1229,6 @@ async def denial_complaints_insert_worker():
                             failed_examples.append({"error": str(row_err)})
                     continue
 
-            # ------------------------------------------------
-            # STEP 4: Final summary
-            # ------------------------------------------------
             logger.info(
                 f"Denial worker SUMMARY: "
                 f"fetched={len(rows)}, "
@@ -1867,19 +1251,11 @@ async def denial_complaints_insert_worker():
 
         await asyncio.sleep(10)
  
-    
-    ##################################################################################
-
 
 # ============================================================
 # Connection Manager
 # ============================================================
 class ConnectionManager:
-    """
-    Each connection gets its own asyncio.Queue.
-    Broadcaster pushes to all queues (non-blocking).
-    Each WS worker drains its own queue so slow clients don't block others.
-    """
     def __init__(self):
         self.active_connections: dict[WebSocket, dict] = {}
 
@@ -1905,9 +1281,6 @@ class ConnectionManager:
             return False
 
     def broadcast(self, payload: dict):
-        """Publish to Redis — ALL workers (including this one) will receive
-        via redis_subscriber and push to their local client queues.
-        This ensures cross-worker WebSocket broadcasts work correctly."""
         try:
             asyncio.create_task(publish_to_redis("central_alerts_channel", payload))
         except Exception as e:
@@ -1921,11 +1294,6 @@ manager = ConnectionManager()
 # Central Alerts Payload Helper
 # ============================================================
 async def _fetch_alerts_payload(incident_id=None, filter_date=None):
-    """
-    Fetch alerts + counts as a single payload.
-    Used for initial connect, filter requests, and broadcast updates.
-    Always returns data sorted by inc_datetime DESC (order guaranteed).
-    """
     conditions = []
     params = {}
 
@@ -1961,7 +1329,6 @@ async def _fetch_alerts_payload(incident_id=None, filter_date=None):
     today_all = [serialize_row(r) for r in rows]
     by_severity = group_by_severity(rows)
 
-    # Counts recalculated for every filter
     count_rows = await cached_query(
         f"""
         SELECT system_type, severity, COUNT(*) AS total
@@ -1995,12 +1362,8 @@ async def _fetch_alerts_payload(incident_id=None, filter_date=None):
 
 
 # ============================================================
-# Alert WebSocket Notifier (with Redis pub/sub)
+# Alert WebSocket Notifier
 # ============================================================
-# ===============================
-# ALERT CHANGE NOTIFIER
-# ===============================
-
 last_sent_updated = None
 last_sent_alert_id = None
 
@@ -2009,11 +1372,10 @@ async def alert_ws_notifier():
     global last_sent_updated, last_sent_alert_id
     print("🚀 Alert WebSocket Notifier STARTED")
     
-    last_broadcast_time = 0  # 👈 FIX: Broadcast Throttle
+    last_broadcast_time = 0
 
     while True:
         try:
-            # 👇 NAYA: Leader Lock
             if not await try_acquire_worker_leadership(NOTIFIER_WORKER_LOCK_KEY):
                 await asyncio.sleep(1)
                 continue
@@ -2051,7 +1413,6 @@ async def alert_ws_notifier():
                     last_sent_updated = last_row["updated_date"] if last_row["updated_date"] else last_row["created_date"]
                     last_sent_alert_id = last_row["alert_id"]
 
-                    # 👇 FIX: 2 second ka throttle lagao taaki burst of alerts me CPU mare nahi
                     now = time.time()
                     if now - last_broadcast_time > 2:
                         full_payload = await _fetch_alerts_payload()
@@ -2067,11 +1428,7 @@ async def alert_ws_notifier():
         await asyncio.sleep(0.5)
 
 
-# ============================================================
-# Auto-Restart Wrappers (crash recovery)
-# ============================================================
 async def run_notifier_with_restart():
-    """Wrapper that restarts alert_ws_notifier if it crashes."""
     while True:
         try:
             logger.info("Starting alert_ws_notifier...")
@@ -2085,7 +1442,6 @@ async def run_notifier_with_restart():
 
 
 async def run_worker_with_restart():
-    """Wrapper that restarts rtm_alert_insert_worker if it crashes."""
     while True:
         try:
             logger.info("Starting rtm_alert_insert_worker...")
@@ -2098,22 +1454,17 @@ async def run_worker_with_restart():
             await asyncio.sleep(5)
 
 
-# ============================================================
-# Lifespan (Startup & Shutdown)
-# ============================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global alert_worker_task, notifier_task, redis_sub_task, denial_worker_task
     global esc_bump_task, reconciliation_task
 
-    # --- STARTUP ---
     await database.connect()
     await database2.connect()
     await init_redis()
 
-    
     try:
-        firebase_admin.get_app()  # Already initialized?
+        firebase_admin.get_app()
         logger.info("Firebase Admin SDK already initialized")
     except ValueError:
         try:
@@ -2135,7 +1486,6 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    # --- SHUTDOWN ---
     for t in [alert_worker_task, notifier_task, redis_sub_task, denial_worker_task, esc_bump_task, reconciliation_task]:
         if t:
             t.cancel()
@@ -2154,9 +1504,6 @@ async def lifespan(app: FastAPI):
     logger.info("Application STOPPED")
 
 
-# ============================================================
-# FastAPI App Creation (MUST be before any @app routes)
-# ============================================================
 app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
@@ -2171,11 +1518,6 @@ router = APIRouter()
 app.include_router(router)
 
 
-# ============================================================
-# ALL API ROUTES & WEBSOCKETS BELOW
-# ============================================================
-
-# -------------------- Login API --------------------
 @app.post("/login")
 async def login_user(data: LoginRequest):
     username = data.username
@@ -2201,7 +1543,6 @@ async def login_user(data: LoginRequest):
     return {"message": "Login successful", "status": "success", "username": username, "token": token}
 
 
-# -------------------- Logout API --------------------
 @app.post("/logout")
 async def logout_user(user_id: str = Depends(verify_token)):
     update_query = """
@@ -2214,7 +1555,6 @@ async def logout_user(user_id: str = Depends(verify_token)):
     return {"message": "Logout successful", "status": "success"}
 
 
-# -------------------- Districts API --------------------
 @app.get("/api/districts", response_model=List[DistrictOut])
 async def get_districts(division_id: Optional[int] = Query(None)):
     if division_id is not None:
@@ -2242,7 +1582,6 @@ async def get_districts(division_id: Optional[int] = Query(None)):
     return districts
 
 
-# -------------------- Division API --------------------
 @app.get("/api/division", response_model=List[DivisionOut])
 async def get_divisions():
     query = """
@@ -2259,7 +1598,6 @@ async def get_divisions():
     return division
 
 
-# -------------------- Ambulance List API --------------------
 @app.get("/api/ambulance-list")
 async def get_ambulance_list():
     query = """
@@ -2290,7 +1628,6 @@ async def get_ambulance_list():
     return {"status": "success", "count": len(result), "data": result}
 
 
-# -------------------- RTM Dashboard WebSocket --------------------
 @app.websocket("/ws/rtm_dashboard")
 async def rtm_dashboard_ws(websocket: WebSocket):
     user_id = await verify_jwt_token(websocket.query_params.get("token"))
@@ -2407,6 +1744,20 @@ async def rtm_dashboard_ws(websocket: WebSocket):
 
             data = [normalize_row(r) for r in rows] if rows else []
 
+            # NEW: MySQL ems_app_login_session table se real-time MDT login status fetch karke overwrite karo
+            if data and data[0].get("ambulance_no"):
+                amb_val = normalize_vehicle_number(data[0]["ambulance_no"])
+                try:
+                    mdt_status_map = await fetch_mdt_login_status_batch([amb_val])
+                    status = mdt_status_map.get(amb_val)
+                    
+                    if status == "1":
+                        data[0]["pilot_login_out"] = "Yes"
+                    else:
+                        data[0]["pilot_login_out"] = "No"
+                except Exception as e:
+                    logger.error(f"RTM WS: Failed to fetch MDT login status for {amb_val}: {e}")
+
             if data != prev_data:
                 await websocket.send_json({"latest_records": data})
                 prev_data = data
@@ -2415,7 +1766,6 @@ async def rtm_dashboard_ws(websocket: WebSocket):
         logger.info("RTM Dashboard WebSocket disconnected")
 
 
-# -------------------- RTM Alerts WebSocket --------------------
 @app.websocket("/ws/rtm_alerts")
 async def rtm_alerts_ws(websocket: WebSocket):
     await websocket.accept()
@@ -2480,15 +1830,10 @@ async def rtm_alerts_ws(websocket: WebSocket):
         logger.info("RTM Alert WebSocket disconnected")
 
 
-# -------------------- Central Alerts WebSocket --------------------
-
-# ---- tuning knobs ----
 MAX_CONSECUTIVE_RECV_ERRORS = 5  
 RECV_ERROR_WINDOW = 10           
 
 def _bump_error(consecutive_errors: int, first_error_ts):
-    """Track error bursts so a single stray error never kills a healthy connection,
-    but a genuinely dead socket (many errors back-to-back) still gets cleaned up."""
     now = time.monotonic()
     if first_error_ts is None or now - first_error_ts > RECV_ERROR_WINDOW:
         return 1, now
@@ -2514,9 +1859,6 @@ async def central_alerts_ws(websocket: WebSocket):
     print("🔌 WebSocket client connected")
 
     try:
-        # =====================================================
-        # 1️⃣ SEND DATA ON CONNECT (TODAY DEFAULT)
-        # =====================================================
         rows = await cached_query(
             """
             SELECT c.*, af.status AS alert_flow_status
@@ -2540,9 +1882,6 @@ async def central_alerts_ws(websocket: WebSocket):
         today_all = [serialize_row(r) for r in rows]
         by_severity = group_by_severity(rows)
 
-        # ===============================
-        # COUNTS (108 / 102)
-        # ===============================
         count_rows = await cached_query(
             """
             SELECT
@@ -2584,10 +1923,6 @@ async def central_alerts_ws(websocket: WebSocket):
         })
 
         print("📤 Sent ALL_ALERTS on connect")
-
-        # =====================================================
-        # 2️⃣ TWO CONCURRENT LOOPS — real-time updates ke liye
-        # =====================================================
 
         current_filter = {}
 
@@ -2644,14 +1979,13 @@ async def central_alerts_ws(websocket: WebSocket):
                 
             return records
 
-        # 👇 NAYA: Filter aur fetch logic ko ek function me nikal diya taaki dono loops use kar sakein
         async def fetch_and_send_filtered_data(incident_id=None, filter_date=None):
             nonlocal current_filter
             
             if incident_id or filter_date:
                 current_filter = {"incident_id": incident_id, "date": filter_date}
             else:
-                current_filter = {} # Filter clear ho gaya
+                current_filter = {}
 
             conditions = []
             params = {}
@@ -2713,22 +2047,18 @@ async def central_alerts_ws(websocket: WebSocket):
             })
 
         async def drain_loop():
-            """Queue se broadcast messages nikal ke client pe bhejo."""
             while True:
                 payload = await queue.get()
                 msg_type = payload.get("type")
 
                 if msg_type == "ALL_ALERTS":
-                    # 👇 FIX: Agar user ne filter lagaya hai, toh global broadcast mat bhejo
                     if current_filter:
-                        # Filter active hai, toh usi filter ka fresh data DB se laao
                         await fetch_and_send_filtered_data(
                             incident_id=current_filter.get("incident_id"),
                             filter_date=current_filter.get("date")
                         )
                         continue
 
-                    # Agar filter nahi hai, toh normal global broadcast bhejo
                     data = payload.get("data", {})
                     records = data.get("today_all", [])
                     records = records[:1000]
@@ -2739,13 +2069,11 @@ async def central_alerts_ws(websocket: WebSocket):
                         break
 
         async def client_listener():
-            """Client se filter requests receive karo."""
             while True:
                 msg = await websocket.receive_json()
                 incident_id = msg.get("incident_id")
-                filter_date = msg.get("date")  # YYYY-MM-DD
+                filter_date = msg.get("date")
                 
-                # 👇 NAYA: Common function call karke data bhejo
                 await fetch_and_send_filtered_data(incident_id=incident_id, filter_date=filter_date)
 
         sender = asyncio.create_task(drain_loop())
@@ -2768,10 +2096,9 @@ async def central_alerts_ws(websocket: WebSocket):
     finally:
         manager.disconnect(websocket)
 
-# -------------------- Escalate API --------------------
+
 @app.put("/api/escalate/{alert_id}")
 async def escalate_alert(alert_id: int, payload: EscalateRequest):
-    """Escalate alert: escalate_status 1 -> 2, update remark and timestamps."""
     alert = await database2.fetch_one(
         """
         SELECT alert_id, escalate_status
@@ -2811,64 +2138,6 @@ async def escalate_alert(alert_id: int, payload: EscalateRequest):
     }
 
 
-# -------------------- Dashboard Overview API --------------------
-# @app.get("/api/dashboard")
-# async def dashboard_alerts_overview(
-#     range: Optional[str] = Query("today", enum=["today", "month", "all"])
-# ):
-#     date_filter = get_date_filter(range)
-
-#     total_alerts_sql = f"""
-#     SELECT
-#         COUNT(*) as total,
-#         COUNT(*) FILTER (WHERE system_type='108') as system_108,
-#         COUNT(*) FILTER (WHERE system_type='102') as system_102
-#     FROM public.central_alerts
-#     WHERE is_deleted = false
-#     AND {date_filter}
-#     """
-#     total_alerts = await database2.fetch_one(total_alerts_sql)
-
-#     escalated_sql = f"""
-#     SELECT
-#         COUNT(*) as total,
-#         COUNT(*) FILTER (WHERE system_type='108') as system_108,
-#         COUNT(*) FILTER (WHERE system_type='102') as system_102
-#     FROM public.central_alerts
-#     WHERE is_deleted = false
-#     AND escalate_status = '2'
-#     AND {date_filter}
-#     """
-#     escalated_alerts = await database2.fetch_one(escalated_sql)
-
-#     severity_sql = f"""
-#     SELECT
-#         severity,
-#         COUNT(*) FILTER (WHERE system_type='108') as system_108,
-#         COUNT(*) FILTER (WHERE system_type='102') as system_102
-#     FROM public.central_alerts
-#     WHERE is_deleted = false
-#     AND {date_filter}
-#     GROUP BY severity
-#     ORDER BY severity
-#     """
-#     severity_rows = await database2.fetch_all(severity_sql)
-
-#     severity_data = [
-#         {
-#             "severity": row["severity"],
-#             "system_108": row["system_108"],
-#             "system_102": row["system_102"]
-#         }
-#         for row in severity_rows
-#     ]
-
-#     return {
-#         "total_alerts": dict(total_alerts),
-#         "escalated_alerts": dict(escalated_alerts),
-#         "severity_timeline": severity_data
-#     }
-
 @app.get("/api/dashboard")
 async def dashboard_alerts_overview(
     range: Optional[str] = Query("today", enum=["today", "month", "all"])
@@ -2881,9 +2150,6 @@ async def dashboard_alerts_overview(
     else:
         denial_date_filter = "1=1"
  
-    # --------------------------------------------------------
-    # 1. CENTRAL ALERTS (Pehle jaisa)
-    # --------------------------------------------------------
     total_alerts_sql = f"""
     SELECT
         COUNT(*) as total,
@@ -2931,10 +2197,6 @@ async def dashboard_alerts_overview(
         for row in severity_rows
     ]
  
-    # --------------------------------------------------------
-    # 2. DENIAL RECORDS (NAYA: Distinct call_id count karega)
-    # --------------------------------------------------------
-    # Total Denials (Distinct call_id)
     denial_total_sql = f"""
     SELECT COUNT(DISTINCT call_id) as total
     FROM public.denial_escalation_master
@@ -2944,7 +2206,6 @@ async def dashboard_alerts_overview(
     denial_total = await database2.fetch_one(denial_total_sql)
     denial_count = denial_total["total"] or 0 if denial_total else 0
  
-    # Escalated Denials (Distinct call_id where status = 2)
     denial_escalated_sql = f"""
     SELECT COUNT(DISTINCT call_id) as total
     FROM public.denial_escalation_master
@@ -2955,18 +2216,15 @@ async def dashboard_alerts_overview(
     denial_escalated = await database2.fetch_one(denial_escalated_sql)
     denial_escalated_count = denial_escalated["total"] or 0 if denial_escalated else 0
  
-    # --------------------------------------------------------
-    # 3. FINAL COMBINED DATA (Dono table ka sum)
-    # --------------------------------------------------------
     final_total = {
         "total": total_alerts["total"] + denial_count,
-        "system_108": total_alerts["system_108"] + denial_count,  # 👈 Denial 108 me add hoga
+        "system_108": total_alerts["system_108"] + denial_count,
         "system_102": total_alerts["system_102"]
     }
  
     final_escalated = {
         "total": escalated_alerts["total"] + denial_escalated_count,
-        "system_108": escalated_alerts["system_108"] + denial_escalated_count, # 👈 Escalated denial 108 me add hoga
+        "system_108": escalated_alerts["system_108"] + denial_escalated_count,
         "system_102": escalated_alerts["system_102"]
     }
  
@@ -2977,516 +2235,19 @@ async def dashboard_alerts_overview(
     }
 
 
-# -------------------- Excel Report Download API --------------------
-# @app.get("/api/dashboard/download-client-report")
-# async def download_client_report(
-#     range_type: str = Query("today", enum=["today", "month", "all"])
-# ):
-#     date_filter = get_date_filter(range_type)
-
-#     full_sql = f"""
-#     SELECT *
-#     FROM public.central_alerts
-#     WHERE is_deleted = false
-#     AND {date_filter}
-#     ORDER BY created_date DESC
-#     """
-#     rows = await database2.fetch_all(full_sql)
-
-#     df = pd.DataFrame([dict(r) for r in rows]) if rows else pd.DataFrame()
-
-#     if not df.empty:
-#         df.insert(0, "Sr No", list(range(1, len(df) + 1)))
-
-#         escalation_map = {
-#             "0": "Open",
-#             "1": "In Progress",
-#             "2": "Escalated",
-#             "3": "Closed"
-#         }
-
-#         if "escalate_status" in df.columns:
-#             df["Escalation Status"] = df["escalate_status"].astype(str).map(escalation_map)
-#             df.drop(columns=["escalate_status"], inplace=True)
-
-#         if "is_deleted" in df.columns:
-#             df.drop(columns=["is_deleted"], inplace=True)
-
-#         date_cols = ["created_date", "updated_date", "cancel_date", "escalated_date"]
-#         for col in date_cols:
-#             if col in df.columns:
-#                 df[col] = pd.to_datetime(df[col], errors="coerce").dt.strftime("%d-%m-%Y %H:%M")
-
-#         rename_map = {
-#             "severity": "Severity",
-#             "created_date": "Created Date & Time",
-#             "updated_date": "Updated Date & Time",
-#             "division": "Division",
-#             "district": "District",
-#             "inc_latitude": "Incidence Latitude",
-#             "inc_longitude": "Incidence Longitude",
-#             "amb_lat": "Ambulance Lattitude",
-#             "amb_long": "Ambulance Longitude",
-#             "paramedic_name": "EMT Name",
-#             "paramedic_mobile": "EMT Mobile",
-#             "inc_datetime": "Incidence Datetime",
-#             "alert_type": "Alert Type",
-#             "incident_id": "Incident Id",
-#             "ambulance_no": "Ambulance Number",
-#             "remark": "Remark",
-#             "escalated_deny_remark": "Escalated/Deny Remark",
-#             "pilot_name": "Pilot Name",
-#             "pilot_mobile": "Pilot Mobile",
-#             "escalated_date": "Escalated Date",
-#             "cancel_date": "Cancel Date",
-#             "escalated_by": "Escalated By",
-#             "cancel_by": "Cancel By",
-#             "Escalation Status": "Escalation Status",
-#             "system_type": "System Type",
-#             "alert_id": "Alert ID",
-#             "Sr No": "Sr No",
-#         }
-
-#         df.rename(columns=rename_map, inplace=True)
-
-#         column_order = [
-#             "Sr No", "Alert ID", "Alert Type", "System Type", "Severity",
-#             "Incident Id", "Incidence Datetime", "Division", "District",
-#             "Incidence Latitude", "Incidence Longitude", "Ambulance Number",
-#             "Ambulance Lattitude", "Ambulance Longitude", "Pilot Name",
-#             "Pilot Mobile", "EMT Name", "EMT Mobile",
-#             "Created Date & Time", "Updated Date & Time",
-#             "Escalation Status", "Escalated Date", "Escalated By",
-#             "Escalated/Deny Remark", "Cancel Date", "Cancel By", "Remark",
-#         ]
-
-#         existing_ordered_cols = [c for c in column_order if c in df.columns]
-#         remaining_cols = [c for c in df.columns if c not in existing_ordered_cols]
-#         df = df[existing_ordered_cols + remaining_cols]
-#     else:
-#         df = pd.DataFrame([{"Message": "No Data Found"}])
-
-#     summary_sql = f"""
-#     SELECT
-#         COUNT(*) as total_alerts,
-#         COUNT(*) FILTER (WHERE escalate_status='2') as escalated_alerts,
-#         COUNT(*) FILTER (WHERE system_type='108') as system_108
-#     FROM public.central_alerts
-#     WHERE is_deleted = false
-#     AND {date_filter}
-#     """
-#     summary_row = await database2.fetch_one(summary_sql)
-#     df_summary = pd.DataFrame([dict(summary_row)]) if summary_row else pd.DataFrame()
-
-#     summary_rename_map = {
-#         "total_alerts": "Total Alerts",
-#         "escalated_alerts": "Escalated Alerts",
-#         "system_108": "System 108"
-#     }
-#     if not df_summary.empty:
-#         df_summary.rename(columns=summary_rename_map, inplace=True)
-
-#     output = io.BytesIO()
-#     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-#         df.to_excel(writer, sheet_name="All Alert Records", index=False)
-#         df_summary.to_excel(writer, sheet_name="Summary", index=False)
-#         workbook = writer.book
-#         format_worksheet(workbook["All Alert Records"])
-#         format_worksheet(workbook["Summary"])
-
-#     output.seek(0)
-#     file_name = f"Central_Alerts_Client_Report_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
-
-#     return StreamingResponse(
-#         output,
-#         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-#         headers={"Content-Disposition": f"attachment; filename={file_name}"}
-#     )
-##########################################################################################
-##########################################################################
-# @app.get("/api/dashboard/download-client-report")
-
-# async def download_client_report(
-
-#     range_type: str = Query("today", enum=["today", "month", "all"])
-
-# ):
-
-#     # 1. Central Alerts ke liye date filter
-
-#     date_filter = get_date_filter(range_type)
-
-#     # 2. Denial Alerts ke liye alag date filter (kyunki column naam 'added_date' hai)
-
-#     if range_type == "today":
-
-#         denial_date_filter = "DATE(added_date) = CURRENT_DATE"
-
-#     elif range_type == "month":
-
-#         denial_date_filter = "DATE_TRUNC('month', added_date) = DATE_TRUNC('month', CURRENT_DATE)"
-
-#     else:
-
-#         denial_date_filter = "1=1"
- 
-#     # --------------------------------------------------------
-
-#     # 1. FETCH CENTRAL ALERTS
-
-#     # --------------------------------------------------------
-
-#     full_sql = f"""
-
-#     SELECT *
-
-#     FROM public.central_alerts
-
-#     WHERE is_deleted = false
-
-#     AND {date_filter}
-
-#     ORDER BY created_date DESC
-
-#     """
-
-#     rows = await database2.fetch_all(full_sql)
- 
-#     df = pd.DataFrame([dict(r) for r in rows]) if rows else pd.DataFrame()
- 
-#     if not df.empty:
-
-#         df.insert(0, "Sr No", list(range(1, len(df) + 1)))
- 
-#         escalation_map = {
-
-#             "0": "Open",
-
-#             "1": "In Progress",
-
-#             "2": "Escalated",
-
-#             "3": "Closed"
-
-#         }
- 
-#         if "escalate_status" in df.columns:
-
-#             df["Escalation Status"] = df["escalate_status"].astype(str).map(escalation_map)
-
-#             df.drop(columns=["escalate_status"], inplace=True)
- 
-#         if "is_deleted" in df.columns:
-
-#             df.drop(columns=["is_deleted"], inplace=True)
- 
-#         date_cols = ["created_date", "updated_date", "cancel_date", "escalated_date"]
-
-#         for col in date_cols:
-
-#             if col in df.columns:
-
-#                 df[col] = pd.to_datetime(df[col], errors="coerce").dt.strftime("%d-%m-%Y %H:%M")
- 
-#         rename_map = {
-
-#             "severity": "Severity",
-
-#             "created_date": "Created Date & Time",
-
-#             "updated_date": "Updated Date & Time",
-
-#             "division": "Division",
-
-#             "district": "District",
-
-#             "inc_latitude": "Incidence Latitude",
-
-#             "inc_longitude": "Incidence Longitude",
-
-#             "amb_lat": "Ambulance Lattitude",
-
-#             "amb_long": "Ambulance Longitude",
-
-#             "paramedic_name": "EMT Name",
-
-#             "paramedic_mobile": "EMT Mobile",
-
-#             "inc_datetime": "Incidence Datetime",
-
-#             "alert_type": "Alert Type",
-
-#             "incident_id": "Incident Id",
-
-#             "ambulance_no": "Ambulance Number",
-
-#             "remark": "Remark",
-
-#             "escalated_deny_remark": "Escalated/Deny Remark",
-
-#             "pilot_name": "Pilot Name",
-
-#             "pilot_mobile": "Pilot Mobile",
-
-#             "escalated_date": "Escalated Date",
-
-#             "cancel_date": "Cancel Date",
-
-#             "escalated_by": "Escalated By",
-
-#             "cancel_by": "Cancel By",
-
-#             "Escalation Status": "Escalation Status",
-
-#             "system_type": "System Type",
-
-#             "alert_id": "Alert ID",
-
-#             "Sr No": "Sr No",
-
-#         }
- 
-#         df.rename(columns=rename_map, inplace=True)
- 
-#         column_order = [
-
-#             "Sr No", "Alert ID", "Alert Type", "System Type", "Severity",
-
-#             "Incident Id", "Incidence Datetime", "Division", "District",
-
-#             "Incidence Latitude", "Incidence Longitude", "Ambulance Number",
-
-#             "Ambulance Lattitude", "Ambulance Longitude", "Pilot Name",
-
-#             "Pilot Mobile", "EMT Name", "EMT Mobile",
-
-#             "Created Date & Time", "Updated Date & Time",
-
-#             "Escalation Status", "Escalated Date", "Escalated By",
-
-#             "Escalated/Deny Remark", "Cancel Date", "Cancel By", "Remark",
-
-#         ]
- 
-#         existing_ordered_cols = [c for c in column_order if c in df.columns]
-
-#         remaining_cols = [c for c in df.columns if c not in existing_ordered_cols]
-
-#         df = df[existing_ordered_cols + remaining_cols]
-
-#     else:
-
-#         df = pd.DataFrame([{"Message": "No Incident Alert Data Found"}])
- 
- 
-#      # --------------------------------------------------------
-#     # 2. FETCH DENIAL RECORDS (NAYA SHEET KE LIYE)
-#     # --------------------------------------------------------
-#     denial_sql = f"""
-#     SELECT id, mysql_id, call_id, amb_no, amb_default_mobile, caller_no,
-#            hp_name, challenge_val, meaning, denial_remark, remark, dst_name,
-#            alert_type, added_by, added_date, escalate_status
-#     FROM public.denial_escalation_master
-#     WHERE (is_deleted = FALSE OR is_deleted IS NULL)
-#     AND {denial_date_filter}
-#     ORDER BY added_date DESC
-#     """
- 
-#     denial_rows = await database2.fetch_all(denial_sql)
-#     df_denial = pd.DataFrame([dict(r) for r in denial_rows]) if denial_rows else pd.DataFrame()
- 
-#     if not df_denial.empty:
-#         df_denial.insert(0, "Sr No", list(range(1, len(df_denial) + 1)))
- 
-#         denial_escalation_map = {
-#             "0": "Open",
-#             "1": "In Progress",
-#             "2": "Escalated",
-#             "3": "Closed"
-#         }
- 
-#         if "escalate_status" in df_denial.columns:
-#             df_denial["Escalation Status"] = df_denial["escalate_status"].astype(str).map(denial_escalation_map)
-#             df_denial.drop(columns=["escalate_status"], inplace=True)
- 
-#         if "added_date" in df_denial.columns:
-#             df_denial["Added Date & Time"] = pd.to_datetime(df_denial["added_date"], errors="coerce").dt.strftime("%d-%m-%Y %H:%M")
-#             df_denial.drop(columns=["added_date"], inplace=True)
- 
-#         if "mysql_id" in df_denial.columns:
-#             df_denial.drop(columns=["mysql_id"], inplace=True)
- 
-#         denial_rename_map = {
-#             "Sr No": "Sr No",
-#             "id": "Denial ID",
-#             "call_id": "Call ID",
-#             "amb_no": "Ambulance Number",
-#             "amb_default_mobile": "Ambulance Mobile",
-#             "caller_no": "Caller No",
-#             "hp_name": "Hospital Name",
-#             "challenge_val": "Challenge",
-#             "meaning": "Denial Reason",
-#             "denial_remark": "Denial Remark",
-#             "remark": "Action Remark",                        # ✅ NAYA
-#             "dst_name": "District",
-#             "alert_type": "Alert Type",
-#             "added_by": "Added By",
-#             "Added Date & Time": "Added Date & Time",
-#             "Escalation Status": "Escalation Status"
-#         }
- 
-#         df_denial.rename(columns=denial_rename_map, inplace=True)
- 
-#         denial_column_order = [
-#             "Sr No", "Denial ID", "Call ID", "Ambulance Number", "Ambulance Mobile",
-#             "Caller No", "Hospital Name", "Challenge", "Denial Reason",
-#             "Denial Remark", "District", "Alert Type", "Added By",
-#             "Added Date & Time", "Escalation Status", "Action Remark",
-#         ]
- 
-#         denial_ordered_cols = [c for c in denial_column_order if c in df_denial.columns]
-#         denial_remaining_cols = [c for c in df_denial.columns if c not in denial_ordered_cols]
-#         df_denial = df_denial[denial_ordered_cols + denial_remaining_cols]
- 
-#     else:
-#         df_denial = pd.DataFrame([{"Message": "No Call Denial Data Found"}])
- 
- 
-#     # --------------------------------------------------------
-
-#     # 3. COMBINED SUMMARY CALCULATIONS
-
-#     # --------------------------------------------------------
-
-#     # Central Counts
-
-#     summary_sql = f"""
-
-#     SELECT
-
-#         COUNT(*) as total_alerts,
-
-#         COUNT(*) FILTER (WHERE escalate_status='2') as escalated_alerts,
-
-#         COUNT(*) FILTER (WHERE system_type='108') as system_108
-
-#     FROM public.central_alerts
-
-#     WHERE is_deleted = false
-
-#     AND {date_filter}
-
-#     """
-
-#     summary_row = await database2.fetch_one(summary_sql)
-
-#     summary_data = dict(summary_row) if summary_row else {"total_alerts": 0, "escalated_alerts": 0, "system_108": 0}
- 
-#     # Denial Counts (Distinct call_id)
-
-#     denial_summary_sql = f"""
-
-#     SELECT
-
-#         COUNT(DISTINCT call_id) as denial_total,
-
-#         COUNT(DISTINCT call_id) FILTER (WHERE escalate_status='2') as denial_escalated
-
-#     FROM public.denial_escalation_master
-
-#     WHERE (is_deleted = FALSE OR is_deleted IS NULL)
-
-#     AND {denial_date_filter}
-
-#     """
-
-#     denial_summary_row = await database2.fetch_one(denial_summary_sql)
-
-#     denial_summary_data = dict(denial_summary_row) if denial_summary_row else {"denial_total": 0, "denial_escalated": 0}
- 
-#     # Final Summary DataFrame
-
-#     final_summary = {
-
-#         "Total Incident Alerts": summary_data.get("total_alerts", 0),
-
-#         "Total Call Denial Alerts (Distinct Call ID)": denial_summary_data.get("denial_total", 0),
-
-#         "Grand Total (Incident + Denial)": summary_data.get("total_alerts", 0) + denial_summary_data.get("denial_total", 0),
-
-#         "Escalated Incident Alerts": summary_data.get("escalated_alerts", 0),
-
-#         "Escalated Call Denial Alerts": denial_summary_data.get("denial_escalated", 0),
-
-#         "Total System 108 (Incident + Denial)": summary_data.get("system_108", 0) + denial_summary_data.get("denial_total", 0)
-
-#     }
-
-#     df_summary = pd.DataFrame([final_summary])
- 
- 
-#     # --------------------------------------------------------
-
-#     # 4. EXCEL GENERATION WITH MULTIPLE SHEETS
-
-#     # --------------------------------------------------------
-
-#     output = io.BytesIO()
-
-#     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-
-#         # 👇 Sheet 1 ka naam change kiya gaya hai
-
-#         df.to_excel(writer, sheet_name="Incident Alerts", index=False)
-
-#         # 👇 Sheet 2 ka naam change kiya gaya hai
-
-#         df_denial.to_excel(writer, sheet_name="Call Denial Alerts", index=False)
-
-#         df_summary.to_excel(writer, sheet_name="Summary", index=False)
-
-#         workbook = writer.book
-
-#         # 👇 Yahan bhi same naam use karna padega
-
-#         format_worksheet(workbook["Incident Alerts"])
-
-#         format_worksheet(workbook["Call Denial Alerts"])
-
-#         format_worksheet(workbook["Summary"])
- 
-#     output.seek(0)
-
-#     file_name = f"Central_Alerts_Client_Report_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
- 
-#     return StreamingResponse(
-
-#         output,
-
-#         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-
-#         headers={"Content-Disposition": f"attachment; filename={file_name}"}
-
-#     )
- 
-#################################################################################################
 @app.get("/api/dashboard/download-client-report")
 async def download_client_report(
     range_type: str = Query("today", enum=["today", "month", "all"])
 ):
-    # 1. Central Alerts ke liye date filter
     date_filter = get_date_filter(range_type)
  
-    # 2. Denial Alerts ke liye alag date filter (kyunki column naam 'added_date' hai)
     if range_type == "today":
         denial_date_filter = "DATE(added_date) = CURRENT_DATE"
     elif range_type == "month":
         denial_date_filter = "DATE_TRUNC('month', added_date) = DATE_TRUNC('month', CURRENT_DATE)"
     else:
         denial_date_filter = "1=1"
-    # --------------------------------------------------------
-    # 1. FETCH CENTRAL ALERTS
-    # --------------------------------------------------------
+        
     full_sql = f"""
     SELECT *,
            CASE 
@@ -3504,9 +2265,7 @@ async def download_client_report(
     """
  
     rows = await database2.fetch_all(full_sql)
-    # --------------------------------------------------------
-    # 2. FETCH DENIAL RECORDS (NAYA SHEET KE LIYE)
-    # --------------------------------------------------------
+
     denial_sql = f"""
     SELECT id, mysql_id, call_id, amb_no, amb_default_mobile, caller_no,
            hp_name, challenge_val, meaning, denial_remark, remark, dst_name,
@@ -3517,9 +2276,7 @@ async def download_client_report(
     ORDER BY added_date DESC
     """
     denial_rows = await database2.fetch_all(denial_sql)
-    # --------------------------------------------------------
-    # 3. COMBINED SUMMARY CALCULATIONS
-    # --------------------------------------------------------
+
     summary_sql = f"""
     SELECT
         COUNT(*) as total_alerts,
@@ -3531,6 +2288,7 @@ async def download_client_report(
     """
     summary_row = await database2.fetch_one(summary_sql)
     summary_data = dict(summary_row) if summary_row else {"total_alerts": 0, "escalated_alerts": 0, "system_108": 0}
+    
     denial_summary_sql = f"""
     SELECT
         COUNT(DISTINCT call_id) as denial_total,
@@ -3541,6 +2299,7 @@ async def download_client_report(
     """
     denial_summary_row = await database2.fetch_one(denial_summary_sql)
     denial_summary_data = dict(denial_summary_row) if denial_summary_row else {"denial_total": 0, "denial_escalated": 0}
+    
     final_summary = {
         "Total Incident Alerts": summary_data.get("total_alerts", 0),
         "Total Call Denial Alerts (Distinct Call ID)": denial_summary_data.get("denial_total", 0),
@@ -3550,10 +2309,7 @@ async def download_client_report(
         "Total System 108 (Incident + Denial)": summary_data.get("system_108", 0) + denial_summary_data.get("denial_total", 0)
     }
     df_summary = pd.DataFrame([final_summary])
-    # --------------------------------------------------------
-    # 4. EXCEL GENERATION WITH MULTIPLE SHEETS (Wrapped in Thread)
-    # --------------------------------------------------------
-    # Synchronous function jo Excel banayega (Tera exact original logic)
+
     def generate_excel_sync():
         df = pd.DataFrame([dict(r) for r in rows]) if rows else pd.DataFrame()
         if not df.empty:
@@ -3569,7 +2325,6 @@ async def download_client_report(
                 df.drop(columns=["escalate_status"], inplace=True)
             if "is_deleted" in df.columns:
                 df.drop(columns=["is_deleted"], inplace=True)
-            # Naye column ka datetime format
             if "alert_closed_datetime" in df.columns:
                 df["alert_closed_datetime"] = pd.to_datetime(df["alert_closed_datetime"], errors="coerce").dt.strftime("%d-%m-%Y %H:%M")
  
@@ -3579,7 +2334,7 @@ async def download_client_report(
                     df[col] = pd.to_datetime(df[col], errors="coerce").dt.strftime("%d-%m-%Y %H:%M")
             rename_map = {
                 "severity": "Severity",
-                "created_date": "Alert Generated Date",          # ✅ Renamed
+                "created_date": "Alert Generated Date",          
                 "updated_date": "Updated Date & Time",
                 "division": "Division",
                 "district": "District",
@@ -3605,7 +2360,7 @@ async def download_client_report(
                 "system_type": "System Type",
                 "alert_id": "Alert ID",
                 "Sr No": "Sr No",
-                "alert_closed_datetime": "Alert Closed Datetime",  # ✅ Naya Column
+                "alert_closed_datetime": "Alert Closed Datetime", 
             }
             df.rename(columns=rename_map, inplace=True)
             column_order = [
@@ -3614,8 +2369,8 @@ async def download_client_report(
                 "Incidence Latitude", "Incidence Longitude", "Ambulance Number",
                 "Ambulance Lattitude", "Ambulance Longitude", "Pilot Name",
                 "Pilot Mobile", "EMT Name", "EMT Mobile",
-                "Alert Generated Date",          # ✅ Renamed
-                "Alert Closed Datetime",         # ✅ Naya Column Add
+                "Alert Generated Date",          
+                "Alert Closed Datetime",         
                 "Updated Date & Time",
                 "Escalation Status", "Escalated Date", "Escalated By",
                 "Escalated/Deny Remark", "Cancel Date", "Cancel By", "Remark",
@@ -3625,6 +2380,7 @@ async def download_client_report(
             df = df[existing_ordered_cols + remaining_cols]
         else:
             df = pd.DataFrame([{"Message": "No Incident Alert Data Found"}])
+            
         df_denial = pd.DataFrame([dict(r) for r in denial_rows]) if denial_rows else pd.DataFrame()
         if not df_denial.empty:
             df_denial.insert(0, "Sr No", list(range(1, len(df_denial) + 1)))
@@ -3653,7 +2409,7 @@ async def download_client_report(
                 "challenge_val": "Challenge",
                 "meaning": "Denial Reason",
                 "denial_remark": "Denial Remark",
-                "remark": "Action Remark",                        # ✅ NAYA
+                "remark": "Action Remark",                        
                 "dst_name": "District",
                 "alert_type": "Alert Type",
                 "added_by": "Added By",
@@ -3672,21 +2428,18 @@ async def download_client_report(
             df_denial = df_denial[denial_ordered_cols + denial_remaining_cols]
         else:
             df_denial = pd.DataFrame([{"Message": "No Call Denial Data Found"}])
+            
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine="openpyxl") as writer:
-            # 👇 Sheet 1 ka naam change kiya gaya hai
             df.to_excel(writer, sheet_name="Incident Alerts", index=False)
-            # 👇 Sheet 2 ka naam change kiya gaya hai
             df_denial.to_excel(writer, sheet_name="Call Denial Alerts", index=False)
             df_summary.to_excel(writer, sheet_name="Summary", index=False)
             workbook = writer.book
-            # 👇 Yahan bhi same naam use karna padega
             format_worksheet(workbook["Incident Alerts"])
             format_worksheet(workbook["Call Denial Alerts"])
             format_worksheet(workbook["Summary"])
         return output.getvalue()
  
-    # 🚀 Run heavy synchronous code in a separate thread to avoid blocking FastAPI server
     excel_bytes = await asyncio.to_thread(generate_excel_sync)
     file_name = f"Central_Alerts_Client_Report_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
     return StreamingResponse(
@@ -3694,8 +2447,8 @@ async def download_client_report(
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f"attachment; filename={file_name}"}
     )
-###################################################################################
-# -------------------- Severity Update API --------------------
+
+
 @app.put("/api/severity")
 async def update_severity(data: SeverityUpdate):
     await database2.execute(
@@ -3710,7 +2463,6 @@ async def update_severity(data: SeverityUpdate):
     return {"message": "updated"}
 
 
-# -------------------- Cancel Alert API --------------------
 @app.put("/api/cancel")
 async def cancel_alert(data: CancelUpdate):
     await database2.execute(
@@ -3732,7 +2484,6 @@ async def cancel_alert(data: CancelUpdate):
     return {"message": "Alert cancelled successfully"}
 
 
-# -------------------- Top Ambulances WebSocket --------------------
 @app.websocket("/ws/top-ambulances")
 async def ws_top_ambulances(websocket: WebSocket):
     await websocket.accept()
@@ -3805,7 +2556,6 @@ async def ws_top_ambulances(websocket: WebSocket):
         await websocket.close()
 
 
-# -------------------- Alert Thresholds API --------------------
 @app.get("/api/alert-thresholds")
 async def get_alert_thresholds():
     query = """
@@ -3869,10 +2619,8 @@ async def update_alert_threshold(id: int, data: AlertThresholdUpdate):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# -------------------- Health Check Endpoint --------------------
 @app.get("/health")
 async def health_check():
-    """Health check for load balancers and monitoring."""
     try:
         await database2.fetch_one("SELECT 1")
         db_status = "ok"
@@ -3903,230 +2651,8 @@ async def health_check():
         "timestamp": datetime.now(ist).isoformat()
     }
 
-####################################################################################################
-# def group_by_call_id(records: list[dict]) -> list[dict]:
-#     """Same call_id wale records ko ek hi group/array mein daal deta hai."""
-#     grouped = {}
-#     for r in records:
-#         cid = r.get("call_id")
-#         grouped.setdefault(cid, []).append(r)
-
-#     return [{"call_id": cid, "records": recs} for cid, recs in grouped.items()]
-
-
-# @app.websocket("/ws/denial_alerts")
-# async def websocket_escalation_alerts(websocket: WebSocket):
-#     """Sirf naya record add hone par hit hoga."""
-
-#     await websocket.accept()
-
-#     active_ids = set()
-
-#     try:
-#         query = """
-#             SELECT *
-#             FROM denial_escalation_master
-#             WHERE escalate_status = '1' 
-#             AND (is_deleted = FALSE OR is_deleted IS NULL)
-#             ORDER BY added_date DESC;
-#         """
-
-#         rows = await database2.fetch_all(query)
-#         initial_data = []
-
-#         for row in rows:
-#             d = dict(row)
-#             for k, v in d.items():
-#                 if isinstance(v, datetime):
-#                     d[k] = v.isoformat()
-#             initial_data.append(d)
-#             active_ids.add(d["id"])  # Current IDs track kar lo
-
-#         if initial_data:
-#             grouped_initial = group_by_call_id(initial_data)
-#             await websocket.send_json({
-#                 "type": "INITIAL_LOAD",
-#                 "data": grouped_initial
-#             })
-
-#         # ---------------------------------------------------------
-#         # STEP 2: Loop to check for NEW records
-#         # ---------------------------------------------------------
-#         while True:
-#             await asyncio.sleep(5)  # Har 5 second mein DB check karo
-
-#             current_rows = await database2.fetch_all(query)
-#             current_data = []
-#             current_ids = set()
-
-#             for row in current_rows:
-#                 d = dict(row)
-#                 for k, v in d.items():
-#                     if isinstance(v, datetime):
-#                         d[k] = v.isoformat()
-#                 current_data.append(d)
-#                 current_ids.add(d["id"])
-
-#             # Naye records find karo (jo active_ids mein nahi the)
-#             new_records = [d for d in current_data if d["id"] not in active_ids]
-
-#             # Agar naya record add hua hai tohi WS hit karo — call_id se group karke bhejo
-#             if new_records:
-#                 grouped_new = group_by_call_id(new_records)
-#                 await websocket.send_json(grouped_new)
-
-#             # Active IDs ko update karo
-#             active_ids = current_ids
-
-#     except WebSocketDisconnect:
-#         print("Frontend disconnected from WebSocket")
-#     except Exception as e:
-#         print(f"WebSocket Error: {e}")
-#         await websocket.close()
-
-
-# def group_by_call_id(records: list[dict]) -> list[dict]:
-#     """Same call_id wale records ko ek hi group/array mein daal deta hai,
-#     aur added_date ke hisaab se sabse latest sabse upar rakhta hai."""
-
-#     def parse_date(rec):
-#         val = rec.get("added_date")
-#         if isinstance(val, str):
-#             try:
-#                 return datetime.fromisoformat(val)
-#             except (ValueError, TypeError):
-#                 return datetime.min
-#         elif isinstance(val, datetime):
-#             return val
-#         return datetime.min
-
-#     grouped = {}
-#     for r in records:
-#         cid = r.get("call_id")
-#         grouped.setdefault(cid, []).append(r)
-
-#     result = []
-#     for cid, recs in grouped.items():
-#         recs_sorted = sorted(recs, key=parse_date, reverse=True)
-#         result.append({"call_id": cid, "records": recs_sorted})
-
-#     result.sort(key=lambda g: parse_date(g["records"][0]), reverse=True)
-
-#     return result
-
-
-# async def fetch_current_data(query) -> list[dict]:
-#     """DB se current active (status=1, not deleted, aaj ke) records nikaal kar
-#     JSON-safe dict list return karta hai."""
-#     rows = await database2.fetch_all(query)
-#     data = []
-#     for row in rows:
-#         d = dict(row)
-#         for k, v in d.items():
-#             if isinstance(v, datetime):
-#                 d[k] = v.isoformat()
-#         data.append(d)
-#     return data
-
-
-# @app.websocket("/ws/denial_alerts")
-# async def websocket_escalation_alerts(websocket: WebSocket):
-#     """Har baar poori current list (status=1, not deleted, aaj ke) bhejta hai,
-#     latest added_date sabse upar. Status 2 hote hi record apne aap
-#     list se hat jata hai kyunki wo query mein aata hi nahi.
-#     DB mein koi bhi change hote hi (LISTEN/NOTIFY) turant push hoga.
-#     Existing database2 pool se hi connection liya ja raha hai."""
-
-#     await websocket.accept()
-
-#     last_sent_ids: set = set()
-#     notify_event = asyncio.Event()
-#     db_connection = None   # databases.Connection wrapper
-#     raw_conn = None        # underlying asyncpg connection (LISTEN ke liye)
-
-#     query = """
-#         SELECT *
-#         FROM denial_escalation_master
-#         WHERE escalate_status = '1' 
-#         AND (is_deleted = FALSE OR is_deleted IS NULL)
-#         AND added_date::date = CURRENT_DATE
-#         ORDER BY added_date DESC;
-#     """
-
-#     async def send_if_changed():
-#         """Latest data nikaal kar bhejta hai, sirf agar kuch change hua ho."""
-#         nonlocal last_sent_ids
-#         current_data = await fetch_current_data(query)
-#         current_ids = {d["id"] for d in current_data}
-
-#         if current_ids != last_sent_ids:
-#             grouped_current = group_by_call_id(current_data)
-#             await websocket.send_json({
-#                 "type": "INITIAL_LOAD",
-#                 "data": grouped_current
-#             })
-#             last_sent_ids = current_ids
-
-#     def on_notify(conn, pid, channel, payload):
-#         # DB se turant signal aata hai idhar (INSERT/UPDATE/DELETE hote hi)
-#         notify_event.set()
-
-#     try:
-#         # ---------------------------------------------------------
-#         # STEP 1: Initial load
-#         # ---------------------------------------------------------
-#         initial_data = await fetch_current_data(query)
-#         last_sent_ids = {d["id"] for d in initial_data}
-
-#         grouped_initial = group_by_call_id(initial_data)
-#         await websocket.send_json({
-#             "type": "INITIAL_LOAD",
-#             "data": grouped_initial
-#         })
-
-#         # ---------------------------------------------------------
-#         # STEP 2: database2 ke pool se hi ek connection nikaalo
-#         # aur uska raw asyncpg connection le kar LISTEN lagao
-#         # ---------------------------------------------------------
-#         db_connection = database2.connection()
-#         await db_connection.__aenter__()          # connection open karo (pool se)
-#         raw_conn = db_connection.raw_connection    # underlying asyncpg.Connection
-#         await raw_conn.add_listener("denial_escalation_channel", on_notify)
-
-#         # ---------------------------------------------------------
-#         # STEP 3: Jab bhi DB mein change ho (ya safety-net timeout),
-#         # turant fresh data check karke bhejo
-#         # ---------------------------------------------------------
-#         while True:
-#             try:
-#                 # Notify ka wait — DB change hote hi ye turant trigger hoga
-#                 await asyncio.wait_for(notify_event.wait(), timeout=30)
-#             except asyncio.TimeoutError:
-#                 pass  # 30 sec safety-net poll, agar kabhi notify miss ho jaye
-
-#             notify_event.clear()
-#             await send_if_changed()
-
-#     except WebSocketDisconnect:
-#         print("Frontend disconnected from WebSocket")
-#     except Exception as e:
-#         print(f"WebSocket Error: {e}")
-#         import traceback
-#         traceback.print_exc()
-#         await websocket.close()
-#     finally:
-#         if raw_conn:
-#             try:
-#                 await raw_conn.remove_listener("denial_escalation_channel", on_notify)
-#             except Exception:
-#                 pass
-#         if db_connection:
-#             await db_connection.__aexit__(None, None, None)   # connection pool ko wapas
 
 def group_by_call_id(records: list[dict]) -> list[dict]:
-    """Same call_id wale records ko ek hi group/array mein daal deta hai,
-    aur added_date ke hisaab se sabse latest sabse upar rakhta hai."""
-
     def parse_date(rec):
         val = rec.get("added_date")
         if isinstance(val, str):
@@ -4154,8 +2680,6 @@ def group_by_call_id(records: list[dict]) -> list[dict]:
 
 
 async def fetch_current_data(query) -> list[dict]:
-    """DB se current active (status=1, not deleted) records nikaal kar
-    JSON-safe dict list return karta hai."""
     rows = await database2.fetch_all(query)
     data = []
     for row in rows:
@@ -4168,7 +2692,6 @@ async def fetch_current_data(query) -> list[dict]:
 
 
 async def get_alert_flow_status(call_id) -> str | None:
-    """alert_escalation_flow se status laata hai (fallback)."""
     if not call_id:
         return None
     q = """
@@ -4184,7 +2707,6 @@ async def get_alert_flow_status(call_id) -> str | None:
 
 
 async def attach_level_info_to_groups(grouped_data: list[dict]) -> list[dict]:
-    """Har call_id group ke liye escalation level/role/severity attach karta hai."""
     for group in grouped_data:
         call_id = group.get("call_id")
         records = group.get("records", [])
@@ -4216,247 +2738,13 @@ async def attach_level_info_to_groups(grouped_data: list[dict]) -> list[dict]:
     return grouped_data
 
 
-# @app.websocket("/ws/denial_alerts")
-
-# async def websocket_denial_alerts(websocket: WebSocket):
-
-#     """URL se ?date=YYYY-MM-DD pass kar sakte hain.
-
-#     Date na diya to default CURRENT_DATE (aaj) use hoga."""
- 
-#     await websocket.accept()
- 
-#     last_sent_ids: set = set()
-
-#     notify_event = asyncio.Event()
- 
-#     # URL se date param
-
-#     date_param = websocket.query_params.get("date")
- 
-#     if date_param:
-
-#         try:
-
-#             selected_date = datetime.strptime(date_param, "%Y-%m-%d").date()
-
-#             date_condition = f"d.added_date::date = '{selected_date}'"
-
-#         except ValueError:
-
-#             await websocket.send_json({
-
-#                 "type": "ERROR",
-
-#                 "message": "Invalid date format! Use ?date=YYYY-MM-DD"
-
-#             })
-
-#             await websocket.close()
-
-#             return
-
-#     else:
-
-#         selected_date = None
-
-#         date_condition = "d.added_date::date = CURRENT_DATE"
- 
-#     query = f"""
-
-#         SELECT d.*,
-
-#                af.status AS alert_flow_status
-
-#         FROM denial_escalation_master d
-
-#         LEFT JOIN LATERAL (
-
-#             SELECT status
-
-#             FROM alert_escalation_flow
-
-#             WHERE call_id = d.call_id
-
-#             LIMIT 1
-
-#         ) af ON TRUE
-
-#         WHERE d.escalate_status = '1' 
-
-#         AND (d.is_deleted = FALSE OR d.is_deleted IS NULL)
-
-#         AND {date_condition}
-
-#         ORDER BY d.added_date DESC;
-
-#     """
- 
-#     async def send_if_changed():
-
-#         nonlocal last_sent_ids
-
-#         current_data = await fetch_current_data(query)
-
-#         current_ids = {d["id"] for d in current_data}
- 
-#         if current_ids != last_sent_ids:
-
-#             grouped_current = group_by_call_id(current_data)
-
-#             grouped_current = await attach_level_info_to_groups(grouped_current)
-
-#             await websocket.send_json({
-
-#                 "type": "INITIAL_LOAD",
-
-#                 "count": len(grouped_current),
-
-#                 "data": grouped_current
-
-#             })
-
-#             last_sent_ids = current_ids
- 
-#     def on_notify(conn, pid, channel, payload):
-
-#         notify_event.set()
- 
-#     # ✅ NAYA: Ye flag se pata chalega client zinda hai ya nahi
-
-#     client_alive = True
- 
-#     try:
-
-#         # STEP 1: Initial load
-
-#         initial_data = await fetch_current_data(query)
-
-#         last_sent_ids = {d["id"] for d in initial_data}
- 
-#         grouped_initial = group_by_call_id(initial_data)
-
-#         grouped_initial = await attach_level_info_to_groups(grouped_initial)
- 
-#         await websocket.send_json({
-
-#             "type": "INITIAL_LOAD",
-
-#             "count": len(grouped_initial),
-
-#             "selected_date": str(selected_date) if selected_date else "today",
-
-#             "data": grouped_initial
-
-#         })
- 
-#         # STEP 2: Connection & LISTEN
-
-#         async with database2.connection() as db_connection:
-
-#             raw_conn = db_connection.raw_connection
-
-#             await raw_conn.add_listener("denial_escalation_channel", on_notify)
- 
-#             try:
-
-#                 # STEP 3: Wait for notify and send changes
-
-#                 while client_alive:
-
-#                     try:
-
-#                         await asyncio.wait_for(notify_event.wait(), timeout=30)
-
-#                     except asyncio.TimeoutError:
-
-#                         pass
- 
-#                     notify_event.clear()
- 
-#                     # ✅ NAYA: Send ko guard karo — dead client pe crash nahi hoga
-
-#                     try:
-
-#                         await send_if_changed()
-
-#                     except (WebSocketDisconnect, RuntimeError):
-
-#                         # Client chala gaya — loop se NIKAL jao (break), error mat failao
-
-#                         print("🔌 Client disconnected during send — stopping listener loop")
-
-#                         client_alive = False
-
-#                         break
- 
-#             finally:
-
-#                 # ✅ NAYA: Listener hamesha remove hoga — InterfaceWarning fix
-
-#                 try:
-
-#                     raw_conn.remove_listener("denial_escalation_channel", on_notify)
-
-#                 except Exception:
-
-#                     pass
- 
-#     except WebSocketDisconnect:
-
-#         print("Frontend disconnected from WebSocket")
- 
-#     except Exception as e:
-
-#         import traceback
-
-#         error_trace = traceback.format_exc()
-
-#         print(f"WebSocket Error: {e}\n{error_trace}")
- 
-#         # ✅ NAYA: Transport dead ho to send_json try hi mat karo
-
-#         try:
-
-#             if client_alive:
-
-#                 await websocket.send_json({
-
-#                     "type": "ERROR",
-
-#                     "message": str(e),
-
-#                     "trace": error_trace
-
-#                 })
-
-#         except Exception:
-
-#             pass
- 
-#     finally:
-
-#         # ✅ NAYA: Close bhi safe — BrokenPipe handle
-
-#         try:
-
-#             await websocket.close()
-
-#         except Exception:
-
-#             pass
-#################################################################################################
 @app.websocket("/ws/denial_alerts")
 async def websocket_denial_alerts(websocket: WebSocket):
-    """URL se ?date=YYYY-MM-DD pass kar sakte hain.
-    Date na diya to default CURRENT_DATE (aaj) use hoga."""
- 
     await websocket.accept()
  
     last_sent_ids: set = set()
     notify_event = asyncio.Event()
  
-    # URL se date param
     date_param = websocket.query_params.get("date")
  
     if date_param:
@@ -4474,7 +2762,6 @@ async def websocket_denial_alerts(websocket: WebSocket):
         selected_date = None
         date_condition = "d.added_date::date = CURRENT_DATE"
  
-    # SQL Query
     query = f"""
         SELECT d.*,
                af.status AS alert_flow_status
@@ -4491,7 +2778,6 @@ async def websocket_denial_alerts(websocket: WebSocket):
         ORDER BY d.added_date DESC;
     """
  
-    # ✅ NAYA SORT: Added_date ke hisaab se DESC sort karega (Latest Upar)
     def sort_grouped_desc(grouped):
         if isinstance(grouped, dict):
             grouped = list(grouped.values())
@@ -4540,7 +2826,6 @@ async def websocket_denial_alerts(websocket: WebSocket):
     client_alive = True
  
     try:
-        # STEP 1: Initial load
         initial_data = await fetch_current_data(query)
         last_sent_ids = {d["id"] for d in initial_data}
  
@@ -4555,7 +2840,6 @@ async def websocket_denial_alerts(websocket: WebSocket):
             "data": grouped_initial
         })
  
-        # STEP 2: Connection & LISTEN
         async with database2.connection() as db_connection:
             raw_conn = db_connection.raw_connection
             await raw_conn.add_listener("denial_escalation_channel", on_notify)
@@ -4605,10 +2889,8 @@ async def websocket_denial_alerts(websocket: WebSocket):
             await websocket.close()
         except Exception:
             pass
-##########################################################################################
-# ------------------------------------------------------------------
-# Config
-# ------------------------------------------------------------------
+
+
 LEVEL_INFO_CENTRAL = {
     1: {"role": "MDT",                     "minutes": 0},
     2: {"role": "District Manager (DM)",   "minutes": 10},
@@ -4619,20 +2901,19 @@ LEVEL_INFO_CENTRAL = {
     7: {"role": "CBO",                     "minutes": 75},
 }
 SEVERITY_BY_LEVEL = {
-    1: "LOW",       # MDT
-    2: "LOW",       # DM
-    3: "MEDIUM",    # ZM
-    4: "MEDIUM",    # OM
-    5: "HIGH",      # SH
-    6: "HIGH",      # COO
-    7: "CRITICAL",  # CBO
+    1: "LOW",       
+    2: "LOW",       
+    3: "MEDIUM",    
+    4: "MEDIUM",    
+    5: "HIGH",      
+    6: "HIGH",      
+    7: "CRITICAL",  
 }
 SORTED_LEVELS = sorted(
     LEVEL_INFO_CENTRAL.keys(),
     key=lambda l: LEVEL_INFO_CENTRAL[l]["minutes"]
 )
 
-# Redis keys
 ESC_LEVEL_REDIS_PREFIX      = "esc_level:"
 ESC_ESCALATED_AT_PREFIX     = "esc_escalated_at:"
 ESC_ACTION_TAKEN_PREFIX     = "esc_action_taken:"
@@ -4642,31 +2923,17 @@ ESC_BUMP_LOCK_TTL_MS        = 30000
 _esc_bump_instance_id       = str(uuid.uuid4())
 
 def normalize_vehicle_number(v) -> str:
-    """
-    Vehicle number ko ek standard format me laata hai.
-    'TT 00 MP 0001' → 'TT00MP0001'
-    'TT-00-MP-0001' → 'TT00MP0001'
-    'tt00mp0001'    → 'TT00MP0001'
-    
-    Saare spaces, hyphens, dots, underscores hata ke uppercase kar deta hai.
-    """
     if not v:
         return ""
-    # String me convert, then saari special chars hata do, uppercase karo
     s = str(v).upper()
     for ch in [" ", "-", ".", "_", "/"]:
         s = s.replace(ch, "")
     return s.strip()
 
 def filter_payloads_by_district(payloads: list, district_str: str) -> list:
-    """Payloads ko district name se filter karta hai (case-insensitive).
-    Multiple districts ko comma (,) se separate kar sakte hain.
-    Agar district None ya empty hai to sab return karega (no filter)."""
     if not district_str or not district_str.strip():
         return payloads
     
-    # 👇 NAYA: District string ko comma se split karke list banao aur strip karo
-    # e.g., "Bhopal, Jabalpur,Indore" -> ["bhopal", "jabalpur", "indore"]
     districts_list = [d.strip().lower() for d in district_str.split(",") if d.strip()]
     
     if not districts_list:
@@ -4674,48 +2941,32 @@ def filter_payloads_by_district(payloads: list, district_str: str) -> list:
 
     filtered = []
     for p in payloads:
-        # Central alerts me 'district' field hai
-        # Denial alerts me bhi 'district' field hai (dst_name se mapped)
         alert_district = (p.get("district") or p.get("dst_name") or "")
         if alert_district and alert_district.strip().lower() in districts_list:
             filtered.append(p)
     return filtered
 
 def extract_ambulance_number_from_payload(payload: dict) -> str:
-    """
-    Kisi bhi escalation payload se ambulance number nikalta hai
-    aur normalize karke return karta hai.
-    """
-    # Direct fields
     amb = (
         payload.get("ambulance_no")
         or payload.get("amb_no")
         or payload.get("vehicleNumber")
     )
 
-    # denial_record ke andar
     if not amb:
         dr = payload.get("denial_record") or {}
         amb = dr.get("amb_no") or dr.get("ambulance_no")
 
-    # central_alerts list ke andar
     if not amb:
         for ca in (payload.get("central_alerts") or []):
             amb = ca.get("ambulance_no") or ca.get("amb_no")
             if amb:
                 break
 
-    # 👇 Normalize karke return karo
     return normalize_vehicle_number(amb)
 
 
-import httpx
-
-# FCM_SERVER_KEY = "AAAAdHbcA2w:APA91bGpaFIHWqD35tEQR0suCf_IRdOysTOvMsObjFgeIzGS_G2daBJjmRJrNyzQ13R5wrqBI9iVUTm-Ns_pIcs2R__m1s48RBNl__1FkFoQWAyUMZ4OPsDHNFg0a_rd2F9lXhHfInQB"   # 👈 yahan apni FCM key daalo
-
 async def send_fcm_push(token: str, title: str, body: str, data: dict = None, vehicle_number: str = None):
-    """Firebase Cloud Messaging — SIRF data field bhejta hai.
-    Agar token invalid hai, toh Redis se automatically delete kar deta hai."""
     if not token:
         return
 
@@ -4754,11 +3005,9 @@ async def send_fcm_push(token: str, title: str, body: str, data: dict = None, ve
     except Exception as e:
         error_str = str(e).lower()
         
-        # 👇 FIX: "notregistered" check karo (case-insensitive)
         if "notregistered" in error_str or "invalid-registration-token" in error_str:
             logger.warning(f"⚠️ FCM Token Expired. Auto-removing from Redis: token={token[:20]}...")
             
-            # 👇 Redis se faltu token hata do taaki aage push na mare
             if vehicle_number:
                 try:
                     await redis_client.delete(f"fcm_token:{vehicle_number}")
@@ -4768,9 +3017,7 @@ async def send_fcm_push(token: str, title: str, body: str, data: dict = None, ve
         else:
             logger.error(f"❌ send_fcm_push FAILED: {error_str}")
 
-# ===========================================================================
-# HELPERS (time → level)
-# ===========================================================================
+
 def get_level_for_elapsed_minutes(elapsed_minutes: int) -> int:
     current_level = 1
     for lvl in SORTED_LEVELS:
@@ -4784,28 +3031,21 @@ def get_level_info_for_level(level: int) -> dict:
 
 
 def elapsed_minutes_since(added_date) -> int:
-    """Uses existing to_datetime() helper."""
     if isinstance(added_date, str):
-        # 'T' ko space se replace karo aur microseconds (.) ke baad ka part hata do
         added_date = added_date.replace("T", " ").split(".")[0]
     
     dt = to_datetime(added_date)
     if not dt:
         return 0
     
-    # 👇 Timezone fix: Agar datetime par timezone nahi hai, to use IST do
     if dt.tzinfo is None:
         dt = ist.localize(dt)
         
-    # 👇 Ab current time aur DB time dono timezone-aware hain
     now = datetime.now(ist)
     
     return max(0, int((now - dt).total_seconds() // 60))
 
 
-# ===========================================================================
-# FETCHES (use existing serialize_row)
-# ===========================================================================
 async def fetch_central_alerts(call_id) -> list:
     rows = await database2.fetch_all(
         """
@@ -4820,7 +3060,7 @@ async def fetch_central_alerts(call_id) -> list:
         FROM public.central_alerts
         WHERE CAST(alert_id AS text) = CAST(:call_id AS text)
         """,
-        {"call_id": str(call_id)},   # 👈 yahan explicitly string banaya
+        {"call_id": str(call_id)},
     )
     return [serialize_row(r) for r in rows]
 
@@ -4833,24 +3073,21 @@ async def fetch_denial_record(call_id: str) -> dict:
                alert_type, added_by, added_date
         FROM public.denial_escalation_master
         WHERE CAST(call_id AS text) = :call_id
-        ORDER BY added_date DESC LIMIT 1   -- 👈 Yahan fix kiya
+        ORDER BY added_date DESC LIMIT 1
         """,
         {"call_id": str(call_id)},
     )
     return serialize_row(row) if row else {}
 
-# ===========================================================================
-# PAYLOAD BUILDER — single call_id ke liye combined payload (dono tables)
-# ===========================================================================
+
 async def build_escalation_payload(
     call_id: str,
     denial_record: dict,
     current_level: int,
     event_type: str = "new_escalation_alert",
     extra: dict = None,
-    central_alerts_data: list = None  # 👈 Yeh add kiya
+    central_alerts_data: list = None
 ) -> dict:
-    # 👇 Agar data pass hua to wahi use karo, warna DB se fetch karo
     if central_alerts_data is not None:
         central_alerts = central_alerts_data
     else:
@@ -4874,231 +3111,23 @@ async def build_escalation_payload(
         payload.update(extra)
     return payload
 
-# ===========================================================================
-# async def attach_sla_info_to_alerts(alerts: list) -> list:
-#     """Each alert me SLA breach details add karta hai.
-    
-#     Fetches from:
-#     - alert_thresholds table: SLA threshold for each alert_type + amb_area (rural/urban)
-#     - rtm_dashboard table: actual duration taken by ambulance
-    
-#     Adds fields:
-#     - sla_threshold_seconds: SLA limit in seconds
-#     - sla_actual_seconds: actual time taken in seconds
-#     - sla_breach_seconds: how much time was exceeded
-#     - sla_breach_reason: human-readable reason
-#     - amb_area: "1" (rural) or "2" (urban)
-#     - amb_area_type: "Rural" or "Urban"
-#     """
-#     if not alerts:
-#         return alerts
-
-#     # 1. Saare thresholds fetch karo (cached, 30s TTL)
-#     try:
-#         thresholds = await get_active_thresholds()
-#     except Exception as e:
-#         logger.error(f"attach_sla: thresholds fetch failed: {e}")
-#         thresholds = []
-
-#     # 2. Saare unique incident_ids collect karo
-#     incident_ids = []
-#     for a in alerts:
-#         inc_id = str(a.get("incident_id") or a.get("call_id") or "")
-#         if inc_id and inc_id != "0" and inc_id not in incident_ids:
-#             incident_ids.append(inc_id)
-
-#     # 3. rtm_dashboard se data fetch karo for these incident_ids
-#     rtm_data = {}
-#     if incident_ids:
-#         try:
-#             placeholders = ", ".join([f":id{i}" for i in range(len(incident_ids))])
-#             params = {f"id{i}": incident_ids[i] for i in range(len(incident_ids))}
-#             query = f"""
-#                 SELECT * FROM rtm_dashboard
-#                 WHERE CAST(inc_ref_id AS text) IN ({placeholders})
-#             """
-#             rtm_rows = await database2.fetch_all(query, params)
-#             for r in rtm_rows:
-#                 rtm_data[str(r["inc_ref_id"])] = normalize_row(r)
-#         except Exception as e:
-#             logger.error(f"attach_sla: rtm_dashboard fetch failed: {e}")
-
-#     # 4. Alert type → rtm_dashboard duration field mapping
-#     ALERT_DURATION_MAP = {
-#         "ACK_DELAY": "acknowledge_duration",
-#         "START_DELAY": "start_from_base_duration",
-#         "AT_SCENE_DELAY": "at_scene_duration",
-#     }
-
-#     # 5. Each alert me SLA info add karo
-#     for alert in alerts:
-#         alert_type = alert.get("alert_type", "")
-#         incident_id = str(alert.get("incident_id") or alert.get("call_id") or "")
-
-#         # rtm_dashboard se row uthao
-#         rtm_row = rtm_data.get(incident_id, {})
-
-#         # amb_area (1=rural, 2=urban)
-#         amb_area = rtm_row.get("amb_working_area")
-#         amb_area_type = ""
-#         if str(amb_area) == "1":
-#             amb_area_type = "Rural"
-#         elif str(amb_area) == "2":
-#             amb_area_type = "Urban"
-
-#         # Threshold dhoondho — alert_type + amb_area match
-#         # null amb_area means applies to ALL areas
-#         threshold_seconds = None
-#         for t in thresholds:
-#             if t.get("alert_type") != alert_type:
-#                 continue
-#             t_amb_area = t.get("amb_area")
-#             if t_amb_area is not None and str(t_amb_area) != str(amb_area):
-#                 continue
-#             threshold_seconds = int(t.get("threshold_seconds") or 0)
-#             break
-
-#         # Actual duration calculate karo
-#         actual_seconds = None
-#         breach_reason = ""
-
-#         # =========================================================
-#         # MDT_NOT_LOGGED_IN
-#         # =========================================================
-#         if alert_type == "MDT_NOT_LOGGED_IN":
-#             pilot_login_out = rtm_row.get("pilot_login_out")
-#             actual_seconds = 0
-#             breach_reason = (
-#                 f"MDT not logged in — pilot login status: {pilot_login_out}"
-#             )
-
-#         # =========================================================
-#         # BACK_TO_BASE_DELAY — patient_handover ke baad se check
-#         # =========================================================
-#         elif alert_type == "BACK_TO_BASE_DELAY":
-#             patient_handover_dt = to_datetime(rtm_row.get("patient_handover"))
-#             back_to_base_dt = to_datetime(rtm_row.get("back_to_base_loc"))
-
-#             if patient_handover_dt and back_to_base_dt:
-#                 diff = (back_to_base_dt - patient_handover_dt).total_seconds()
-#                 if diff >= 0:
-#                     actual_seconds = int(diff)
-
-#             if actual_seconds is not None and threshold_seconds is not None:
-#                 breach_seconds = max(0, actual_seconds - threshold_seconds)
-#                 breach_reason = (
-#                     f"Back to base delay — ambulance took {format_seconds_human(actual_seconds)} "
-#                     f"to return to base after patient handover, "
-#                     f"{format_seconds_human(breach_seconds)} over the "
-#                     f"{format_seconds_human(threshold_seconds)} SLA limit"
-#                     + (f" ({amb_area_type} area)" if amb_area_type else "")
-#                 )
-#             elif actual_seconds is not None and threshold_seconds is None:
-#                 breach_reason = (
-#                     f"Back to base delay — ambulance took {format_seconds_human(actual_seconds)} "
-#                     f"to return to base after patient handover. "
-#                     f"SLA threshold not configured for this alert type."
-#                 )
-#             else:
-#                 breach_reason = (
-#                     "Back to base delay — patient handover or back to base "
-#                     "time data not available in rtm_dashboard."
-#                 )
-
-#         # =========================================================
-#         # ACK_DELAY, START_DELAY, AT_SCENE_DELAY — direct duration field
-#         # =========================================================
-#         else:
-#             duration_field = ALERT_DURATION_MAP.get(alert_type)
-#             if duration_field:
-#                 raw_duration = rtm_row.get(duration_field)
-#                 actual_seconds = hhmmss_to_seconds(raw_duration) if raw_duration else None
-
-#                 if actual_seconds is not None and threshold_seconds is not None:
-#                     breach_seconds = max(0, actual_seconds - threshold_seconds)
-
-#                     # Human-readable message per alert type
-#                     if alert_type == "ACK_DELAY":
-#                         breach_reason = (
-#                             f"Acknowledge delay — ambulance took {format_seconds_human(actual_seconds)} "
-#                             f"to acknowledge the call, "
-#                             f"{format_seconds_human(breach_seconds)} over the "
-#                             f"{format_seconds_human(threshold_seconds)} SLA limit"
-#                             + (f" ({amb_area_type} area)" if amb_area_type else "")
-#                         )
-#                     elif alert_type == "START_DELAY":
-#                         breach_reason = (
-#                             f"Start from base delay — ambulance took {format_seconds_human(actual_seconds)} "
-#                             f"to depart from base, "
-#                             f"{format_seconds_human(breach_seconds)} over the "
-#                             f"{format_seconds_human(threshold_seconds)} SLA limit"
-#                             + (f" ({amb_area_type} area)" if amb_area_type else "")
-#                         )
-#                     elif alert_type == "AT_SCENE_DELAY":
-#                         breach_reason = (
-#                             f"At scene delay — ambulance spent {format_seconds_human(actual_seconds)} "
-#                             f"at the scene, "
-#                             f"{format_seconds_human(breach_seconds)} over the "
-#                             f"{format_seconds_human(threshold_seconds)} SLA limit"
-#                             + (f" ({amb_area_type} area)" if amb_area_type else "")
-#                         )
-#                     else:
-#                         breach_reason = (
-#                             f"{alert_type} — actual: {format_seconds_human(actual_seconds)}, "
-#                             f"threshold: {format_seconds_human(threshold_seconds)}, "
-#                             f"breached by: {format_seconds_human(breach_seconds)}"
-#                             + (f" ({amb_area_type} area)" if amb_area_type else "")
-#                         )
-#                 elif actual_seconds is not None and threshold_seconds is None:
-#                     breach_reason = (
-#                         f"{alert_type} — ambulance took {format_seconds_human(actual_seconds)}. "
-#                         f"SLA threshold not configured for this alert type."
-#                     )
-#                 else:
-#                     breach_reason = (
-#                         f"{alert_type} — duration data not available in rtm_dashboard."
-#                     )
-#             else:
-#                 breach_reason = f"{alert_type} — unknown alert type, no SLA mapping available."
-
-#         # breach seconds
-#         breach_seconds = None
-#         if actual_seconds is not None and threshold_seconds is not None:
-#             breach_seconds = max(0, actual_seconds - threshold_seconds)
-
-#         # 👇 SLA fields add karo alert me
-#         alert["sla_threshold_seconds"] = threshold_seconds
-#         alert["sla_actual_seconds"] = actual_seconds
-#         alert["sla_breach_seconds"] = breach_seconds
-#         alert["sla_breach_reason"] = breach_reason
-#         alert["amb_area"] = amb_area
-#         alert["amb_area_type"] = amb_area_type
-
-#     return alerts
 
 async def attach_sla_info_to_alerts(alerts: list) -> list:
-    """Each alert me SLA breach details add karta hai.
-    Real-time calculation added: Agar action nahi hua, to current time se duration nikalega.
-    ACK, START, AT_SCENE - teeno inc_datetime se check honge.
-    """
     if not alerts:
         return alerts
 
-    # 1. Saare thresholds fetch karo (cached, 30s TTL)
     try:
         thresholds = await get_active_thresholds()
     except Exception as e:
         logger.error(f"attach_sla: thresholds fetch failed: {e}")
         thresholds = []
 
-    # 2. Saare unique incident_ids collect karo
     incident_ids = []
     for a in alerts:
         inc_id = str(a.get("incident_id") or a.get("call_id") or "")
         if inc_id and inc_id != "0" and inc_id not in incident_ids:
             incident_ids.append(inc_id)
 
-    # 3. rtm_dashboard se data fetch karo for these incident_ids
     rtm_data = {}
     if incident_ids:
         try:
@@ -5110,7 +3139,6 @@ async def attach_sla_info_to_alerts(alerts: list) -> list:
             """
             rtm_rows = await database2.fetch_all(query, params)
             
-            # 👇 NAYA: MySQL se real-time data uthao aur merge karo
             rtm_list = []
             for r in rtm_rows:
                 rtm_list.append(normalize_row(r))
@@ -5121,15 +3149,12 @@ async def attach_sla_info_to_alerts(alerts: list) -> list:
         except Exception as e:
             logger.error(f"attach_sla: rtm_dashboard fetch failed: {e}")
 
-    # 4. Each alert me SLA info add karo
     for alert in alerts:
         alert_type = alert.get("alert_type", "")
         incident_id = str(alert.get("incident_id") or alert.get("call_id") or "")
 
-        # rtm_dashboard se row uthao
         rtm_row = rtm_data.get(incident_id, {})
 
-        # amb_area (1=rural, 2=urban)
         amb_area = rtm_row.get("amb_working_area")
         amb_area_type = ""
         if str(amb_area) == "1":
@@ -5137,7 +3162,6 @@ async def attach_sla_info_to_alerts(alerts: list) -> list:
         elif str(amb_area) == "2":
             amb_area_type = "Urban"
 
-        # Threshold dhoondho (Rural/Urban ke hisaab se)
         threshold_seconds = None
         for t in thresholds:
             if t.get("alert_type") != alert_type:
@@ -5148,14 +3172,12 @@ async def attach_sla_info_to_alerts(alerts: list) -> list:
             threshold_seconds = int(t.get("threshold_seconds") or 0)
             break
 
-        # 👇 NAYA: Real-time time calculation helpers
         now = datetime.now(ist)
         def make_aware(dt):
             if dt and dt.tzinfo is None:
                 return ist.localize(dt)
             return dt
 
-        # 👇 FIX: inc_datetime ko base time maano (inc_dispatch_time mat use karo)
         inc_dispatch_dt = make_aware(to_datetime(rtm_row.get("inc_datetime")))
             
         ack_dt = make_aware(to_datetime(rtm_row.get("acknowledge")))
@@ -5172,20 +3194,14 @@ async def attach_sla_info_to_alerts(alerts: list) -> list:
         actual_seconds = None
         breach_reason = ""
         hin_breach_reason = ""
-        is_pending = False # 👈 Agar action nahi hua, to message me "Pending" dikhana hai
+        is_pending = False
 
-        # =========================================================
-        # MDT_NOT_LOGGED_IN
-        # =========================================================
         if alert_type == "MDT_NOT_LOGGED_IN":
             pilot_login_out = rtm_row.get("pilot_login_out")
             actual_seconds = 0
             breach_reason = f"MDT not logged in — pilot login status: {pilot_login_out}"
             hin_breach_reason = f"MDT लॉग इन नहीं है — पायलट लॉगिन स्टेटस: {pilot_login_out}"
 
-        # =========================================================
-        # ACK_DELAY (inc_datetime se check)
-        # =========================================================
         elif alert_type == "ACK_DELAY":
             if inc_dispatch_dt:
                 if ack_done:
@@ -5211,9 +3227,6 @@ async def attach_sla_info_to_alerts(alerts: list) -> list:
                     + (f" ({amb_area_type} क्षेत्र)" if amb_area_type else "")
                 )
 
-        # =========================================================
-        # START_DELAY (inc_datetime se check)
-        # =========================================================
         elif alert_type == "START_DELAY":
             if inc_dispatch_dt:
                 if start_done:
@@ -5239,9 +3252,6 @@ async def attach_sla_info_to_alerts(alerts: list) -> list:
                     + (f" ({amb_area_type} क्षेत्र)" if amb_area_type else "")
                 )
 
-        # =========================================================
-        # AT_SCENE_DELAY (inc_datetime se check)
-        # =========================================================
         elif alert_type == "AT_SCENE_DELAY":
             if inc_dispatch_dt:
                 if scene_done:
@@ -5267,9 +3277,6 @@ async def attach_sla_info_to_alerts(alerts: list) -> list:
                     + (f" ({amb_area_type} क्षेत्र)" if amb_area_type else "")
                 )
 
-        # =========================================================
-        # BACK_TO_BASE_DELAY (handover_dt se check)
-        # =========================================================
         elif alert_type == "BACK_TO_BASE_DELAY":
             if back_base_done and handover_dt:
                 actual_seconds = int((back_base_dt - handover_dt).total_seconds())
@@ -5294,12 +3301,10 @@ async def attach_sla_info_to_alerts(alerts: list) -> list:
                     + (f" ({amb_area_type} क्षेत्र)" if amb_area_type else "")
                 )
 
-        # breach seconds
         breach_seconds = None
         if actual_seconds is not None and threshold_seconds is not None:
             breach_seconds = max(0, actual_seconds - threshold_seconds)
 
-        # 👇 SLA fields add karo alert me
         alert["sla_threshold_seconds"] = threshold_seconds
         alert["sla_actual_seconds"] = actual_seconds
         alert["sla_breach_seconds"] = breach_seconds
@@ -5308,7 +3313,6 @@ async def attach_sla_info_to_alerts(alerts: list) -> list:
         alert["amb_area"] = amb_area
         alert["amb_area_type"] = amb_area_type
         
-        # 👇 NAYA: call_type add karo
         alert["call_type"] = rtm_row.get("call_type")
 
         alert["acknowledge_time"] = rtm_row.get("acknowledge")
@@ -5319,33 +3323,22 @@ async def attach_sla_info_to_alerts(alerts: list) -> list:
 
     return alerts
 
-# ===========================================================================
-# PAYLOAD BUILDER
-# ===========================================================================
-async def build_all_escalation_payloads(requested_level: int = None) -> list:
-    """Saare alerts (central + denial) ko ek hi list mein laata hai.
-    N+1 Query Fix + JSON Caching + Mutex Lock for 10x performance."""
 
-    global _payload_cache, _payload_locks # 👈 Yahan _payload_locks add kiya
+async def build_all_escalation_payloads(requested_level: int = None) -> list:
+    global _payload_cache, _payload_locks
     cache_key = f"esc_payloads_{requested_level}"
     now = time.time()
     
-    # 1. Fast path: Agar cache valid hai toh sidha return karo
     if cache_key in _payload_cache and now < _payload_cache[cache_key]["expiry"]:
         return _payload_cache[cache_key]["data"]
 
-    # 2. 👇 NAYA: Lock acquire karo taaki 10,000 clients ek saath DB na maren
     if cache_key not in _payload_locks:
         _payload_locks[cache_key] = asyncio.Lock()
         
     async with _payload_locks[cache_key]:
-        # 3. Double-check cache (Lock wait karte time koi aur thread cache bhar chuka ho toh)
         if cache_key in _payload_cache and time.time() < _payload_cache[cache_key]["expiry"]:
             return _payload_cache[cache_key]["data"]
         
-        # --- Yahan se actual DB Query aur processing shuru ---
-
-        # Fetch denial records
         denial_rows = []
         if requested_level is None or requested_level != 1:
             denial_rows = await database2.fetch_all(
@@ -5360,7 +3353,6 @@ async def build_all_escalation_payloads(requested_level: int = None) -> list:
                 """
             )
 
-        # Fetch central alerts
         central_rows = await database2.fetch_all(
             """
             SELECT *
@@ -5375,7 +3367,6 @@ async def build_all_escalation_payloads(requested_level: int = None) -> list:
 
         unified_alerts = []
 
-        # 1. Central alerts ko GROUP karke unified list mein daalo
         central_groups_map = {}
         for record in central_rows:
             c = serialize_row(record)
@@ -5406,7 +3397,6 @@ async def build_all_escalation_payloads(requested_level: int = None) -> list:
                 
         unified_alerts.extend(central_groups_map.values())
 
-        # 2. Denial records ko GROUP karke unified list mein daalo
         denial_groups_map = {}
         for record in denial_rows:
             d = serialize_row(record)
@@ -5431,10 +3421,8 @@ async def build_all_escalation_payloads(requested_level: int = None) -> list:
             
         unified_alerts.extend(denial_groups_map.values())
 
-        # 3. Sort by time DESC
         unified_alerts.sort(key=lambda x: x.get("sort_time") or "", reverse=True)
 
-        # 4. BATCH REDIS FETCHING (MGET)
         all_ids = []
         for a in unified_alerts:
             if a.get("record_source") == "central":
@@ -5460,7 +3448,6 @@ async def build_all_escalation_payloads(requested_level: int = None) -> list:
             closed_map = {all_ids[i]: closed_vals[i] for i in range(len(all_ids))}
             level_map = {all_ids[i]: level_vals[i] for i in range(len(all_ids))}
 
-        # 5. Level info attach karo aur filter lagao
         filtered_alerts = []
         for alert in unified_alerts:
             is_denial = (alert.get("record_source") == "denial")
@@ -5530,6 +3517,11 @@ async def build_all_escalation_payloads(requested_level: int = None) -> list:
                         lvl = to_int(level_map.get(aid))
                         elapsed = elapsed_minutes_since(rec.get("sort_time"))
                         time_based_level = get_level_for_elapsed_minutes(elapsed)
+                        
+                        # NEW: MDT_NOT_LOGGED_IN alert hamesha DM (Level 2) se shuru hoga
+                        if rec.get("alert_type") == "MDT_NOT_LOGGED_IN" and time_based_level < 2:
+                            time_based_level = 2
+                            
                         time_based_level = min(time_based_level, 7)
 
                         if lvl is None:
@@ -5565,7 +3557,6 @@ async def build_all_escalation_payloads(requested_level: int = None) -> list:
                 alert["escalated_at"] = datetime.now(ist).isoformat()
                 filtered_alerts.append(alert)
 
-        # 👇 FIX: N+1 Query Fix - SLA info ONCE attach karo for all central records
         all_central_records_flat = []
         for alert in filtered_alerts:
             if alert.get("record_source") == "central":
@@ -5574,7 +3565,6 @@ async def build_all_escalation_payloads(requested_level: int = None) -> list:
         if all_central_records_flat:
             await attach_sla_info_to_alerts(all_central_records_flat)
 
-        # Field cleanup logic
         FIELDS_TO_LIFT = [
             "system_type", "inc_latitude", "inc_longitude", "amb_lat", "amb_long", 
             "inc_datetime", "pilot_name", "pilot_mobile", "paramedic_name", "paramedic_mobile", 
@@ -5670,15 +3660,14 @@ async def build_all_escalation_payloads(requested_level: int = None) -> list:
             "data": filtered_alerts,
             "json_str": json.dumps(msg_dict, default=str),
             "signature": sig_set,  
-            "expiry": time.time() + 1.0 # 👈 Fix: time.time() use kiya
+            "expiry": time.time() + 1.0
         }
 
         logger.info(f"BUILD PAYLOADS: returning {len(filtered_alerts)} alerts for level={requested_level}")
         return filtered_alerts
-# ===========================================================================
-# REDIS STATE — per call_id current level + closed flag
-# ===========================================================================
-async def get_or_init_escalation_level(call_id: str, added_date, is_denial: bool = False) -> int:
+
+
+async def get_or_init_escalation_level(call_id: str, added_date, is_denial: bool = False, min_level: int = 1) -> int:
     key = f"{ESC_LEVEL_REDIS_PREFIX}{call_id}"
     raw = await redis_client.get(key)
 
@@ -5687,7 +3676,6 @@ async def get_or_init_escalation_level(call_id: str, added_date, is_denial: bool
         val = raw if isinstance(raw, str) else raw.decode()
         current_level = to_int(val)
 
-    # Denial records hamesha level 2 se start hote hain
     if is_denial and (current_level is None or current_level < 2):
         current_level = 2
         await redis_client.set(key, str(current_level))
@@ -5697,15 +3685,17 @@ async def get_or_init_escalation_level(call_id: str, added_date, is_denial: bool
         )
         return current_level
 
-    # 👇 HAMESHA time-based level calculate karo (sticky hone ka fix)
     elapsed = elapsed_minutes_since(added_date)
     time_based_level = get_level_for_elapsed_minutes(elapsed)
     if is_denial and time_based_level < 2:
         time_based_level = 2
-    # Cap at 7
+        
+    # NEW: Agar kisi specific alert ka min_level 2 diya gaya hai (e.g., MDT_NOT_LOGGED_IN)
+    if time_based_level < min_level:
+        time_based_level = min_level
+        
     time_based_level = min(time_based_level, 7)
 
-    # 👇 Agar Redis me level hai hi nahi → time-based use karo + set karo
     if current_level is None:
         current_level = time_based_level
         await redis_client.set(key, str(current_level))
@@ -5715,8 +3705,6 @@ async def get_or_init_escalation_level(call_id: str, added_date, is_denial: bool
         )
         return current_level
 
-    # 👇 Agar Redis me level hai but time-based level ZYADA hai → upgrade kar do
-    #    (Lekin kabhi downgrade mat karo — agar manually level 7 set kiya hai to rehne do)
     if time_based_level > current_level:
         current_level = time_based_level
         await redis_client.set(key, str(current_level))
@@ -5766,12 +3754,6 @@ async def mark_action_taken(
     action_remark: str,
     action_type: str = "acknowledge",
 ) -> dict:
-    """
-    Kisi role ne action liya:
-    1. esc_action_taken:{call_id} set karo
-    2. esc_closed:{call_id}      set karo
-    3. esc_level:* & esc_escalated_at:* delete karo → aage escalate nahi hoga
-    """
     action_details = {
         "call_id": call_id,
         "action_by": action_by,
@@ -5786,14 +3768,12 @@ async def mark_action_taken(
     await redis_client.set(f"{ESC_ACTION_TAKEN_PREFIX}{call_id}", action_json)
     await redis_client.set(f"{ESC_CLOSED_PREFIX}{call_id}", action_json)
 
-    # Cleanup level state — aage escalate NAHI karna
     await redis_client.delete(f"{ESC_LEVEL_REDIS_PREFIX}{call_id}")
     await redis_client.delete(f"{ESC_ESCALATED_AT_PREFIX}{call_id}")
 
     return action_details
 
 
-# Escalation Flow Table Mapping
 ESC_FLOW_LEVEL_MAP = {
     1: "pilot",
     2: "dm",
@@ -5815,7 +3795,6 @@ ROLE_NAMES = {
 }
 
 def safe_int(val):
-    """Convert string/float to int safely, return None if invalid."""
     if val is None or str(val).strip() == "" or str(val).strip() == "None":
         return None
     try:
@@ -5832,7 +3811,6 @@ async def update_escalation_flow(
     action_remark: str = None,
     generated_at: str = None
 ):
-    """alert_escalation_flow table me real-time tracking maintain karta hai."""
     try:
         c_id = safe_int(call_id)
         a_id = safe_int(alert_id)
@@ -5840,7 +3818,6 @@ async def update_escalation_flow(
         
         gen_dt = to_datetime(generated_at) if generated_at else None
         
-        # 👇 FIX: More robust where clause
         where_clauses = []
         params = {}
         if a_id is not None and a_id != 0:
@@ -5889,7 +3866,6 @@ async def update_escalation_flow(
 
         elif event_type == "LEVEL_BUMP":
             if not existing:
-                # Fallback if bumped before insert
                 await update_escalation_flow(call_id, alert_id, level, "NEW_ALERT", generated_at=generated_at)
                 existing = await database2.fetch_one(query, params)
                 if not existing: 
@@ -5946,9 +3922,8 @@ async def update_escalation_flow(
 
     except Exception as e:
         logger.error(f"Failed to update escalation flow: {e}")
-# ===========================================================================
-# REDIS LEADER LOCK (bump watcher ke liye)
-# ===========================================================================
+
+
 async def try_acquire_bump_leadership() -> bool:
     if await redis_client.set(
         ESC_BUMP_LOCK_KEY, _esc_bump_instance_id,
@@ -5964,28 +3939,13 @@ async def try_acquire_bump_leadership() -> bool:
     return False
 
 
-# ===========================================================================
-# WEBSOCKET — /ws/escalation_alerts (path-based level filter: /1, /2, ..., /7)
-# ===========================================================================
-# ===========================================================================
-# WEBSOCKET — /ws/escalation_alerts (single endpoint, level as query param)
-#   - /ws/escalation_alerts              → saare levels ke alerts
-#   - /ws/escalation_alerts?level=2      → sirf level 2 (DM) ke alerts
-# ===========================================================================
 @app.websocket("/ws/escalation_alerts")
 async def websocket_escalation_alerts(
     websocket: WebSocket,
-    level: Optional[int] = Query(default=None),   # None = all, 1-7 = specific
-    district: Optional[str] = Query(default=None), # 👈 NAYA: district filter
+    level: Optional[int] = Query(default=None),
+    district: Optional[str] = Query(default=None), 
     user_id: str = "anonymous"
 ):
-    """
-    Single endpoint jo dono kaam karta hai:
-      /ws/escalation_alerts                    → saare levels ke alerts
-      /ws/escalation_alerts?level=2            → sirf level 2 (DM) ke alerts
-      /ws/escalation_alerts?level=2&district=Bhopal → sirf level 2 + Bhopal district ke alerts
-      /ws/escalation_alerts?district=Bhopal     → saare levels + Bhopal district ke alerts
-    """
     if level is not None and (level < 1 or level > 7):
         await websocket.accept()
         await websocket.send_json({
@@ -6002,15 +3962,11 @@ async def websocket_escalation_alerts(
     await _handle_escalation_ws(
         websocket,
         requested_level=level,
-        district_filter=district,  # 👈 NAYA
+        district_filter=district, 
         user_id=user_id
     )
 
 
-
-# ---------------------------------------------------------------------------
-# Common handler — dono routes yahan se chalte hain
-# ---------------------------------------------------------------------------
 async def _handle_escalation_ws(websocket: WebSocket, requested_level: int, user_id: str, district_filter: str = None):
     conn_info = await manager.connect(websocket, user_id)
     queue = conn_info["queue"]
@@ -6019,9 +3975,6 @@ async def _handle_escalation_ws(websocket: WebSocket, requested_level: int, user
     vehicle_number_raw = None
     fcm_token = None
 
-    # =========================================================
-    # Level 1: SILENTLY wait for registration message
-    # =========================================================
     if requested_level == 1:
         try:
             raw = await asyncio.wait_for(websocket.receive_text(), timeout=60)
@@ -6040,7 +3993,6 @@ async def _handle_escalation_ws(websocket: WebSocket, requested_level: int, user
                 await websocket.close(code=1008)
                 return
 
-            # Redis me token save karo
             await redis_client.set(f"fcm_token:{vehicle_number}", fcm_token)
             logger.info(
                 f"Level-1 MDT registered & SAVED IN REDIS: user={user_id}, "
@@ -6061,22 +4013,20 @@ async def _handle_escalation_ws(websocket: WebSocket, requested_level: int, user
             return
 
     try:
-        # Send INITIAL_LOAD (First time connect hote hi)
         await send_current_escalations(
             websocket,
             requested_level=requested_level,
             vehicle_filter=vehicle_number,
             fcm_token=None,
-            district_filter=district_filter  # 👈 NAYA
+            district_filter=district_filter 
         )
 
         async def drain_loop():
-            """Sirf INITIAL_LOAD format bhejo — kuch aur nahi."""
             from collections import deque
             
             last_refresh_time = 0
             notified_alert_ids = deque(maxlen=50)
-            last_sent_signature = None  # 👈 SPAM STOPPER
+            last_sent_signature = None 
 
             while True:
                 payload = await queue.get()
@@ -6103,14 +4053,12 @@ async def _handle_escalation_ws(websocket: WebSocket, requested_level: int, user
                 last_refresh_time = now
 
                 try:
-                    # 👇 NAYA: Agar koi vehicle/district filter nahi hai, to cached JSON + Signature use karo
                     if not vehicle_number and not district_filter:
                         cache_key = f"esc_payloads_{requested_level}"
                         if cache_key in _payload_cache and time.time() < _payload_cache[cache_key]["expiry"]:
                             cached = _payload_cache[cache_key]
                             current_signature = cached.get("signature")
                             
-                            # Spam Stopper Check
                             if current_signature == last_sent_signature:
                                 continue
                             last_sent_signature = current_signature
@@ -6124,7 +4072,6 @@ async def _handle_escalation_ws(websocket: WebSocket, requested_level: int, user
                                     break
                                 continue
 
-                    # Agar filter hai ya cache miss hua, to DB se fresh laao
                     payloads = await build_all_escalation_payloads(requested_level)
 
                     if district_filter:
@@ -6139,7 +4086,6 @@ async def _handle_escalation_ws(websocket: WebSocket, requested_level: int, user
                                 filtered.append(p)
                         payloads = filtered
 
-                    # 👇 NAYA: Spam Stopper for filtered payloads (Level 1 or District filtered)
                     current_signature = set()
                     for p in payloads:
                         uid = str(p.get("group_key") or p.get("call_id") or p.get("alert_id") or p.get("incident_id"))
@@ -6151,7 +4097,6 @@ async def _handle_escalation_ws(websocket: WebSocket, requested_level: int, user
                         continue
                     last_sent_signature = current_signature
 
-                    # FCM PUSH LOGIC (Only Level 1 with vehicle filter)
                     if requested_level == 1 and fcm_token and len(payloads) > 0:
                         for p in payloads:
                             unique_id = str(p.get("alert_id") or p.get("call_id") or p.get("incident_id") or "")
@@ -6203,6 +4148,7 @@ async def _handle_escalation_ws(websocket: WebSocket, requested_level: int, user
     finally:
         manager.disconnect(websocket)
 
+
 async def send_current_escalations(
     websocket: WebSocket,
     requested_level: int = None,
@@ -6210,9 +4156,7 @@ async def send_current_escalations(
     fcm_token: str = None,
     district_filter: str = None
 ):
-    """Sirf INITIAL_LOAD format bhejta hai — kuch aur nahi."""
     try:
-        # 👇 NAYA: Agar koi filter nahi hai, to cached JSON string use karo
         if not vehicle_filter and not district_filter:
             cache_key = f"esc_payloads_{requested_level}"
             if cache_key in _payload_cache and time.time() < _payload_cache[cache_key]["expiry"]:
@@ -6249,17 +4193,12 @@ async def send_current_escalations(
 
     except Exception as e:
         logger.exception(f"send_current_escalations FAILED: {e}")
-# ===========================================================================
-# WATCHER: TIME-BASED LEVEL BUMP (MDT → DM → ZM → OM → SH → COO → CBO)
-#   *** AGAR ACTION LIYA TO AAGE ESCALATE NAHI KAREGA ***
-# ===========================================================================
+
 async def init_escalation_levels_for_today():
-    """Aaj ke saare alerts scan karke Redis me level set karo aur Audit Table sync karo."""
     try:
-        # ---------- Central Alerts ----------
         central_rows = await database2.fetch_all(
             """
-            SELECT alert_id, created_date, escalate_status
+            SELECT alert_id, created_date, escalate_status, alert_type
             FROM public.central_alerts
             WHERE created_date::date = CURRENT_DATE
             AND is_deleted = false
@@ -6280,6 +4219,10 @@ async def init_escalation_levels_for_today():
                 level = get_level_for_elapsed_minutes(elapsed)
                 level = min(level, 7)
                 
+                # NEW: MDT_NOT_LOGGED_IN alert hamesha DM (Level 2) se shuru hoga
+                if row["alert_type"] == "MDT_NOT_LOGGED_IN" and level < 2:
+                    level = 2
+                
                 if await is_closed(call_id) or str(row["escalate_status"]) == "2":
                     level = 1
                     await set_escalation_level(call_id, level)
@@ -6292,7 +4235,6 @@ async def init_escalation_levels_for_today():
                         await update_escalation_flow(call_id=0, alert_id=call_id, level=level, event_type="LEVEL_BUMP", generated_at=row["created_date"])
                 central_init += 1
 
-        # ---------- Denial Records ----------
         denial_rows = await database2.fetch_all(
             """
             SELECT DISTINCT ON (call_id) call_id, added_date, escalate_status
@@ -6385,12 +4327,11 @@ async def escalation_level_bump_watcher():
 
                 if not d:
                     is_denial_rec = False
-                    # 👇 FIX: alert_id se search karo
                     central_row = await database2.fetch_one(
                         """SELECT * FROM public.central_alerts 
                           WHERE CAST(alert_id AS text) = :id
                           ORDER BY created_date DESC LIMIT 1""",
-                          {"id": str(call_id)} # 👈 FIX
+                          {"id": str(call_id)}
                     )
                     if not central_row:
                         await redis_client.delete(f"{ESC_LEVEL_REDIS_PREFIX}{call_id}")
@@ -6408,6 +4349,11 @@ async def escalation_level_bump_watcher():
                 time_based_level = get_level_for_elapsed_minutes(elapsed)
                 if is_denial_rec and time_based_level < 2:
                     time_based_level = 2
+                    
+                # NEW: MDT_NOT_LOGGED_IN alert hamesha DM (Level 2) se shuru hoga (bina wait kiye)
+                if not is_denial_rec and d.get("alert_type") == "MDT_NOT_LOGGED_IN" and time_based_level < 2:
+                    time_based_level = 2
+
                 time_based_level = min(time_based_level, 7)
 
                 if time_based_level <= current_level:
@@ -6477,21 +4423,15 @@ async def escalation_level_bump_watcher():
             await asyncio.sleep(10)
 
 
-# ===========================================================================
-# AUDIT TABLE RECONCILIATION WORKER (Safety Net)
-# ===========================================================================
 async def audit_table_reconciliation_worker():
-    """Background worker to fix any missed audit table updates."""
     logger.info("Audit Table Reconciliation Worker STARTED")
 
     while True:
         try:
-            # 👇 NAYA: Leader Lock
             if not await try_acquire_worker_leadership(RECON_WORKER_LOCK_KEY):
-                await asyncio.sleep(30) # Agar leader nahi hai to thoda lamba wait karo
+                await asyncio.sleep(30)
                 continue
 
-            # 1. Fetch all active central alerts for today
             central_rows = await database2.fetch_all(
                 """
                 SELECT alert_id, created_date, escalate_status 
@@ -6500,7 +4440,6 @@ async def audit_table_reconciliation_worker():
                 """
             )
             
-            # 2. Fetch all active denial alerts for today (grouped by call_id)
             denial_rows = await database2.fetch_all(
                 """
                 SELECT DISTINCT ON (call_id) call_id, added_date, escalate_status
@@ -6510,7 +4449,6 @@ async def audit_table_reconciliation_worker():
                 """
             )
 
-            # 3. Fetch current audit states to compare
             audit_rows = await database2.fetch_all(
                 """
                 SELECT alert_id, call_id, level, is_closed 
@@ -6527,18 +4465,16 @@ async def audit_table_reconciliation_worker():
                 if key and key != "0":
                     audit_map[key] = d
 
-            # 4. Check Central Alerts
             for row in central_rows:
                 call_id = str(row["alert_id"])
                 if not call_id or call_id == "0": continue
                 
                 audit_rec = audit_map.get(call_id)
-                if not audit_rec: continue # init worker will handle missing ones
+                if not audit_rec: continue
                 
                 elapsed = elapsed_minutes_since(row["created_date"])
                 expected_level = min(get_level_for_elapsed_minutes(elapsed), 7)
                 
-                # Check if closed
                 is_cl = await is_closed(call_id) or str(row["escalate_status"]) == "2"
                 
                 if is_cl:
@@ -6547,7 +4483,6 @@ async def audit_table_reconciliation_worker():
                 elif expected_level > int(audit_rec.get("level", 0)):
                     await update_escalation_flow(call_id=0, alert_id=call_id, level=expected_level, event_type="LEVEL_BUMP", generated_at=row["created_date"])
                     
-            # 5. Check Denial Alerts
             for row in denial_rows:
                 call_id = str(row["call_id"])
                 if not call_id or call_id == "0": continue
@@ -6570,26 +4505,20 @@ async def audit_table_reconciliation_worker():
         except Exception as e:
             logger.error(f"Audit Reconciliation Error: {e}")
             
-        await asyncio.sleep(120) # Run every 2 minutes
+        await asyncio.sleep(120)
 
-# ===========================================================================
-# NAYA RECORD BROADCAST
-# (denial_complaints_insert_worker mein insert ke baad call karo)
-# ===========================================================================
+
 async def broadcast_new_escalation(call_id: str, denial_record: dict):
-    """Insert ke turant baad call karo — naya alert MDT pe broadcast hoga."""
     try:
         if await is_closed(call_id):
             return
 
-        # 👇 FIX: Naye denial alert ka level uske naye added_date se calculate karo
         elapsed = elapsed_minutes_since(denial_record.get("added_date"))
         current_level = get_level_for_elapsed_minutes(elapsed)
         if current_level < 2:
             current_level = 2
         current_level = min(current_level, 7)
         
-        # Redis me forcefully update karo
         await set_escalation_level(call_id, current_level)
 
         payload = await build_escalation_payload(
@@ -6605,12 +4534,9 @@ async def broadcast_new_escalation(call_id: str, denial_record: dict):
             f"level={current_level} ({LEVEL_INFO_CENTRAL[current_level]['role']})"
         )
 
-        # =========================================================
-        # 👇 TRACK IN ESCALATION FLOW TABLE (Denial ke liye alert_id = 0)
-        # =========================================================
         await update_escalation_flow(
             call_id=call_id,
-            alert_id=0, # 👈 Yahan 0 bhej rahe hain
+            alert_id=0, 
             level=current_level,
             event_type="NEW_ALERT",
             generated_at=denial_record.get("added_date")
@@ -6620,10 +4546,7 @@ async def broadcast_new_escalation(call_id: str, denial_record: dict):
         logger.exception(f"broadcast_new_escalation FAILED: {e}")
 
 async def broadcast_new_central_alert(central_alert_row: dict):
-    """Central alert insert ke turant baad call karo —
-    naya alert MDT (level 1) pe real-time broadcast hoga + FCM push hoga."""
     try:
-        # 👇 FIX: Ab hum alert_id ko track karenge, incident_id ko nahi
         call_id = str(central_alert_row.get("alert_id") or "")
         if not call_id or call_id == "0":
             return
@@ -6631,17 +4554,18 @@ async def broadcast_new_central_alert(central_alert_row: dict):
         if await is_closed(call_id):
             return
 
-        # 👇 SLA breach details add karo before broadcast
         alerts_with_sla = await attach_sla_info_to_alerts([central_alert_row])
         if alerts_with_sla:
             central_alert_row = alerts_with_sla[0]
 
-        # Naye alert ka level uske naye created_date se calculate karo
         elapsed = elapsed_minutes_since(central_alert_row.get("created_date"))
         current_level = get_level_for_elapsed_minutes(elapsed)
         current_level = min(current_level, 7)
         
-        # Redis me forcefully update karo
+        # NEW: MDT_NOT_LOGGED_IN alert hamesha DM (Level 2) se shuru hoga (bina wait kiye)
+        if central_alert_row.get("alert_type") == "MDT_NOT_LOGGED_IN" and current_level < 2:
+            current_level = 2
+        
         await set_escalation_level(call_id, current_level)
 
         payload = await build_escalation_payload(
@@ -6659,7 +4583,6 @@ async def broadcast_new_central_alert(central_alert_row: dict):
             f"level={current_level} ({LEVEL_INFO_CENTRAL[current_level]['role']})"
         )
 
-        # 👇 NAYA FCM LOGIC: Redis se token nikal kar direct push maro
         amb_raw = central_alert_row.get("ambulance_no")
         if amb_raw:
             amb_normalized = normalize_vehicle_number(amb_raw)
@@ -6680,9 +4603,6 @@ async def broadcast_new_central_alert(central_alert_row: dict):
             else:
                 logger.info(f"SKIP FCM: No token found in Redis for amb={amb_normalized}")
 
-        # =========================================================
-        # 👇 TRACK IN ESCALATION FLOW TABLE (Central Alert ke liye call_id = 0)
-        # =========================================================
         await update_escalation_flow(
             call_id=0,
             alert_id=str(central_alert_row.get("alert_id")),
@@ -6693,10 +4613,8 @@ async def broadcast_new_central_alert(central_alert_row: dict):
 
     except Exception as e:
         logger.exception(f"broadcast_new_central_alert FAILED: {e}")
-# ===========================================================================
-# API — Take Action  (path-based level: /api/escalation/take_action/{level})
-#   koi bhi role action le → incident close, aage forward nahi
-# ===========================================================================
+
+
 class TakeActionRequest(BaseModel):
     call_id: Optional[Union[str, int]] = None
     alert_id: Optional[Union[str, int]] = None
@@ -6705,140 +4623,13 @@ class TakeActionRequest(BaseModel):
     action_remark: Optional[str] = ""
     action_type: Optional[str] = "acknowledge"
 
-# @app.post("/api/escalation/take_action/{level}")
-# async def take_escalation_action(level: int, request: Request):
-#     """
-#     URL:  POST /api/escalation/take_action/1    (1=MDT, 2=DM, ..., 7=CBO)
 
-#     Body:
-#     {
-#         "call_id": "CALL123",
-#         "action_by": "user_id",
-#         "action_by_role": "MDT",
-#         "action_remark": "Ambulance dispatched",
-#         "action_type": "acknowledge"
-#     }
-#     """
-#     try:
-#         # Validate level
-#         if level < 1 or level > 7:
-#             return {
-#                 "status": "error",
-#                 "message": f"Invalid level: {level}. Must be 1-7.",
-#                 "valid_levels": {
-#                     1: "MDT", 2: "DM", 3: "ZM", 4: "OM",
-#                     5: "SH", 6: "COO", 7: "CBO"
-#                 }
-#             }
-
-#         action_by_level = level
-#         action_by_role  = LEVEL_INFO_CENTRAL[level]["role"]
-
-#         body              = await request.json()
-#         call_id           = body.get("call_id")
-#         action_by         = body.get("action_by", "unknown")
-#         action_remark     = body.get("action_remark", "")
-#         action_type       = body.get("action_type", "acknowledge")
-
-#         # Body mein role diya to wahi use karo, warnha URL level se
-#         if body.get("action_by_role"):
-#             action_by_role = body.get("action_by_role")
-
-#         if not call_id:
-#             return {"status": "error", "message": "call_id is required"}
-
-#         if await is_closed(call_id):
-#             return {"status": "error", "message": "Incident already closed"}
-
-#         # Mark action taken + cleanup Redis state (aage escalate nahi hoga)
-#         action_details = await mark_action_taken(
-#             call_id=call_id,
-#             action_by=action_by,
-#             action_by_role=action_by_role,
-#             action_by_level=action_by_level,
-#             action_remark=action_remark,
-#             action_type=action_type,
-#         )
-
-#         # DB update (central_alerts → CLOSED)
-#         try:
-#             await database2.execute(
-#                 """
-#                 UPDATE public.central_alerts
-#                 SET escalate_status = 'CLOSED',
-#                     cancel_by        = :action_by,
-#                     cancel_date      = NOW(),
-#                     remark           = CONCAT(COALESCE(remark, ''),
-#                                              ' | CLOSED BY ', :role, ': ', :remark)
-#                 WHERE alert_id = :call_id
-#                 """,
-#                 {
-#                     "action_by": action_by,
-#                     "role":      action_by_role,
-#                     "remark":    action_remark,
-#                     "call_id":   call_id,
-#                 },
-#             )
-#         except Exception as db_err:
-#             logger.exception(f"DB update failed (still broadcasting): {db_err}")
-
-#         # Broadcast to all WS clients
-#         denial_record = await fetch_denial_record(call_id)
-#         payload = await build_escalation_payload(
-#             call_id=call_id,
-#             denial_record=denial_record,
-#             current_level=action_by_level,
-#             event_type="escalation_closed",
-#             extra={
-#                 "action_by":         action_by,
-#                 "action_by_role":    action_by_role,
-#                 "action_by_level":   action_by_level,
-#                 "action_remark":     action_remark,
-#                 "action_type":       action_type,
-#                 "action_taken_at":   action_details["action_taken_at"],
-#                 "closed":            True,
-#             },
-#         )
-#         manager.broadcast(payload)
-
-#         logger.info(
-#             f"ACTION TAKEN → INCIDENT CLOSED: call_id={call_id}, "
-#             f"by={action_by_role} (level {action_by_level}), remark={action_remark}"
-#         )
-
-#         return {
-#             "status": "success",
-#             "message": "Action taken, incident closed. Aage escalate nahi hoga.",
-#             "action_details": action_details,
-#         }
-
-#     except Exception as e:
-#         logger.exception(f"take_escalation_action FAILED: {e}")
-#         return {"status": "error", "message": str(e)}
-
-
-
-
-
-# ============================================================
-# TEST API — FCM push manually test karne ke liye
-# ============================================================
 @app.get("/api/test-fcm")
 async def test_fcm_push(
     token: str = Query(..., description="FCM device token"),
     title: str = Query("Test Alert", description="Notification title"),
     body: str = Query("This is a test notification", description="Notification body")
 ):
-    """
-    FCM push notification manually test karne ke liye.
-    
-    Usage:
-      GET /api/test-fcm?token=cFtOhLxNj9c:APA91b...&title=Test&body=Hello
-    
-    Server logs me check karo:
-      ✅ FCM SUCCESS  → notification bajega
-      ❌ FCM ERROR    → token ya key me problem hai
-    """
     logger.info(f"TEST FCM: manual test requested for token={token[:20]}...")
 
     await send_fcm_push(
@@ -6859,18 +4650,7 @@ async def test_fcm_push(
 
 @app.post("/api/escalation/take_action/{level}")
 async def take_escalation_action(level: int, payload: TakeActionRequest):
-    """
-    URL:  POST /api/escalation/take_action/1    (1=MDT, 2=DM, ..., 7=CBO)
-
-    Body:
-    {
-        "alert_id": 159125894,  <-- int ya string dono accept honge
-        "action_by": "pilot_user_id",
-        "action_remark": "Ambulance dispatched to location"
-    }
-    """
     try:
-        # Validate level
         if level < 1 or level > 7:
             return {
                 "status": "error",
@@ -6884,10 +4664,8 @@ async def take_escalation_action(level: int, payload: TakeActionRequest):
         action_by_level = level
         action_by_role  = LEVEL_INFO_CENTRAL[level]["role"]
 
-        # 👇 Pydantic model se data lo
         raw_id = payload.call_id if payload.call_id is not None else payload.alert_id
         
-        # ID ko hamesha string me convert karo (agar int aaya to str ban jayega)
         payload_id = str(raw_id).strip() if raw_id is not None else ""
         
         action_by         = payload.action_by if payload.action_by else "unknown"
@@ -6897,13 +4675,11 @@ async def take_escalation_action(level: int, payload: TakeActionRequest):
         if payload.action_by_role:
             action_by_role = payload.action_by_role
 
-        # 👇 DEBUG LOG
         logger.info(f"🚀 TAKE ACTION API CALLED. Received ID: '{payload_id}'")
 
         if not payload_id or payload_id.lower() == "none":
             return {"status": "error", "message": "call_id or alert_id is required"}
 
-        # Check if already closed
         is_already_closed = await is_closed(payload_id)
         logger.info(f"🔍 Checking is_closed for ID '{payload_id}': {is_already_closed}")
         
@@ -6911,7 +4687,6 @@ async def take_escalation_action(level: int, payload: TakeActionRequest):
             logger.warning(f"❌ BLOCKED: Incident {payload_id} is already closed in Redis.")
             return {"status": "error", "message": "Incident already closed"}
 
-        # Mark action taken + cleanup Redis state (aage escalate nahi hoga)
         action_details = await mark_action_taken(
             call_id=payload_id,
             action_by=action_by,
@@ -6921,10 +4696,6 @@ async def take_escalation_action(level: int, payload: TakeActionRequest):
             action_type=action_type,
         )
 
-        # =========================================================
-        # IDENTIFY & UPDATE CORRECT TABLE
-        # =========================================================
-        # 👇 ID ko int me convert karke query me daal rahe hain taaki DB match ho jaye
         try:
             db_id = int(payload_id)
         except ValueError:
@@ -6936,7 +4707,6 @@ async def take_escalation_action(level: int, payload: TakeActionRequest):
         )
 
         if central_record:
-            # --- CENTRAL ALERT ---
             try:
                 await database2.execute(
                     """
@@ -6958,7 +4728,6 @@ async def take_escalation_action(level: int, payload: TakeActionRequest):
             except Exception as db_err:
                 logger.exception(f"Central DB update failed: {db_err}")
         else:
-            # --- DENIAL ALERT ---
             try:
                 await database2.execute(
                     """
@@ -6969,16 +4738,13 @@ async def take_escalation_action(level: int, payload: TakeActionRequest):
                     """,
                     {
                         "remark": action_remark,
-                        "call_id": str(db_id), # Denial table me call_id varchar hai
+                        "call_id": str(db_id),
                     },
                 )
                 logger.info(f"✅ DENIAL TABLE UPDATED: call_id={payload_id}, status=2")
             except Exception as db_err:
                 logger.exception(f"Denial DB update failed: {db_err}")
 
-        # =========================================================
-        # BROADCAST TO ALL WS CLIENTS
-        # =========================================================
         denial_record_payload = await fetch_denial_record(payload_id)
         broadcast_payload = await build_escalation_payload(
             call_id=payload_id,
@@ -7002,9 +4768,6 @@ async def take_escalation_action(level: int, payload: TakeActionRequest):
             f"by={action_by_role} (level {action_by_level}), remark={action_remark}"
         )
 
-        # =========================================================
-        # TRACK IN AUDIT TABLE (alert_escalation_flow)
-        # =========================================================
         await update_escalation_flow(
             call_id=payload_id,
             alert_id=payload_id, 
@@ -7013,8 +4776,6 @@ async def take_escalation_action(level: int, payload: TakeActionRequest):
             action_by=action_by,
             action_remark=action_remark
         )
-
-        
 
         return {
             "data": {
@@ -7029,14 +4790,8 @@ async def take_escalation_action(level: int, payload: TakeActionRequest):
         return {"status": "error", "message": str(e)}
 
 
-
-
 @app.get("/api/mdt/alerts")
 async def get_mdt_alerts_by_ambulance(ambulance_no: str = Query(..., description="Ambulance Number")):
-    """
-    Fetch all alerts for a specific ambulance (MDT Level 1 perspective).
-    Optimized with Batch Redis (MGET) to avoid N+1 calls.
-    """
     try:
         normalized_amb = normalize_vehicle_number(ambulance_no)
         
@@ -7060,7 +4815,6 @@ async def get_mdt_alerts_by_ambulance(ambulance_no: str = Query(..., description
         alerts = [serialize_row(r) for r in rows]
         alerts = await attach_sla_info_to_alerts(alerts)
         
-        # 👇 FIX: Batch Redis Fetch (N+1 problem solved)
         alert_ids = [str(a.get("alert_id") or "") for a in alerts if a.get("alert_id")]
         closed_map = {}
         if alert_ids:
@@ -7079,7 +4833,6 @@ async def get_mdt_alerts_by_ambulance(ambulance_no: str = Query(..., description
             if alert.get("sla_threshold_seconds") is not None:
                 alert["sla_threshold_human"] = format_seconds_human(alert.get("sla_threshold_seconds"))
             
-            # 👇 FIX: Redis se map me check karo (no network call inside loop)
             is_closed_flag = bool(closed_map.get(call_id))
             
             if is_closed_flag:
@@ -7118,7 +4871,6 @@ async def get_mdt_alerts_by_ambulance(ambulance_no: str = Query(..., description
         return {"status": "error", "message": str(e)}
 
 
-
 @app.get("/api/alerts/all")
 async def get_all_alerts(
     filter_type: str = Query("today", enum=["today", "month", "all", "custom"]),
@@ -7126,13 +4878,7 @@ async def get_all_alerts(
     end_date: Optional[str] = Query(None, description="YYYY-MM-DD (for custom filter)"),
     district: Optional[str] = Query(None, description="Comma separated district names e.g. Bhopal,Indore")
 ):
-    """
-    Fetch all alerts (Central + Denial) with action details.
-    Central alerts are grouped by incident_id, Denial alerts by call_id.
-    Common fields are lifted to group level to avoid duplication.
-    """
     try:
-        # 1. Date Filters Setup
         if filter_type == "custom":
             if not start_date or not end_date:
                 return {"status": "error", "message": "start_date and end_date required for custom filter"}
@@ -7145,11 +4891,10 @@ async def get_all_alerts(
         elif filter_type == "month":
             central_date_filter = "DATE_TRUNC('month', c.created_date) = DATE_TRUNC('month', CURRENT_DATE)"
             denial_date_filter = "DATE_TRUNC('month', d.added_date) = DATE_TRUNC('month', CURRENT_DATE)"
-        else: # all
+        else: 
             central_date_filter = "1=1"
             denial_date_filter = "1=1"
 
-        # 2. Fetch Central Alerts
         central_query = f"""
             SELECT * FROM public.central_alerts c
             WHERE {central_date_filter}
@@ -7158,7 +4903,6 @@ async def get_all_alerts(
         """
         central_rows = await database2.fetch_all(central_query)
 
-        # 3. Fetch Denial Alerts
         denial_query = f"""
             SELECT id, mysql_id, call_id, amb_no, amb_default_mobile, caller_no,
                    hp_name, challenge_val, meaning, denial_remark,
@@ -7173,7 +4917,6 @@ async def get_all_alerts(
         unified_alerts = []
         all_central_records_flat = []
 
-        # Process Central Alerts (Group by incident_id)
         central_groups_map = {}
         for record in central_rows:
             c = serialize_row(record)
@@ -7202,7 +4945,6 @@ async def get_all_alerts(
                 
         unified_alerts.extend(central_groups_map.values())
 
-        # Process and Group Denial Alerts
         denial_groups_map = {}
         for record in denial_rows:
             d = serialize_row(record)
@@ -7224,10 +4966,8 @@ async def get_all_alerts(
             
         unified_alerts.extend(denial_groups_map.values())
 
-        # Sort by time (latest first)
         unified_alerts.sort(key=lambda x: x.get("sort_time") or "", reverse=True)
 
-        # 4. Batch Fetch Audit (Action) Details
         alert_ids = [str(r.get("alert_id")) for r in all_central_records_flat if r.get("alert_id")]
         call_ids = [str(a.get("call_id")) for a in unified_alerts if a.get("record_source") == "denial" and a.get("call_id")]
         
@@ -7268,11 +5008,9 @@ async def get_all_alerts(
                         "last_level": row_d.get("level")
                     }
 
-        # 5. Attach SLA info for Central Alerts
         if all_central_records_flat:
             await attach_sla_info_to_alerts(all_central_records_flat)
 
-        # 6. BATCH REDIS FETCHING (MGET)
         all_ids = alert_ids + call_ids
         closed_keys = [f"{ESC_CLOSED_PREFIX}{id}" for id in all_ids]
         level_keys = [f"{ESC_LEVEL_REDIS_PREFIX}{id}" for id in all_ids]
@@ -7287,10 +5025,8 @@ async def get_all_alerts(
             closed_map = {all_ids[i]: closed_vals[i] for i in range(len(all_ids))}
             level_map = {all_ids[i]: level_vals[i] for i in range(len(all_ids))}
 
-        # 7. Build Response
         response_data = []
         
-        # 👇 NAYA: Common fields jo group level par dikhani hai, records se hata dega
         FIELDS_TO_LIFT = [
             "system_type", "inc_latitude", "inc_longitude", "amb_lat", "amb_long", 
             "inc_datetime", "pilot_name", "pilot_mobile", "paramedic_name", "paramedic_mobile", 
@@ -7301,7 +5037,6 @@ async def get_all_alerts(
         for alert in unified_alerts:
             
             if alert.get("record_source") == "central":
-                # --- CENTRAL GROUP LOGIC ---
                 max_level = 1
                 any_closed = False
                 action_details_group = None
@@ -7332,7 +5067,8 @@ async def get_all_alerts(
                         rec["is_closed"] = False
                         lvl = to_int(level_map.get(rec_id))
                         if lvl is None:
-                            lvl = await get_or_init_escalation_level(rec_id, rec.get("sort_time"), is_denial=False)
+                            min_lvl = 2 if rec.get("alert_type") == "MDT_NOT_LOGGED_IN" else 1
+                            lvl = await get_or_init_escalation_level(rec_id, rec.get("sort_time"), is_denial=False, min_level=min_lvl)
 
                     if lvl > max_level:
                         max_level = lvl
@@ -7380,17 +5116,14 @@ async def get_all_alerts(
                             try: rec[d_key] = d_val.replace("T", " ").split(".")[0]
                             except: pass
 
-                # 👇 NAYA: Common Fields ko Upar Lift Karo & Neeche Se Hatao
                 if alert.get("records"):
                     first_rec = alert["records"][0]
                     for field in FIELDS_TO_LIFT:
                         if field in first_rec:
                             val = first_rec.get(field)
-                            # Datetime format fix
                             if isinstance(val, datetime):
                                 val = val.strftime("%Y-%m-%d %H:%M:%S")
                             alert[field] = val
-                            # Remove from all records inside array
                             for rec in alert["records"]:
                                 rec.pop(field, None)
 
@@ -7413,7 +5146,6 @@ async def get_all_alerts(
                 response_data.append(alert)
 
             else:
-                # --- DENIAL GROUP LOGIC ---
                 call_id = str(alert.get("call_id") or "")
                 if not call_id or call_id == "0":
                     continue
@@ -7459,7 +5191,6 @@ async def get_all_alerts(
 
                 response_data.append(alert)
 
-        # Apply District Filter at the end
         if district:
             response_data = filter_payloads_by_district(response_data, district)
 
@@ -7476,17 +5207,13 @@ async def get_all_alerts(
         return {"status": "error", "message": str(e)}
 
 
-
 @app.get("/api/fix/audit_table")
 async def fix_audit_table():
-    """Ek baar run karne se audit table me saare records fresh ho jayenge."""
     try:
         logger.info("🛠️ Starting Audit Table Cleanup & Fix...")
         
-        # 1. Aaj ke saare records delete karo
         await database2.execute("DELETE FROM alert_escalation_flow WHERE alert_generated_at::date = CURRENT_DATE OR created_at::date = CURRENT_DATE")
         
-        # 2. Central Alerts ko sahi se wapas insert karo
         central_rows = await database2.fetch_all(
             "SELECT alert_id, created_date, escalate_status FROM public.central_alerts WHERE created_date::date = CURRENT_DATE"
         )
@@ -7505,7 +5232,6 @@ async def fix_audit_table():
                 if level > 1:
                     await update_escalation_flow(call_id=0, alert_id=call_id_str, level=level, event_type="LEVEL_BUMP", generated_at=row["created_date"])
 
-        # 3. Denial Alerts ko sahi se wapas insert karo
         denial_rows = await database2.fetch_all(
             "SELECT DISTINCT ON (call_id) call_id, added_date, escalate_status FROM public.denial_escalation_master WHERE added_date::date = CURRENT_DATE ORDER BY call_id, added_date DESC"
         )
@@ -7530,88 +5256,17 @@ async def fix_audit_table():
     except Exception as e:
         logger.exception(f"Fix Audit Table FAILED: {e}")
         return {"status": "error", "message": str(e)}
-    
-
-
-
-
-#<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<Monitor>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-# @app.get("/api/fix/false_alerts")
-# async def cleanup_false_alerts():
-#     """Aaj ke saare false alerts (jinme SLA breach nahi hua) delete karega."""
-#     try:
-#         logger.info("🛠️ Starting False Alerts Cleanup...")
-        
-#         # 1. Aaj ke saare central alerts fetch karo
-#         alerts = await database2.fetch_all(
-#             "SELECT alert_id, incident_id, alert_type FROM central_alerts WHERE created_date::date = CURRENT_DATE"
-#         )
-        
-#         if not alerts:
-#             return {"status": "success", "message": "No alerts to check today."}
-            
-#         thresholds = await get_active_thresholds()
-#         deleted_count = 0
-        
-#         # 2. Saare incident_ids ke liye RTM data ek hi baar fetch karo (Batch Query)
-#         inc_ids = [str(a['incident_id']) for a in alerts if a['incident_id']]
-#         rtm_data = {}
-        
-#         if inc_ids:
-#             placeholders = ", ".join([f":id{i}" for i in range(len(inc_ids))])
-#             params = {f"id{i}": inc_ids[i] for i in range(len(inc_ids))}
-#             query = f"SELECT * FROM rtm_dashboard WHERE inc_ref_id IN ({placeholders})"
-#             rtm_rows = await database2.fetch_all(query, params)
-#             for r in rtm_rows:
-#                 rtm_data[str(r["inc_ref_id"])] = normalize_row(r)
-        
-#         # 3. Har alert check karo ki kya wo sach me breach tha?
-#         for alert in alerts:
-#             inc_id = str(alert['incident_id'])
-#             rtm_row = rtm_data.get(inc_id)
-            
-#             if not rtm_row:
-#                 continue # Agar RTM table me data nahi hai, to skip karo (safe side)
-            
-#             # Naye wale guarded logic se valid alerts nikalo
-#             valid_alerts = resolve_alerts(rtm_row, thresholds)
-#             valid_types = [v[0] for v in valid_alerts]
-            
-#             # Agar ye alert valid list me nahi hai, to ise FALSE alert maan kar delete karo
-#             if alert['alert_type'] not in valid_types:
-#                 await database2.execute(
-#                     "DELETE FROM central_alerts WHERE alert_id = :id", 
-#                     {"id": alert['alert_id']}
-#                 )
-#                 await database2.execute(
-#                     "DELETE FROM alert_escalation_flow WHERE alert_id = :id", 
-#                     {"id": alert['alert_id']}
-#                 )
-#                 deleted_count += 1
-#                 logger.info(f"Deleted false alert: {alert['alert_id']} (Type: {alert['alert_type']})")
-                
-#         return {
-#             "status": "success", 
-#             "message": f"Cleanup complete! Deleted {deleted_count} false alerts out of {len(alerts)} checked."
-#         }
-        
-#     except Exception as e:
-#         logger.exception(f"False Alerts Cleanup FAILED: {e}")
-#         return {"status": "error", "message": str(e)}
 
 
 @app.get("/api/maintenance/clear-cache")
 async def clear_memory_cache():
-    """Clears Python in-memory caches and runs Garbage Collector. Zero Downtime!"""
     import gc
     global _cache, _cache_expiry, _payload_cache
     
-    # Dicts ko khali karo
     _cache.clear()
     _cache_expiry.clear()
     _payload_cache.clear()
     
-    # Python ko force karo memory cleanup karne ke liye
     gc.collect()
     
     logger.info("🧹 In-memory caches cleared and Garbage Collector run successfully.")
