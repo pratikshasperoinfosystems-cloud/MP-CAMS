@@ -2649,9 +2649,8 @@ async def download_client_report(
     await init_redis()
 
     # ==========================================
-    # 🚀 FETCH CURRENT ESCALATION LEVELS (FIXED r.keys() BUG)
+    # 🚀 FETCH CURRENT ESCALATION LEVELS
     # ==========================================
-    # 1. For Incident Alerts
     inc_ids = [str(r["alert_id"]) for r in rows if "alert_id" in r.keys() and r["alert_id"] is not None]
     inc_current_roles = {}
     if inc_ids:
@@ -2684,7 +2683,6 @@ async def download_client_report(
         except Exception as e:
             logger.error(f"Redis fetch failed for Incident roles: {e}")
 
-    # 2. For Denial Alerts
     den_ids = [str(r["call_id"]) for r in denial_rows if "call_id" in r.keys() and r["call_id"] is not None]
     den_current_roles = {}
     if den_ids:
@@ -2719,7 +2717,55 @@ async def download_client_report(
         except Exception as e:
             logger.error(f"Redis fetch failed for Denial roles: {e}")
 
+    # ==========================================
+    # 🆕 FETCH ESCALATED BY NAMES FROM MYSQL (Batch Query)
+    # ==========================================
+    all_escalated_ids = set()
+    for r in rows:
+        esc_by = r.get("escalated_by")
+        if esc_by:
+            ids = [x.strip().strip('"').strip("'") for x in str(esc_by).split(",") if x.strip()]
+            all_escalated_ids.update(ids)
+            
+    for r in denial_rows:
+        esc_by = r.get("escalated_by")
+        if esc_by:
+            ids = [x.strip().strip('"').strip("'") for x in str(esc_by).split(",") if x.strip()]
+            all_escalated_ids.update(ids)
+            
+    id_to_name_map = {}
+    if all_escalated_ids:
+        try:
+            unique_ids = list(all_escalated_ids)
+            placeholders = ", ".join([f":id{i}" for i in range(len(unique_ids))])
+            params = {f"id{i}": unique_ids[i] for i in range(len(unique_ids))}
+            
+            # MySQL se first, mid, last name combine karke full name nikaalo
+            mysql_query = f"""
+                SELECT clg_ref_id, 
+                       TRIM(CONCAT(clg_first_name, ' ', IFNULL(clg_mid_name, ''), ' ', clg_last_name)) AS full_name 
+                FROM ems_colleague 
+                WHERE clg_ref_id IN ({placeholders})
+            """
+            mysql_rows = await database.fetch_all(mysql_query, params)
+            for mr in mysql_rows:
+                id_to_name_map[mr["clg_ref_id"]] = mr["full_name"]
+        except Exception as e:
+            logger.error(f"Failed to fetch escalated_by names from MySQL: {e}")
 
+    # Helper function for Pandas
+    def get_escalated_names(raw_val):
+        if not raw_val or pd.isna(raw_val):
+            return ""
+        ids = [x.strip().strip('"').strip("'") for x in str(raw_val).split(",") if x.strip()]
+        if not ids:
+            return ""
+        names = [id_to_name_map.get(id_str, id_str) for id_str in ids]
+        return ", ".join(names)
+
+    # ==========================================
+    # EXCEL GENERATION
+    # ==========================================
     def generate_excel_sync():
         df = pd.DataFrame([dict(r) for r in rows]) if rows else pd.DataFrame()
         if not df.empty:
@@ -2728,7 +2774,11 @@ async def download_client_report(
             # Map the fetched roles directly into the DataFrame
             df["Current Escalation Level"] = df["alert_id"].astype(str).map(inc_current_roles).fillna("Pending")
             
-            # 📌 Purana wala Escalation Status add kiya (Open, In Progress, Escalated, Closed)
+            # 🆕 Naya Column: "Escalated By Name"
+            if "escalated_by" in df.columns:
+                df["Escalated By Name"] = df["escalated_by"].apply(get_escalated_names)
+            
+            # 📌 Purana wala Escalation Status add kiya
             escalation_map = {
                 "0": "Open",
                 "1": "In Progress",
@@ -2806,8 +2856,8 @@ async def download_client_report(
                 "Back To Base Time",
                 "Updated Date & Time",
                 "Current Escalation Level", 
-                "Escalation Status",  # 👈 Yahan add kiya Incident sheet me
-                "Escalated Date", "Escalated By",
+                "Escalation Status",  
+                "Escalated Date", "Escalated By", "Escalated By Name",  # 👈 Naya column add kiya
                 "Escalated/Deny Remark", "Cancel Date", "Cancel By", "Remark",
             ]
             
@@ -2822,6 +2872,10 @@ async def download_client_report(
             
             # Map the fetched roles directly into the DataFrame
             df_denial["Current Escalation Level"] = df_denial["call_id"].astype(str).map(den_current_roles).fillna("Pending")
+            
+            # 🆕 Naya Column: "Escalated By Name" for Denial
+            if "escalated_by" in df_denial.columns:
+                df_denial["Escalated By Name"] = df_denial["escalated_by"].apply(get_escalated_names)
             
             # 📌 Purana wala Escalation Status add kiya Denial sheet me
             denial_escalation_map = {
@@ -2874,8 +2928,8 @@ async def download_client_report(
                 "Denial Remark", "District", "Alert Type", "Added By",
                 "Added Date & Time", 
                 "Current Escalation Level", 
-                "Escalation Status",  # 👈 Yahan add kiya Denial sheet me
-                "Escalated Date", "Escalated By",
+                "Escalation Status",  
+                "Escalated Date", "Escalated By", "Escalated By Name",  # 👈 Naya column add kiya
                 "Escalated Remark",
                 "Cancel Date", "Cancel By",
                 "Action Remark",
