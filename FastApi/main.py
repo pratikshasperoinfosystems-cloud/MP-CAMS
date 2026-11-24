@@ -2,6 +2,8 @@
 # Central Alert Management System (CAMS) — FastAPI Application
 # Production-ready with real-time WebSocket syncing
 # ============================================================
+import re
+import httpx
 import uuid
 import os
 import time
@@ -96,6 +98,13 @@ notifier_task = None
 redis_sub_task = None
 denial_worker_task = None
 esc_bump_task = None
+fuel_level_task = None
+fuel_drain_task = None
+fuel_bump_task = None
+
+FUEL_GPS_USERNAME = os.getenv("FUEL_GPS_USERNAME")
+FUEL_GPS_PASSWORD = os.getenv("FUEL_GPS_PASSWORD")
+_fuel_auth_token = None
 
 security = HTTPBearer()
 
@@ -1458,6 +1467,7 @@ async def run_worker_with_restart():
 async def lifespan(app: FastAPI):
     global alert_worker_task, notifier_task, redis_sub_task, denial_worker_task
     global esc_bump_task, reconciliation_task
+    global fuel_level_task, fuel_drain_task, fuel_bump_task
 
     await database.connect()
     await database2.connect()
@@ -1481,12 +1491,15 @@ async def lifespan(app: FastAPI):
     denial_worker_task = asyncio.create_task(denial_complaints_insert_worker())
     esc_bump_task = asyncio.create_task(escalation_level_bump_watcher())
     reconciliation_task = asyncio.create_task(audit_table_reconciliation_worker())
+    fuel_level_task = asyncio.create_task(fuel_level_tracking_worker())
+    fuel_drain_task = asyncio.create_task(fuel_drain_tracking_worker())
+    fuel_bump_task = asyncio.create_task(fuel_alert_bump_worker())
 
     logger.info("Application STARTED — all workers + escalation bump watcher running")
 
     yield
 
-    for t in [alert_worker_task, notifier_task, redis_sub_task, denial_worker_task, esc_bump_task, reconciliation_task]:
+    for t in [alert_worker_task, notifier_task, redis_sub_task, denial_worker_task, esc_bump_task, reconciliation_task,fuel_level_task, fuel_drain_task, fuel_bump_task]:
         if t:
             t.cancel()
             try:
@@ -2234,334 +2247,6 @@ async def dashboard_alerts_overview(
         "severity_timeline": severity_data
     }
 ####################################################################################################
-# @app.get("/api/dashboard/download-client-report")
-# async def download_client_report(
-#     range_type: str = Query("today", enum=["today", "month", "all", "last_1_hr"])
-# ):
-#     # 1. Central Alerts ke liye date filter
-#     if range_type == "last_1_hr":
-#         date_filter = "created_date >= NOW() - INTERVAL '1 hour'"
-#     else:
-#         date_filter = get_date_filter(range_type)
-
-#     # 2. Denial Alerts ke liye alag date filter
-#     if range_type == "today":
-#         denial_date_filter = "DATE(added_date) = CURRENT_DATE"
-#     elif range_type == "month":
-#         denial_date_filter = "DATE_TRUNC('month', added_date) = DATE_TRUNC('month', CURRENT_DATE)"
-#     elif range_type == "last_1_hr":
-#         denial_date_filter = "added_date >= NOW() - INTERVAL '1 hour'"
-#     else:
-#         denial_date_filter = "1=1"
-        
-#     full_sql = f"""
-#     SELECT *,
-#            CASE 
-#                WHEN alert_type = 'AT_SCENE_DELAY' THEN rd.at_scene
-#                WHEN alert_type = 'START_DELAY' THEN rd.start_from_base_loc
-#                WHEN alert_type = 'ACK_DELAY' THEN rd.acknowledge
-#                WHEN alert_type = 'BACK_TO_BASE_DELAY' THEN rd.back_to_base_loc
-#                ELSE NULL
-#            END AS alert_closed_datetime
-#     FROM public.central_alerts
-#     LEFT JOIN public.rtm_dashboard rd ON central_alerts.incident_id = rd.inc_ref_id
-#     WHERE is_deleted = false
-#     AND {date_filter}
-#     ORDER BY created_date DESC
-#     """
-#     rows = await database2.fetch_all(full_sql)
-
-#     denial_sql = f"""
-#     SELECT id, mysql_id, call_id, amb_no, amb_default_mobile, caller_no,
-#            hp_name, challenge_val, meaning, denial_remark, remark, dst_name,
-#            alert_type, added_by, added_date, escalate_status
-#     FROM public.denial_escalation_master
-#     WHERE (is_deleted = FALSE OR is_deleted IS NULL)
-#     AND {denial_date_filter}
-#     ORDER BY added_date DESC
-#     """
-#     denial_rows = await database2.fetch_all(denial_sql)
-
-#     summary_sql = f"""
-#     SELECT
-#         COUNT(*) as total_alerts,
-#         COUNT(*) FILTER (WHERE escalate_status='2') as escalated_alerts,
-#         COUNT(*) FILTER (WHERE system_type='108') as system_108
-#     FROM public.central_alerts
-#     WHERE is_deleted = false
-#     AND {date_filter}
-#     """
-#     summary_row = await database2.fetch_one(summary_sql)
-#     summary_data = dict(summary_row) if summary_row else {"total_alerts": 0, "escalated_alerts": 0, "system_108": 0}
-    
-#     denial_summary_sql = f"""
-#     SELECT
-#         COUNT(DISTINCT call_id) as denial_total,
-#         COUNT(DISTINCT call_id) FILTER (WHERE escalate_status='2') as denial_escalated
-#     FROM public.denial_escalation_master
-#     WHERE (is_deleted = FALSE OR is_deleted IS NULL)
-#     AND {denial_date_filter}
-#     """
-#     denial_summary_row = await database2.fetch_one(denial_summary_sql)
-#     denial_summary_data = dict(denial_summary_row) if denial_summary_row else {"denial_total": 0, "denial_escalated": 0}
-    
-#     final_summary = {
-#         "Total Incident Alerts": summary_data.get("total_alerts", 0),
-#         "Total Call Denial Alerts (Distinct Call ID)": denial_summary_data.get("denial_total", 0),
-#         "Grand Total (Incident + Denial)": summary_data.get("total_alerts", 0) + denial_summary_data.get("denial_total", 0),
-#         "Escalated Incident Alerts": summary_data.get("escalated_alerts", 0),
-#         "Escalated Call Denial Alerts": denial_summary_data.get("denial_escalated", 0),
-#         "Total System 108 (Incident + Denial)": summary_data.get("system_108", 0) + denial_summary_data.get("denial_total", 0)
-#     }
-#     df_summary = pd.DataFrame([final_summary])
-
-#     # Ensure Redis is initialized
-#     await init_redis()
-
-#     # ==========================================
-#     # 🚀 FETCH CURRENT ESCALATION LEVELS (FIXED r.keys() BUG)
-#     # ==========================================
-#     # 1. For Incident Alerts
-#     inc_ids = [str(r["alert_id"]) for r in rows if "alert_id" in r.keys() and r["alert_id"] is not None]
-#     inc_current_roles = {}
-#     if inc_ids:
-#         try:
-#             inc_level_keys = [f"{ESC_LEVEL_REDIS_PREFIX}{id}" for id in inc_ids]
-#             inc_closed_keys = [f"{ESC_CLOSED_PREFIX}{id}" for id in inc_ids]
-            
-#             inc_levels_raw, inc_closed_raw = await asyncio.gather(
-#                 redis_client.mget(inc_level_keys),
-#                 redis_client.mget(inc_closed_keys)
-#             )
-            
-#             for i, inc_id in enumerate(inc_ids):
-#                 row_dict = dict(rows[i])
-#                 esc_stat = str(row_dict.get("escalate_status"))
-#                 is_closed = (inc_closed_raw[i] is not None) or (esc_stat == '2')
-                
-#                 if is_closed:
-#                     inc_current_roles[inc_id] = "Closed (Action Taken)"
-#                 else:
-#                     level = to_int(inc_levels_raw[i])
-#                     if level is None:
-#                         elapsed = elapsed_minutes_since(row_dict.get("created_date"))
-#                         level = min(get_level_for_elapsed_minutes(elapsed), 7)
-                    
-#                     role = LEVEL_INFO_CENTRAL.get(level, {}).get("role", "MDT Device")
-#                     if role == "MDT":
-#                         role = "MDT Device"
-#                     inc_current_roles[inc_id] = role
-#         except Exception as e:
-#             logger.error(f"Redis fetch failed for Incident roles: {e}")
-
-#     # 2. For Denial Alerts
-#     den_ids = [str(r["call_id"]) for r in denial_rows if "call_id" in r.keys() and r["call_id"] is not None]
-#     den_current_roles = {}
-#     if den_ids:
-#         try:
-#             den_level_keys = [f"{ESC_LEVEL_REDIS_PREFIX}{id}" for id in den_ids]
-#             den_closed_keys = [f"{ESC_CLOSED_PREFIX}{id}" for id in den_ids]
-            
-#             den_levels_raw, den_closed_raw = await asyncio.gather(
-#                 redis_client.mget(den_level_keys),
-#                 redis_client.mget(den_closed_keys)
-#             )
-            
-#             for i, den_id in enumerate(den_ids):
-#                 row_dict = dict(denial_rows[i])
-#                 esc_stat = str(row_dict.get("escalate_status"))
-#                 is_closed = (den_closed_raw[i] is not None) or (esc_stat == '2')
-                
-#                 if is_closed:
-#                     den_current_roles[den_id] = "Closed (Action Taken)"
-#                 else:
-#                     level = to_int(den_levels_raw[i])
-#                     if level is None:
-#                         elapsed = elapsed_minutes_since(row_dict.get("added_date"))
-#                         level = get_level_for_elapsed_minutes(elapsed)
-#                         if level < 2: level = 2
-#                         level = min(level, 7)
-                    
-#                     role = LEVEL_INFO_CENTRAL.get(level, {}).get("role", "District Manager (DM)")
-#                     if role == "MDT":
-#                         role = "MDT Device"
-#                     den_current_roles[den_id] = role
-#         except Exception as e:
-#             logger.error(f"Redis fetch failed for Denial roles: {e}")
-
-
-#     def generate_excel_sync():
-#         df = pd.DataFrame([dict(r) for r in rows]) if rows else pd.DataFrame()
-#         if not df.empty:
-#             df.insert(0, "Sr No", list(range(1, len(df) + 1)))
-            
-#             # Map the fetched roles directly into the DataFrame
-#             df["Current Escalation Level"] = df["alert_id"].astype(str).map(inc_current_roles).fillna("Pending")
-            
-#             # 📌 Purana wala Escalation Status add kiya (Open, In Progress, Escalated, Closed)
-#             escalation_map = {
-#                 "0": "Open",
-#                 "1": "In Progress",
-#                 "2": "Escalated",
-#                 "3": "Closed"
-#             }
-#             if "escalate_status" in df.columns:
-#                 df["Escalation Status"] = df["escalate_status"].astype(str).map(escalation_map)
-#                 df.drop(columns=["escalate_status"], inplace=True)
-                
-#             if "is_deleted" in df.columns:
-#                 df.drop(columns=["is_deleted"], inplace=True)
-                
-#             if "alert_closed_datetime" in df.columns:
-#                 df["alert_closed_datetime"] = pd.to_datetime(df["alert_closed_datetime"], errors="coerce").dt.strftime("%d-%m-%Y %H:%M")
- 
-#             date_cols = ["created_date", "updated_date", "cancel_date", "escalated_date"]
-#             for col in date_cols:
-#                 if col in df.columns:
-#                     df[col] = pd.to_datetime(df[col], errors="coerce").dt.strftime("%d-%m-%Y %H:%M")
-                    
-#             rtm_time_cols = ["acknowledge", "start_from_base_loc", "at_scene", "patient_handover", "back_to_base_loc"]
-#             for col in rtm_time_cols:
-#                 if col in df.columns:
-#                     df[col] = pd.to_datetime(df[col], errors="coerce").dt.strftime("%d-%m-%Y %H:%M")
- 
-#             rename_map = {
-#                 "severity": "Severity",
-#                 "created_date": "Alert Generated Date",          
-#                 "updated_date": "Updated Date & Time",
-#                 "division": "Division",
-#                 "district": "District",
-#                 "inc_latitude": "Incidence Latitude",
-#                 "inc_longitude": "Incidence Longitude",
-#                 "amb_lat": "Ambulance Lattitude",
-#                 "amb_long": "Ambulance Longitude",
-#                 "paramedic_name": "EMT Name",
-#                 "paramedic_mobile": "EMT Mobile",
-#                 "inc_datetime": "Incidence Datetime",
-#                 "alert_type": "Alert Type",
-#                 "incident_id": "Incident Id",
-#                 "ambulance_no": "Ambulance Number",
-#                 "remark": "Remark",
-#                 "escalated_deny_remark": "Escalated/Deny Remark",
-#                 "pilot_name": "Pilot Name",
-#                 "pilot_mobile": "Pilot Mobile",
-#                 "escalated_date": "Escalated Date",
-#                 "cancel_date": "Cancel Date",
-#                 "escalated_by": "Escalated By",
-#                 "cancel_by": "Cancel By",
-#                 "system_type": "System Type",
-#                 "alert_id": "Alert ID",
-#                 "Sr No": "Sr No",
-#                 "alert_closed_datetime": "Alert Closed Datetime", 
-#                 "acknowledge": "Acknowledge Time",
-#                 "start_from_base_loc": "Start From Base Time",
-#                 "at_scene": "At Scene Time",
-#                 "patient_handover": "Patient Handover Time",
-#                 "back_to_base_loc": "Back To Base Time",
-#             }
-#             df.rename(columns=rename_map, inplace=True)
-            
-#             column_order = [
-#                 "Sr No", "Alert ID", "Alert Type", "System Type", "Severity",
-#                 "Incident Id", "Incidence Datetime", "Division", "District",
-#                 "Incidence Latitude", "Incidence Longitude", "Ambulance Number",
-#                 "Ambulance Lattitude", "Ambulance Longitude", "Pilot Name",
-#                 "Pilot Mobile", "EMT Name", "EMT Mobile",
-#                 "Alert Generated Date",          
-#                 "Alert Closed Datetime", 
-#                 "Acknowledge Time", 
-#                 "Start From Base Time", 
-#                 "At Scene Time", 
-#                 "Patient Handover Time", 
-#                 "Back To Base Time",
-#                 "Updated Date & Time",
-#                 "Current Escalation Level", 
-#                 "Escalation Status",  # 👈 Yahan add kiya Incident sheet me
-#                 "Escalated Date", "Escalated By",
-#                 "Escalated/Deny Remark", "Cancel Date", "Cancel By", "Remark",
-#             ]
-            
-#             existing_ordered_cols = [c for c in column_order if c in df.columns]
-#             df = df[existing_ordered_cols]
-#         else:
-#             df = pd.DataFrame([{"Message": "No Incident Alert Data Found"}])
-            
-#         df_denial = pd.DataFrame([dict(r) for r in denial_rows]) if denial_rows else pd.DataFrame()
-#         if not df_denial.empty:
-#             df_denial.insert(0, "Sr No", list(range(1, len(df_denial) + 1)))
-            
-#             # Map the fetched roles directly into the DataFrame
-#             df_denial["Current Escalation Level"] = df_denial["call_id"].astype(str).map(den_current_roles).fillna("Pending")
-            
-#             # 📌 Purana wala Escalation Status add kiya Denial sheet me
-#             denial_escalation_map = {
-#                 "0": "Open",
-#                 "1": "In Progress",
-#                 "2": "Escalated",
-#                 "3": "Closed"
-#             }
-#             if "escalate_status" in df_denial.columns:
-#                 df_denial["Escalation Status"] = df_denial["escalate_status"].astype(str).map(denial_escalation_map)
-#                 df_denial.drop(columns=["escalate_status"], inplace=True)
-                
-#             if "added_date" in df_denial.columns:
-#                 df_denial["Added Date & Time"] = pd.to_datetime(df_denial["added_date"], errors="coerce").dt.strftime("%d-%m-%Y %H:%M")
-#                 df_denial.drop(columns=["added_date"], inplace=True)
-#             if "mysql_id" in df_denial.columns:
-#                 df_denial.drop(columns=["mysql_id"], inplace=True)
-                
-#             denial_rename_map = {
-#                 "Sr No": "Sr No",
-#                 "id": "Denial ID",
-#                 "call_id": "Call ID",
-#                 "amb_no": "Ambulance Number",
-#                 "amb_default_mobile": "Ambulance Mobile",
-#                 "caller_no": "Caller No",
-#                 "hp_name": "Hospital Name",
-#                 "challenge_val": "Challenge",
-#                 "meaning": "Denial Reason",
-#                 "denial_remark": "Denial Remark",
-#                 "remark": "Action Remark",                        
-#                 "dst_name": "District",
-#                 "alert_type": "Alert Type",
-#                 "added_by": "Added By",
-#                 "Added Date & Time": "Added Date & Time",
-#             }
-#             df_denial.rename(columns=denial_rename_map, inplace=True)
-            
-#             denial_column_order = [
-#                 "Sr No", "Denial ID", "Call ID", "Ambulance Number", "Ambulance Mobile",
-#                 "Caller No", "Hospital Name", "Challenge", "Denial Reason",
-#                 "Denial Remark", "District", "Alert Type", "Added By",
-#                 "Added Date & Time", 
-#                 "Current Escalation Level", 
-#                 "Escalation Status",  # 👈 Yahan add kiya Denial sheet me
-#                 "Action Remark",
-#             ]
-#             denial_ordered_cols = [c for c in denial_column_order if c in df_denial.columns]
-#             df_denial = df_denial[denial_ordered_cols]
-#         else:
-#             df_denial = pd.DataFrame([{"Message": "No Call Denial Data Found"}])
-            
-#         output = io.BytesIO()
-#         with pd.ExcelWriter(output, engine="openpyxl") as writer:
-#             df.to_excel(writer, sheet_name="Incident Alerts", index=False)
-#             df_denial.to_excel(writer, sheet_name="Call Denial Alerts", index=False)
-#             df_summary.to_excel(writer, sheet_name="Summary", index=False)
-#             workbook = writer.book
-#             format_worksheet(workbook["Incident Alerts"])
-#             format_worksheet(workbook["Call Denial Alerts"])
-#             format_worksheet(workbook["Summary"])
-#         return output.getvalue()
- 
-#     excel_bytes = await asyncio.to_thread(generate_excel_sync)
-#     file_name = f"Central_Alerts_Client_Report_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
-#     return StreamingResponse(
-#         io.BytesIO(excel_bytes),
-#         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-#         headers={"Content-Disposition": f"attachment; filename={file_name}"}
-#     )
-##################################################################################################
 @app.get("/api/dashboard/download-client-report")
 async def download_client_report(
     range_type: str = Query("today", enum=["today", "month", "all", "last_1_hr"])
@@ -2602,9 +2287,7 @@ async def download_client_report(
     denial_sql = f"""
     SELECT id, mysql_id, call_id, amb_no, amb_default_mobile, caller_no,
            hp_name, challenge_val, meaning, denial_remark, remark, dst_name,
-           alert_type, added_by, added_date, escalate_status,
-           escalated_by, escalated_date, cancel_by, cancel_date,
-           escalation_deny_remark
+           alert_type, added_by, added_date, escalate_status
     FROM public.denial_escalation_master
     WHERE (is_deleted = FALSE OR is_deleted IS NULL)
     AND {denial_date_filter}
@@ -2649,8 +2332,9 @@ async def download_client_report(
     await init_redis()
 
     # ==========================================
-    # 🚀 FETCH CURRENT ESCALATION LEVELS
+    # 🚀 FETCH CURRENT ESCALATION LEVELS (FIXED r.keys() BUG)
     # ==========================================
+    # 1. For Incident Alerts
     inc_ids = [str(r["alert_id"]) for r in rows if "alert_id" in r.keys() and r["alert_id"] is not None]
     inc_current_roles = {}
     if inc_ids:
@@ -2683,6 +2367,7 @@ async def download_client_report(
         except Exception as e:
             logger.error(f"Redis fetch failed for Incident roles: {e}")
 
+    # 2. For Denial Alerts
     den_ids = [str(r["call_id"]) for r in denial_rows if "call_id" in r.keys() and r["call_id"] is not None]
     den_current_roles = {}
     if den_ids:
@@ -2717,55 +2402,7 @@ async def download_client_report(
         except Exception as e:
             logger.error(f"Redis fetch failed for Denial roles: {e}")
 
-    # ==========================================
-    # 🆕 FETCH ESCALATED BY NAMES FROM MYSQL (Batch Query)
-    # ==========================================
-    all_escalated_ids = set()
-    for r in rows:
-        esc_by = r.get("escalated_by")
-        if esc_by:
-            ids = [x.strip().strip('"').strip("'") for x in str(esc_by).split(",") if x.strip()]
-            all_escalated_ids.update(ids)
-            
-    for r in denial_rows:
-        esc_by = r.get("escalated_by")
-        if esc_by:
-            ids = [x.strip().strip('"').strip("'") for x in str(esc_by).split(",") if x.strip()]
-            all_escalated_ids.update(ids)
-            
-    id_to_name_map = {}
-    if all_escalated_ids:
-        try:
-            unique_ids = list(all_escalated_ids)
-            placeholders = ", ".join([f":id{i}" for i in range(len(unique_ids))])
-            params = {f"id{i}": unique_ids[i] for i in range(len(unique_ids))}
-            
-            # MySQL se first, mid, last name combine karke full name nikaalo
-            mysql_query = f"""
-                SELECT clg_ref_id, 
-                       TRIM(CONCAT(clg_first_name, ' ', IFNULL(clg_mid_name, ''), ' ', clg_last_name)) AS full_name 
-                FROM ems_colleague 
-                WHERE clg_ref_id IN ({placeholders})
-            """
-            mysql_rows = await database.fetch_all(mysql_query, params)
-            for mr in mysql_rows:
-                id_to_name_map[mr["clg_ref_id"]] = mr["full_name"]
-        except Exception as e:
-            logger.error(f"Failed to fetch escalated_by names from MySQL: {e}")
 
-    # Helper function for Pandas
-    def get_escalated_names(raw_val):
-        if not raw_val or pd.isna(raw_val):
-            return ""
-        ids = [x.strip().strip('"').strip("'") for x in str(raw_val).split(",") if x.strip()]
-        if not ids:
-            return ""
-        names = [id_to_name_map.get(id_str, id_str) for id_str in ids]
-        return ", ".join(names)
-
-    # ==========================================
-    # EXCEL GENERATION
-    # ==========================================
     def generate_excel_sync():
         df = pd.DataFrame([dict(r) for r in rows]) if rows else pd.DataFrame()
         if not df.empty:
@@ -2774,11 +2411,7 @@ async def download_client_report(
             # Map the fetched roles directly into the DataFrame
             df["Current Escalation Level"] = df["alert_id"].astype(str).map(inc_current_roles).fillna("Pending")
             
-            # 🆕 Naya Column: "Escalated By Name"
-            if "escalated_by" in df.columns:
-                df["Escalated By Name"] = df["escalated_by"].apply(get_escalated_names)
-            
-            # 📌 Purana wala Escalation Status add kiya
+            # 📌 Purana wala Escalation Status add kiya (Open, In Progress, Escalated, Closed)
             escalation_map = {
                 "0": "Open",
                 "1": "In Progress",
@@ -2856,8 +2489,8 @@ async def download_client_report(
                 "Back To Base Time",
                 "Updated Date & Time",
                 "Current Escalation Level", 
-                "Escalation Status",  
-                "Escalated Date", "Escalated By", "Escalated By Name",  # 👈 Naya column add kiya
+                "Escalation Status",  # 👈 Yahan add kiya Incident sheet me
+                "Escalated Date", "Escalated By",
                 "Escalated/Deny Remark", "Cancel Date", "Cancel By", "Remark",
             ]
             
@@ -2872,10 +2505,6 @@ async def download_client_report(
             
             # Map the fetched roles directly into the DataFrame
             df_denial["Current Escalation Level"] = df_denial["call_id"].astype(str).map(den_current_roles).fillna("Pending")
-            
-            # 🆕 Naya Column: "Escalated By Name" for Denial
-            if "escalated_by" in df_denial.columns:
-                df_denial["Escalated By Name"] = df_denial["escalated_by"].apply(get_escalated_names)
             
             # 📌 Purana wala Escalation Status add kiya Denial sheet me
             denial_escalation_map = {
@@ -2893,12 +2522,6 @@ async def download_client_report(
                 df_denial.drop(columns=["added_date"], inplace=True)
             if "mysql_id" in df_denial.columns:
                 df_denial.drop(columns=["mysql_id"], inplace=True)
-
-            # 🆕 Escalated & Cancel date columns format karke rename
-            for col, new_col in [("escalated_date", "Escalated Date"), ("cancel_date", "Cancel Date")]:
-                if col in df_denial.columns:
-                    df_denial[new_col] = pd.to_datetime(df_denial[col], errors="coerce").dt.strftime("%d-%m-%Y %H:%M")
-                    df_denial.drop(columns=[col], inplace=True)
                 
             denial_rename_map = {
                 "Sr No": "Sr No",
@@ -2916,9 +2539,6 @@ async def download_client_report(
                 "alert_type": "Alert Type",
                 "added_by": "Added By",
                 "Added Date & Time": "Added Date & Time",
-                "escalated_by": "Escalated By",
-                "cancel_by": "Cancel By",
-                "escalation_deny_remark": "Escalated Remark",
             }
             df_denial.rename(columns=denial_rename_map, inplace=True)
             
@@ -2928,10 +2548,7 @@ async def download_client_report(
                 "Denial Remark", "District", "Alert Type", "Added By",
                 "Added Date & Time", 
                 "Current Escalation Level", 
-                "Escalation Status",  
-                "Escalated Date", "Escalated By", "Escalated By Name",  # 👈 Naya column add kiya
-                "Escalated Remark",
-                "Cancel Date", "Cancel By",
+                "Escalation Status",  # 👈 Yahan add kiya Denial sheet me
                 "Action Remark",
             ]
             denial_ordered_cols = [c for c in denial_column_order if c in df_denial.columns]
@@ -5236,43 +4853,21 @@ async def take_escalation_action(level: int, payload: TakeActionRequest):
                 logger.info(f"✅ CENTRAL TABLE UPDATED: alert_id={payload_id}, status=2")
             except Exception as db_err:
                 logger.exception(f"Central DB update failed: {db_err}")
-        # else:
-        #     try:
-        #         await database2.execute(
-        #             """
-        #             UPDATE public.denial_escalation_master
-        #             SET escalate_status = '2',
-        #                 remark = :remark
-        #             WHERE call_id = :call_id
-        #             """,
-        #             {
-        #                 "remark": action_remark,
-        #                 "call_id": str(db_id),
-        #             },
-        #         )
-        #         logger.info(f"✅ DENIAL TABLE UPDATED: call_id={payload_id}, status=2")
-        #     except Exception as db_err:
-        #         logger.exception(f"Denial DB update failed: {db_err}")
-
         else:
             try:
                 await database2.execute(
                     """
                     UPDATE public.denial_escalation_master
                     SET escalate_status = '2',
-                        remark = :remark,
-                        escalation_deny_remark = :remark,
-                        escalated_by = :action_by,
-                        escalated_date = NOW()
+                        remark = :remark
                     WHERE call_id = :call_id
                     """,
                     {
                         "remark": action_remark,
-                        "action_by": action_by,
                         "call_id": str(db_id),
                     },
                 )
-                logger.info(f"✅ DENIAL TABLE UPDATED: call_id={payload_id}, status=2, escalated_by={action_by}")
+                logger.info(f"✅ DENIAL TABLE UPDATED: call_id={payload_id}, status=2")
             except Exception as db_err:
                 logger.exception(f"Denial DB update failed: {db_err}")
 
@@ -5802,3 +5397,1460 @@ async def clear_memory_cache():
     
     logger.info("🧹 In-memory caches cleared and Garbage Collector run successfully.")
     return {"status": "success", "message": "Memory caches cleared. Server is fresh now!"}
+
+################################################################################################
+
+################################################################################################
+# ============================================================
+# FUEL ALERTS (GPS: etrackpro) - Level + Drain + Escalation bump + WebSocket + Take action
+# ============================================================
+fuel_logger = logging.getLogger("fuel_alerts")
+fuel_logger.setLevel(logging.INFO)      # root logger WARNING hai, isliye fuel ke liye alag INFO
+
+FUEL_BASE = "http://etrackpro.in/webservice"
+FUEL_PROJECT_ID = 37
+
+FUEL_LEVEL_INTERVAL = 300       # level API: har 5 min
+FUEL_DRAIN_INTERVAL = 960       # drain API: har 16 min
+FUEL_DRAIN_MIN_GAP = 930        # GPS API limit 15 min (+margin), restart ke baad bhi follow hota hai
+FUEL_BUMP_INTERVAL = 30
+FUEL_LEVEL_CHUNK = 100          # level API: ek call me itni vehicles
+FUEL_DRAIN_CHUNK = 1000         # drain API: ek call me itni (reject kare to 200 kar do)
+
+FUEL_TODAY_ONLY = True       # False = overall (abhi), True = sirf aaj ke alerts (insert + WS)
+FUEL_DRAIN_DATE = ""            # "" = aaj ki date. Testing ke liye "16-11-2026" (dd-MM-yyyy)
+FUEL_DEBUG = True               # True = har vehicle ki line log me. Baad me False kar dena
+FUEL_WS_REQUIRE_TOKEN = False   # True = /ws/fuel_alerts me ?token= zaroori
+
+FUEL_NOT_LOGGED_IN = "MDT not logged in"
+FUEL_VIEWS = ("active", "closed", "all")
+FUEL_DRAIN_TS_KEY = "fuel_drain_last_call_ts"
+
+# jo vehicles GPS user ki nahi hain: normalized plate -> expiry timestamp
+FUEL_INVALID = {}
+FUEL_INVALID_TTL = 6 * 3600     # 6 ghante baad dobara try
+FUEL_INVALID_REDIS_PREFIX = "fuel_invalid:"
+
+
+def fuel_is_invalid(plate) -> bool:
+    k = normalize_vehicle_number(plate)
+    exp = FUEL_INVALID.get(k)
+    if exp is None:
+        return False
+    if exp < time.time():
+        FUEL_INVALID.pop(k, None)
+        return False
+    return True
+
+
+async def fuel_mark_invalid(keys):
+    """Invalid plates local dict + Redis (sab workers/restart ke liye) me save."""
+    exp = time.time() + FUEL_INVALID_TTL
+    for k in keys:
+        FUEL_INVALID[k] = exp
+    try:
+        pipe = redis_client.pipeline()
+        for k in keys:
+            pipe.set(f"{FUEL_INVALID_REDIS_PREFIX}{k}", "1", ex=FUEL_INVALID_TTL)
+        await pipe.execute()
+    except Exception as e:
+        fuel_logger.warning(f"fuel_mark_invalid redis save fail: {e}")
+
+
+async def fuel_sync_invalid():
+    """Redis se invalid plates local dict me load karo."""
+    try:
+        exp = time.time() + FUEL_INVALID_TTL
+        async for k in redis_client.scan_iter(match=f"{FUEL_INVALID_REDIS_PREFIX}*", count=500):
+            k = k.decode() if isinstance(k, bytes) else k
+            plate = k[len(FUEL_INVALID_REDIS_PREFIX):]
+            if plate not in FUEL_INVALID:
+                FUEL_INVALID[plate] = exp
+    except Exception as e:
+        fuel_logger.warning(f"fuel_sync_invalid fail: {e}")
+
+
+FUEL_PILOT_MOBILE_INT = False
+_fuel_cols_checked = False
+FUEL_REQUIRED_COLS = (
+    ["alert_id", "alert_type", "ambulance_no", "severity", "remark", "latitude", "longitude",
+     "alert_datetime", "escalate_status", "created_at", "updated_at", "fuel_percentage",
+     "drain_liters", "event_time", "location", "division", "district", "level", "status",
+     "is_closed", "action_by", "action_remark", "pilot_name", "pilot_mobile"]
+    + [f"{p}_{s}" for p in ("dm", "zm", "om", "sh", "coo", "cbo")
+       for s in ("send_datetime", "action", "action_datetime")]
+)
+
+
+# ---------------- Helpers ----------------
+def fuel_now():
+    # timestamp without time zone columns ke liye naive IST
+    return datetime.now(ist).replace(tzinfo=None)
+
+
+def fuel_num(s):
+    m = re.search(r"-?\d+(\.\d+)?", str(s))
+    return float(m.group()) if m else None
+
+
+def fuel_extract_percent(can_params):
+    # key: "Fuel Tank Level Input or Fuel level", value: "56.80 %"
+    for p in can_params or []:
+        if isinstance(p, dict):
+            for k, v in p.items():
+                if "fuel" in str(k).lower() and "level" in str(k).lower():
+                    return fuel_num(v)
+    return None
+
+
+def fuel_parse_event_time(s):
+    # API format: "16-11-2026 12:17:44 PM"
+    for fmt in ("%d-%m-%Y %I:%M:%S %p", "%d-%m-%Y %H:%M:%S"):
+        try:
+            return datetime.strptime(str(s).strip(), fmt)
+        except Exception:
+            pass
+    return None
+
+
+def fuel_gps_is_today(gps_time_str):
+    try:
+        t = datetime.strptime(str(gps_time_str), "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return False
+    return t.date() == fuel_now().date()
+
+
+def fuel_level_rule(p):
+    if p <= 10:
+        return "FUEL_LEVEL_CRITICAL", "CRITICAL", f"Fuel critically low: {p}%"
+    if p <= 25:
+        return "FUEL_LEVEL_LOW", "HIGH", f"Fuel low: {p}%"
+    if p <= 50:
+        return "FUEL_LEVEL_NORMAL", "MEDIUM", f"Fuel below normal: {p}%"
+    return None
+
+
+def fuel_mobile_value(m):
+    if m is None:
+        return None
+    digits = re.sub(r"\D", "", str(m))
+    if not digits:
+        return None
+    return int(digits) if FUEL_PILOT_MOBILE_INT else digits
+
+
+async def fuel_try_lock(lock_key: str, ttl_ms: int) -> bool:
+    ok = await redis_client.set(lock_key, _worker_instance_id, nx=True, px=ttl_ms)
+    if ok:
+        return True
+    cur = await redis_client.get(lock_key)
+    if isinstance(cur, bytes):
+        cur = cur.decode()
+    if cur == _worker_instance_id:
+        await redis_client.pexpire(lock_key, ttl_ms)
+        return True
+    return False
+
+
+async def fuel_check_columns():
+    """fuel_alerts ke columns check (missing ho to log me dikhega) + pilot_mobile ka type."""
+    global _fuel_cols_checked, FUEL_PILOT_MOBILE_INT
+    if _fuel_cols_checked:
+        return
+    try:
+        rows = await database2.fetch_all(
+            """SELECT column_name, data_type FROM information_schema.columns
+               WHERE table_schema = 'public' AND table_name = 'fuel_alerts'"""
+        )
+        cols = {r["column_name"]: r["data_type"] for r in rows}
+        if not cols:
+            fuel_logger.error("❌ public.fuel_alerts table nahi mili")
+            return
+        missing = [c for c in FUEL_REQUIRED_COLS if c not in cols]
+        if missing:
+            fuel_logger.error(f"❌ fuel_alerts me ye columns missing hain: {missing}")
+        FUEL_PILOT_MOBILE_INT = cols.get("pilot_mobile") in ("integer", "bigint", "smallint", "numeric")
+        _fuel_cols_checked = True
+        fuel_logger.info(
+            f"✅ fuel_alerts columns checked | missing={len(missing)} | "
+            f"pilot_mobile type={cols.get('pilot_mobile')}"
+        )
+    except Exception as e:
+        fuel_logger.exception(f"fuel_check_columns failed: {e}")
+
+
+# ---------------- GPS token + API ----------------
+async def get_fuel_gps_token(force_refresh: bool = False):
+    global _fuel_auth_token
+    if _fuel_auth_token and not force_refresh:
+        return _fuel_auth_token
+    if not FUEL_GPS_USERNAME or not FUEL_GPS_PASSWORD:
+        fuel_logger.error("❌ FUEL_GPS_USERNAME / FUEL_GPS_PASSWORD .env me nahi hain")
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(
+                f"{FUEL_BASE}?token=generateAccessToken",
+                headers={"Content-Type": "application/json"},
+                json={"username": FUEL_GPS_USERNAME, "password": FUEL_GPS_PASSWORD}
+            )
+            if response.status_code != 200:
+                fuel_logger.error(f"Fuel GPS token HTTP {response.status_code}: {response.text[:200]}")
+                return None
+            data = response.json()
+            if "data" in data and isinstance(data["data"], dict):
+                _fuel_auth_token = data["data"].get("token") or data["data"].get("auth_code")
+            else:
+                _fuel_auth_token = data.get("auth_code") or data.get("token")
+            if not _fuel_auth_token:
+                fuel_logger.error(f"Fuel GPS token response me token nahi: {str(data)[:200]}")
+            return _fuel_auth_token
+    except Exception as e:
+        fuel_logger.error(f"Failed to get Fuel GPS token: {e}")
+    return None
+
+
+async def fuel_post(client, url, body, retry_token=True):
+    """Returns (data, message). data None ho to message me wajah."""
+    global _fuel_auth_token
+    token = await get_fuel_gps_token()
+    if not token:
+        return None, "token not available"
+
+    r = await client.post(
+        url, headers={"auth-code": token, "Content-Type": "application/json"}, json=body
+    )
+    if r.status_code != 200:
+        return None, f"HTTP {r.status_code}: {r.text[:150]}"
+
+    data = r.json()
+    if data.get("result") == 1:
+        return data, ""
+
+    msg = str(data.get("message") or "")
+    low = msg.lower()
+    if retry_token and "token" in low and ("invalid" in low or "expired" in low):
+        _fuel_auth_token = None
+        return await fuel_post(client, url, body, retry_token=False)
+    return None, msg
+
+
+async def fuel_post_batch(client, url, vehicles, key, extra, bisect=True, budget=None):
+    """
+    vehicles ko comma-separated 'key' me bhejta hai.
+    API invalid hone par poori list echo karti hai (kaun si invalid hai nahi batati),
+    isliye batch ko aadha-aadha karke invalid plates dhundte hain.
+    bisect=False: sirf ek call (drain API ke 15 min limit ke liye).
+    """
+    if budget is None:
+        budget = [800]                     # ek chunk ke liye max calls
+    vehicles = [v for v in vehicles if not fuel_is_invalid(v)]
+    if not vehicles:
+        return None, "no vehicles"
+
+    data, msg = await fuel_post(client, url, {key: ",".join(vehicles), **extra})
+    if data is not None:
+        return data, ""
+    if "belong" not in msg.lower():
+        return None, msg
+
+    if len(vehicles) == 1:
+        await fuel_mark_invalid({normalize_vehicle_number(vehicles[0])})
+        fuel_logger.info(f"Fuel: invalid vehicle marked: {vehicles[0]}")
+        return None, msg
+    if not bisect or budget[0] <= 0:
+        return None, msg                   # blacklist NAHI karte
+    budget[0] -= 1
+
+    mid = len(vehicles) // 2
+    d1, m1 = await fuel_post_batch(client, url, vehicles[:mid], key, extra, bisect, budget)
+    d2, m2 = await fuel_post_batch(client, url, vehicles[mid:], key, extra, bisect, budget)
+    if d1 is None and d2 is None:
+        return None, m1 or m2
+    rows = ((d1 or {}).get("data") or []) + ((d2 or {}).get("data") or [])
+    return {"result": 1, "data": rows}, ""
+
+
+# ---------------- Vehicles + division/district (Postgres) ----------------
+async def fuel_load_vehicles():
+    await fuel_sync_invalid()
+    queries = [
+        """SELECT a.amb_rto_register_no AS ambulance_no,
+                  d.dst_name  AS district_name,
+                  dv.div_name AS division_name
+           FROM ems_ambulance a
+           LEFT JOIN ems_mas_districts d ON a.amb_district = d.dst_code
+           LEFT JOIN ems_mas_division dv ON d.div_id = dv.div_code
+           WHERE a.amb_rto_register_no IS NOT NULL
+             AND TRIM(a.amb_rto_register_no) <> ''""",
+        # fallback: join fail ho to bhi alerts insert hon (division/district NULL)
+        """SELECT a.amb_rto_register_no AS ambulance_no,
+                  NULL AS district_name, NULL AS division_name
+           FROM ems_ambulance a
+           WHERE a.amb_rto_register_no IS NOT NULL
+             AND TRIM(a.amb_rto_register_no) <> ''""",
+    ]
+    rows = []
+    for i, q in enumerate(queries):
+        try:
+            rows = await database2.fetch_all(q)
+            if i == 1:
+                fuel_logger.warning("Fuel: district/division join fail hua, bina division/district ke chala")
+            break
+        except Exception as e:
+            fuel_logger.error(f"Fuel vehicle query {i + 1} fail: {str(e)[:200]}")
+
+    info = {}
+    for r in rows:
+        plate = str(r["ambulance_no"]).strip()
+        key = normalize_vehicle_number(plate)
+        if not key or fuel_is_invalid(key):
+            continue
+        info[key] = {
+            "plate": plate,
+            "district": r["district_name"],
+            "division": r["division_name"],
+        }
+    with_div = sum(1 for v in info.values() if v["division"])
+    fuel_logger.info(f"Fuel vehicles loaded: {len(info)} (division mila: {with_div})")
+    return info
+
+
+# ---------------- Pilot (MySQL: ems_app_login_session + ems_colleague) ----------------
+async def fuel_fetch_pilots(plates):
+    """
+    Har vehicle ki sabse latest modify_sync_data wali row.
+    status = 1  -> pilot_name (first+mid+last ek column me) + clg_mobile_no
+    warna       -> "MDT not logged in", mobile NULL
+    Query fail ho to None return (pilot fields NULL rahenge, galat 'not logged in' nahi likhenge).
+    """
+    keys = sorted({normalize_vehicle_number(p) for p in plates if p})
+    if not keys:
+        return {}
+    result = {}
+    try:
+        for i in range(0, len(keys), 400):
+            part = keys[i:i + 400]
+            ph = ", ".join(f":v{j}" for j in range(len(part)))
+            params = {f"v{j}": part[j] for j in range(len(part))}
+            rows = await database.fetch_all(
+                f"""
+                SELECT s.vehicle_no, s.status, s.modify_sync_data,
+                       c.clg_first_name, c.clg_mid_name, c.clg_last_name, c.clg_mobile_no
+                FROM ems_app_login_session s
+                LEFT JOIN ems_colleague c ON c.clg_id = s.clg_id
+                WHERE UPPER(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(s.vehicle_no, ' ', ''), '-', ''), '.', ''), '_', ''), '/', '')) IN ({ph})
+                ORDER BY s.modify_sync_data DESC, s.id DESC
+                """,
+                params
+            )
+            for r in rows:
+                k = normalize_vehicle_number(r["vehicle_no"])
+                if k in result:
+                    continue            # latest modify_sync_data wali row pehle aati hai
+                if str(r["status"]).strip() == "1":
+                    name = " ".join(
+                        str(x).strip()
+                        for x in (r["clg_first_name"], r["clg_mid_name"], r["clg_last_name"])
+                        if x and str(x).strip()
+                    )
+                    result[k] = {"pilot_name": name or None, "pilot_mobile": r["clg_mobile_no"]}
+                else:
+                    result[k] = {"pilot_name": FUEL_NOT_LOGGED_IN, "pilot_mobile": None}
+        return result
+    except Exception as e:
+        fuel_logger.error(f"❌ Fuel pilot lookup (MySQL) fail: {type(e).__name__}: {e}")
+        return None
+
+
+def fuel_pilot_for(pilots, plate):
+    if pilots is None:
+        return None, None
+    p = pilots.get(normalize_vehicle_number(plate))
+    if not p:
+        return FUEL_NOT_LOGGED_IN, None      # is gaadi ka koi session hi nahi mila
+    return p["pilot_name"], p["pilot_mobile"]
+
+
+# ---------------- Alert insert ----------------
+async def insert_fuel_alert_if_not_exists(
+    ambulance_no, alert_type, severity, remark, lat, long, division, district,
+    location=None, fuel_percent=None, drain_liters=None, event_time=None,
+    pilot_name=None, pilot_mobile=None
+):
+    """Returns 'inserted' / 'exists' / 'error'."""
+    try:
+        now_ist = fuel_now()
+        day_start = now_ist.replace(hour=0, minute=0, second=0, microsecond=0)
+
+        if alert_type == "FUEL_DRAIN":
+            # aaj is gaadi ka drain alert abhi open ho, ya wahi drain event pehle aa chuka ho -> skip
+            existing = await database2.fetch_one(
+                """SELECT alert_id FROM fuel_alerts
+                   WHERE ambulance_no = :amb AND alert_type = :type
+                     AND ((is_closed = FALSE AND created_at >= :day_start)
+                          OR (CAST(:et AS timestamp) IS NOT NULL AND event_time = CAST(:et AS timestamp)))
+                   LIMIT 1""",
+                {"amb": ambulance_no, "type": alert_type, "day_start": day_start, "et": event_time}
+            )
+        else:
+            # aaj is gaadi ka ye type abhi open ho -> skip. Close ho chuka ho to naya ban sakta hai
+            existing = await database2.fetch_one(
+                """SELECT alert_id FROM fuel_alerts
+                   WHERE ambulance_no = :amb AND alert_type = :type
+                     AND is_closed = FALSE AND created_at >= :day_start
+                   LIMIT 1""",
+                {"amb": ambulance_no, "type": alert_type, "day_start": day_start}
+            )
+        if existing:
+            return "exists"
+
+        params = {
+            "alert_type": alert_type,
+            "ambulance_no": ambulance_no,
+            "severity": severity,
+            "remark": remark,
+            "latitude": str(lat) if lat is not None else None,
+            "longitude": str(long) if long is not None else None,
+            "alert_datetime": now_ist,
+            "created_at": now_ist,
+            "updated_at": now_ist,
+            "fuel_percentage": fuel_percent,
+            "drain_liters": drain_liters,
+            "event_time": event_time,
+            "location": location,
+            "division": division,
+            "district": district,
+            "level": 2,                      # DM se start (Pilot ko nahi jayega)
+            "status": "Escalated To DM",
+            "dm_send_datetime": now_ist,
+            "pilot_name": pilot_name,
+            "pilot_mobile": fuel_mobile_value(pilot_mobile),
+        }
+
+        row = await database2.fetch_one(
+            """INSERT INTO fuel_alerts (
+                alert_type, ambulance_no, severity, remark, latitude, longitude, alert_datetime,
+                created_at, updated_at,
+                fuel_percentage, drain_liters, event_time, location, division, district,
+                level, status, dm_send_datetime, pilot_name, pilot_mobile
+            ) VALUES (
+                :alert_type, :ambulance_no, :severity, :remark, :latitude, :longitude, :alert_datetime,
+                :created_at, :updated_at,
+                :fuel_percentage, :drain_liters, :event_time, :location, :division, :district,
+                :level, :status, :dm_send_datetime, :pilot_name, :pilot_mobile
+            ) RETURNING *""",
+            params
+        )
+
+        if row:
+            manager.broadcast({"type": "FUEL_ALERT_NEW", "data": serialize_row(row)})
+            fuel_logger.info(
+                f"✅ FUEL ALERT INSERTED: id={row['alert_id']} | {ambulance_no} | {alert_type} | "
+                f"{severity} | pilot={pilot_name}"
+            )
+            return "inserted"
+
+    except Exception as e:
+        fuel_logger.exception(f"❌ insert_fuel_alert FAILED for {ambulance_no} {alert_type}: {e}")
+    return "error"
+
+
+# ============================================================
+# WORKER 1: Fuel Level (har 5 min, batch)
+# ============================================================
+async def fuel_level_tracking_worker():
+    fuel_logger.info("🚀 Fuel Level Tracking Worker STARTED")
+    while True:
+        try:
+            # lock TTL bada rakha: pehli cycle me bisect se time lag sakta hai
+            if not await fuel_try_lock("fuel_level_worker_lock", 900000):
+                await asyncio.sleep(30)
+                continue
+
+            await fuel_check_columns()
+            info = await fuel_load_vehicles()
+            plates = list(info.keys())
+            if not plates:
+                fuel_logger.warning("Fuel Level: ems_ambulance se koi vehicle nahi mili")
+                await asyncio.sleep(FUEL_LEVEL_INTERVAL)
+                continue
+
+            st = dict(sent=len(plates), returned=0, no_fuel=0, not_today=0, above_50=0,
+                      alerts_needed=0, inserted=0, exists=0, errors=0, batch_fail=0)
+            candidates = []
+
+            async with httpx.AsyncClient(timeout=60) as client:
+                for i in range(0, len(plates), FUEL_LEVEL_CHUNK):
+                    chunk = plates[i:i + FUEL_LEVEL_CHUNK]
+                    data, msg = await fuel_post_batch(
+                        client,
+                        f"{FUEL_BASE}?token=getUserVehicleLiveData&ProjectId={FUEL_PROJECT_ID}",
+                        chunk, "vehicle_nos", {}
+                    )
+                    if data is None:
+                        st["batch_fail"] += 1
+                        fuel_logger.warning(f"Fuel Level batch fail: {msg[:200]}")
+                        continue
+
+                    rows = data.get("data") or []
+                    fuel_logger.info(f"Fuel Level batch: sent={len(chunk)} returned={len(rows)}")
+
+                    for vehicle in rows:
+                        st["returned"] += 1
+                        plate_no = vehicle.get("plate_no")
+                        gps = vehicle.get("gps") or {}
+                        fuel_percent = fuel_extract_percent(vehicle.get("can_or_obd_parameters"))
+                        gps_time = gps.get("gps_actual_date_time")
+
+                        if FUEL_DEBUG:
+                            fuel_logger.info(f"⛽ {plate_no} | fuel={fuel_percent} | gps_time={gps_time}")
+
+                        if not plate_no or fuel_percent is None:
+                            st["no_fuel"] += 1
+                            continue
+                        if FUEL_TODAY_ONLY and not fuel_gps_is_today(gps_time):
+                            st["not_today"] += 1
+                            continue
+
+                        rule = fuel_level_rule(fuel_percent)
+                        if not rule:
+                            st["above_50"] += 1
+                            continue
+
+                        details = info.get(normalize_vehicle_number(plate_no), {})
+                        candidates.append({
+                            "plate": details.get("plate", plate_no),
+                            "rule": rule, "fuel": fuel_percent, "gps": gps,
+                            "division": details.get("division"),
+                            "district": details.get("district"),
+                        })
+                    await asyncio.sleep(1)
+
+            st["alerts_needed"] = len(candidates)
+            pilots = await fuel_fetch_pilots([c["plate"] for c in candidates]) if candidates else {}
+
+            for c in candidates:
+                pname, pmobile = fuel_pilot_for(pilots, c["plate"])
+                res = await insert_fuel_alert_if_not_exists(
+                    ambulance_no=c["plate"],
+                    alert_type=c["rule"][0], severity=c["rule"][1], remark=c["rule"][2],
+                    lat=c["gps"].get("latitude"), long=c["gps"].get("longitude"),
+                    division=c["division"], district=c["district"],
+                    location=c["gps"].get("location"), fuel_percent=c["fuel"],
+                    pilot_name=pname, pilot_mobile=pmobile,
+                )
+                key = {"inserted": "inserted", "exists": "exists"}.get(res, "errors")
+                st[key] += 1
+
+            fuel_logger.info(f"⛽ Fuel Level cycle: {st}")
+
+        except Exception as e:
+            fuel_logger.exception(f"Fuel Level Worker Error: {e}")
+
+        await asyncio.sleep(FUEL_LEVEL_INTERVAL)
+
+
+# ============================================================
+# WORKER 2: Fuel Drain (har 16 min, ek batch call)
+# ============================================================
+async def fuel_drain_wait_seconds():
+    """Pichli drain call ko 15 min nahi hue to kitna ruka jaye (restart ke baad bhi sahi)."""
+    try:
+        raw = await redis_client.get(FUEL_DRAIN_TS_KEY)
+        if raw:
+            last = float(raw if isinstance(raw, str) else raw.decode())
+            return max(0.0, FUEL_DRAIN_MIN_GAP - (time.time() - last))
+    except Exception:
+        pass
+    return 0.0
+
+
+async def fuel_drain_tracking_worker():
+    fuel_logger.info("🚀 Fuel Drain Tracking Worker STARTED")
+    while True:
+        try:
+            if not await fuel_try_lock("fuel_drain_worker_lock", 1100000):
+                await asyncio.sleep(30)
+                continue
+
+            await fuel_check_columns()
+
+            wait = await fuel_drain_wait_seconds()
+            if wait > 0:
+                fuel_logger.info(f"⛽ Drain: pichli call ko 15 min nahi hue, {int(wait)}s ruk raha hu")
+                await asyncio.sleep(wait)
+
+            info = await fuel_load_vehicles()
+            plates = list(info.keys())
+            if not plates:
+                fuel_logger.warning("Fuel Drain: ems_ambulance se koi vehicle nahi mili")
+                await asyncio.sleep(FUEL_DRAIN_INTERVAL)
+                continue
+
+            day_str = FUEL_DRAIN_DATE or fuel_now().strftime("%d-%m-%Y")
+            st = dict(date=day_str, sent=len(plates), returned=0, drain_events=0, not_today=0,
+                      inserted=0, exists=0, errors=0, batch_fail=0)
+            events = []
+
+            async with httpx.AsyncClient(timeout=120) as client:
+                for i in range(0, len(plates), FUEL_DRAIN_CHUNK):
+                    chunk = plates[i:i + FUEL_DRAIN_CHUNK]
+                    # call se PEHLE time likho (fail hui call bhi API limit me ginti hai)
+                    await redis_client.set(FUEL_DRAIN_TS_KEY, str(time.time()))
+                    data, msg = await fuel_post_batch(
+                        client, f"{FUEL_BASE}?token=getFuelEvents",
+                        chunk, "vehicle_no",    # drain API me key 'vehicle_no' hai (comma-separated)
+                        {"date": day_str, "event_type": "drain", "project_id": FUEL_PROJECT_ID},
+                        bisect=False            # drain API 15 min me 1 hi call leti hai
+                    )
+                    if data is None:
+                        st["batch_fail"] += 1
+                        fuel_logger.warning(f"Fuel Drain batch fail: {msg[:200]}")
+                        if "wait for 15" in msg.lower():
+                            break
+                        continue
+
+                    rows = data.get("data") or []
+                    fuel_logger.info(f"Fuel Drain batch: sent={len(chunk)} returned={len(rows)} date={day_str}")
+
+                    for vd in rows:
+                        st["returned"] += 1
+                        plate_no = vd.get("vehicle_no") or vd.get("plate_no")
+                        details = info.get(normalize_vehicle_number(plate_no), {})
+
+                        for event in vd.get("fuel_data") or []:
+                            if str(event.get("event_type", "")).lower() != "drain":
+                                continue
+                            st["drain_events"] += 1
+                            et = fuel_parse_event_time(event.get("event_start_time"))
+                            if FUEL_TODAY_ONLY and (not et or et.date() != fuel_now().date()):
+                                st["not_today"] += 1
+                                continue
+                            events.append({
+                                "plate": details.get("plate", plate_no),
+                                "event": event, "et": et,
+                                "division": details.get("division"),
+                                "district": details.get("district"),
+                            })
+
+            pilots = await fuel_fetch_pilots([e["plate"] for e in events]) if events else {}
+
+            for e in events:
+                ev = e["event"]
+                liters = fuel_num(ev.get("value"))
+                pname, pmobile = fuel_pilot_for(pilots, e["plate"])
+                res = await insert_fuel_alert_if_not_exists(
+                    ambulance_no=e["plate"], alert_type="FUEL_DRAIN", severity="CRITICAL",
+                    remark=f"Fuel drain detected: {liters} ltr",
+                    lat=ev.get("latitude"), long=ev.get("longitude"),
+                    division=e["division"], district=e["district"],
+                    location=ev.get("location"), drain_liters=liters, event_time=e["et"],
+                    pilot_name=pname, pilot_mobile=pmobile,
+                )
+                key = {"inserted": "inserted", "exists": "exists"}.get(res, "errors")
+                st[key] += 1
+
+            fuel_logger.info(f"⛽ Fuel Drain cycle: {st}")
+
+        except Exception as e:
+            fuel_logger.exception(f"Fuel Drain Worker Error: {e}")
+
+        await asyncio.sleep(FUEL_DRAIN_INTERVAL)
+
+
+# ============================================================
+# WORKER 3: Fuel alerts escalation bump (DM -> ZM -> OM -> SH -> COO -> CBO)
+# ============================================================
+async def fuel_alert_bump_worker():
+    fuel_logger.info("🚀 Fuel Alert Bump Worker STARTED")
+    while True:
+        try:
+            if not await fuel_try_lock("fuel_bump_worker_lock", 90000):
+                await asyncio.sleep(15)
+                continue
+
+            rows = await database2.fetch_all(
+                """SELECT alert_id, ambulance_no, level, created_at FROM fuel_alerts
+                   WHERE is_closed = FALSE AND escalate_status = '1' AND level < 7
+                   ORDER BY created_at LIMIT 1000"""
+            )
+
+            for r in rows:
+                alert_id = int(r["alert_id"])
+                cur = r["level"] or 2
+                elapsed = elapsed_minutes_since(r["created_at"])
+                new_level = min(max(get_level_for_elapsed_minutes(elapsed), 2), 7)
+                if new_level <= cur:
+                    continue
+
+                # beech ke levels ke send_datetime bhi bhar do (agar skip hue ho)
+                sets = ", ".join(
+                    f"{ESC_FLOW_LEVEL_MAP[l]}_send_datetime = COALESCE({ESC_FLOW_LEVEL_MAP[l]}_send_datetime, :now)"
+                    for l in range(cur + 1, new_level + 1)
+                )
+                now_ist = fuel_now()
+                row = await database2.fetch_one(
+                    f"""UPDATE fuel_alerts
+                        SET level = :lvl, status = :stat, {sets}, updated_at = :now
+                        WHERE alert_id = :aid AND is_closed = FALSE
+                        RETURNING *""",
+                    {"lvl": new_level, "stat": f"Escalated To {ROLE_NAMES[new_level]}",
+                     "now": now_ist, "aid": alert_id}
+                )
+                if not row:
+                    continue
+
+                change = {
+                    "alert_id": alert_id,
+                    "ambulance_no": r["ambulance_no"],
+                    "from_level": cur,
+                    "from_role": ROLE_NAMES.get(cur),
+                    "to_level": new_level,
+                    "to_role": ROLE_NAMES[new_level],
+                    "elapsed_minutes": elapsed,
+                }
+                manager.broadcast({
+                    "type": "FUEL_ALERT_BUMPED",
+                    "data": serialize_row(row),
+                    "change": change,
+                })
+                fuel_logger.info(
+                    f"⛽ FUEL BUMP: alert_id={alert_id} {r['ambulance_no']} "
+                    f"{ROLE_NAMES.get(cur)} -> {ROLE_NAMES[new_level]} (elapsed={elapsed} min)"
+                )
+
+        except Exception as e:
+            fuel_logger.exception(f"Fuel Alert Bump Error: {e}")
+
+        await asyncio.sleep(FUEL_BUMP_INTERVAL)
+
+
+#################################################################################################
+# ============================================================
+# WebSocket
+
+def fuel_parse_types(alert_type):
+    # FUEL_LEVEL = Critical+Low+Normal, FUEL_DRAIN = drain. Comma se kai de sakte ho.
+    types = []
+    for t in (alert_type or "").split(","):
+        t = t.strip().upper()
+        if t == "FUEL_LEVEL":
+            types += ["FUEL_LEVEL_CRITICAL", "FUEL_LEVEL_LOW", "FUEL_LEVEL_NORMAL"]
+        elif t in ("FUEL_DRAIN", "FUEL_LEVEL_CRITICAL", "FUEL_LEVEL_LOW", "FUEL_LEVEL_NORMAL"):
+            types.append(t)
+    return types
+
+
+async def fuel_fetch_alerts(level, view, district_list, division_list=None, type_list=None, limit=1000):
+    conds, params = [], {"limit": limit}
+
+    if view == "active":
+        conds += ["is_closed = FALSE", "escalate_status = '1'"]
+    elif view == "closed":
+        conds.append("is_closed = TRUE")
+
+    if level is not None:
+        prefix = ESC_FLOW_LEVEL_MAP[level]          # dm/zm/om/sh/coo/cbo
+        params["level"] = level
+        if view == "active":
+            conds.append("level = :level")
+        else:
+            conds.append(f"(level = :level OR {prefix}_action IS NOT NULL)")
+
+    if district_list:
+        ph = []
+        for i, d in enumerate(district_list):
+            params[f"d{i}"] = d
+            ph.append(f":d{i}")
+        conds.append(f"LOWER(COALESCE(district, '')) IN ({', '.join(ph)})")
+
+    if division_list:
+        ph = []
+        for i, d in enumerate(division_list):
+            params[f"v{i}"] = d
+            ph.append(f":v{i}")
+        conds.append(f"LOWER(COALESCE(division, '')) IN ({', '.join(ph)})")
+
+    if type_list:
+        ph = []
+        for i, t in enumerate(type_list):
+            params[f"t{i}"] = t
+            ph.append(f":t{i}")
+        conds.append(f"alert_type IN ({', '.join(ph)})")
+
+    if FUEL_TODAY_ONLY:
+        params["day_start"] = fuel_now().replace(hour=0, minute=0, second=0, microsecond=0)
+        conds.append("created_at >= :day_start")
+
+    where = " AND ".join(conds) if conds else "1=1"
+    rows = await database2.fetch_all(
+        f"SELECT * FROM fuel_alerts WHERE {where} ORDER BY created_at DESC LIMIT :limit",
+        params
+    )
+    return [serialize_row(r) for r in rows]
+
+
+def fuel_ws_should_send(payload: dict, level, view, district_list, division_list=None, type_list=None) -> bool:
+    t = payload.get("type")
+    if t not in ("FUEL_ALERT_NEW", "FUEL_ALERT_BUMPED", "FUEL_ALERT_CLOSED"):
+        return False
+    if view == "closed" and t != "FUEL_ALERT_CLOSED":
+        return False
+
+    data = payload.get("data") or {}
+    if district_list:
+        d = (data.get("district") or "").strip().lower()
+        if d not in district_list:
+            return False
+    if type_list and (data.get("alert_type") or "") not in type_list:
+        return False
+    if division_list:
+        v = (data.get("division") or "").strip().lower()
+        if v not in division_list:
+            return False
+
+    if level is None:
+        return True
+    if t == "FUEL_ALERT_BUMPED":
+        ch = payload.get("change") or {}
+        return level in (ch.get("from_level"), ch.get("to_level"))   # purane level se hatane + naye me dikhane
+    if t == "FUEL_ALERT_CLOSED":
+        return data.get("level") == level or payload.get("closed_at_level") == level
+    return data.get("level") == level
+
+
+@app.websocket("/ws/fuel_alerts")
+async def fuel_alerts_ws(
+    websocket: WebSocket,
+    level: Optional[int] = Query(default=None),
+    view: str = Query(default="active"),
+    district: Optional[str] = Query(default=None),
+    division: Optional[str] = Query(default=None),
+    alert_type: Optional[str] = Query(default=None),
+):
+    if level is not None and (level < 2 or level > 7):
+        await websocket.accept()
+        await websocket.send_json({"type": "ERROR", "message": "Invalid level. Use 2 to 7.",
+                                   "valid_levels": {2: "DM", 3: "ZM", 4: "OM", 5: "SH", 6: "COO", 7: "CBO"}})
+        await websocket.close(code=1008)
+        return
+
+    if view not in FUEL_VIEWS:
+        await websocket.accept()
+        await websocket.send_json({"type": "ERROR", "message": "Invalid view. Use: active, closed or all",
+                                   "valid_values": list(FUEL_VIEWS)})
+        await websocket.close(code=1008)
+        return
+
+    user_id = "anonymous"      # token / JWT check hata diya
+
+    district_list = [d.strip().lower() for d in (district or "").split(",") if d.strip()]
+    division_list = [d.strip().lower() for d in (division or "").split(",") if d.strip()]
+    type_list = fuel_parse_types(alert_type)
+    if alert_type and not type_list:
+        await websocket.accept()
+        await websocket.send_json({"type": "ERROR", "message": "Invalid alert_type.",
+                                   "valid_values": ["FUEL_LEVEL", "FUEL_DRAIN", "FUEL_LEVEL_CRITICAL",
+                                                    "FUEL_LEVEL_LOW", "FUEL_LEVEL_NORMAL"]})
+        await websocket.close(code=1008)
+        return
+    role_label = ROLE_NAMES.get(level, "ALL") if level else "ALL"
+
+    conn_info = await manager.connect(websocket, user_id)
+    queue = conn_info["queue"]
+    sender = None
+    receiver = None
+
+    try:
+        alerts = await fuel_fetch_alerts(level, view, district_list, division_list, type_list)
+        await websocket.send_json({
+            "type": "FUEL_ALERT_INITIAL",
+            "level": level,
+            "level_name": role_label,
+            "view": view,
+            "alert_type": alert_type,
+            "count": len(alerts),
+            "data": alerts,
+        })
+        fuel_logger.info(f"📤 FUEL_ALERT_INITIAL sent: {len(alerts)} alerts | role={role_label} view={view}")
+
+        async def drain_loop():
+            while True:
+                payload = await queue.get()
+                if not fuel_ws_should_send(payload, level, view, district_list, division_list, type_list):
+                    continue
+                if not await manager.safe_send(websocket, payload):
+                    break
+
+        async def client_listener():
+            while True:
+                msg = await websocket.receive_text()
+                if msg == "ping":
+                    await websocket.send_json({"type": "PONG"})
+
+        sender = asyncio.create_task(drain_loop())
+        receiver = asyncio.create_task(client_listener())
+        done, pending = await asyncio.wait([sender, receiver], return_when=asyncio.FIRST_COMPLETED)
+        for t in pending:
+            t.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        fuel_logger.exception(f"fuel_alerts_ws FAILED: {e}")
+    finally:
+        for t in (sender, receiver):
+            if t and not t.done():
+                t.cancel()
+        manager.disconnect(websocket)
+
+##############################################################################################
+#Fuel take action api
+
+class FuelActionRequest(BaseModel):
+    alert_id: Union[str, int]
+    action_by: Optional[str] = "unknown"
+    action_by_role: Optional[str] = None
+    action_remark: Optional[str] = ""
+    action_type: Optional[str] = "acknowledge"
+
+
+@app.post("/api/fuel/take_action/{level}")
+async def fuel_take_action(level: int, payload: FuelActionRequest):
+    try:
+        if level < 2 or level > 7:
+            return {"status": "error", "message": f"Invalid level: {level}. Valid levels for fuel alerts are 2 to 7 (DM to CBO).",
+                    "valid_levels": {2: "DM", 3: "ZM", 4: "OM", 5: "SH", 6: "COO", 7: "CBO"}}
+
+        aid = safe_int(payload.alert_id)
+        if not aid:
+            return {"status": "error", "message": "alert_id is required."}
+
+        existing = await database2.fetch_one(
+            "SELECT alert_id, is_closed FROM fuel_alerts WHERE alert_id = :aid", {"aid": aid}
+        )
+        if not existing:
+            return {"status": "error", "message": f"Alert {aid} was not found."}
+        if existing["is_closed"]:
+            return {"status": "error", "message": "The alert was already closed."}
+
+        role_prefix = ESC_FLOW_LEVEL_MAP[level]
+        action_by = payload.action_by or "unknown"
+        action_remark = payload.action_remark or ""
+        action_by_role = payload.action_by_role or ROLE_NAMES[level]
+        now_ist = fuel_now()
+
+        row = await database2.fetch_one(
+            f"""UPDATE fuel_alerts
+                SET is_closed = TRUE, escalate_status = '2', status = 'Closed',
+                    action_by = :by, action_remark = :remark,
+                    {role_prefix}_action = :remark, {role_prefix}_action_datetime = :now,
+                    updated_at = :now
+                WHERE alert_id = :aid AND is_closed = FALSE
+                RETURNING *""",
+            {"by": action_by, "remark": action_remark, "now": now_ist, "aid": aid}
+        )
+        if not row:
+            return {"status": "error", "message": "The alert was already closed."}
+
+        out = serialize_row(row)
+        action_details = {
+            "alert_id": aid,
+            "action_by": action_by,
+            "action_by_role": action_by_role,
+            "action_by_level": level,
+            "action_remark": action_remark,
+            "action_type": payload.action_type,
+            "action_taken_at": now_ist.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        manager.broadcast({
+            "type": "FUEL_ALERT_CLOSED",
+            "data": out,
+            "action_details": action_details,
+            "closed_by": action_by,
+            "closed_at_level": level,
+            "closed_by_role": action_by_role,
+            "action_remark": action_remark,
+        })
+        fuel_logger.info(f"✅ FUEL TAKE ACTION: alert_id={aid} closed by {action_by_role} ({action_by})")
+
+        return {"data": {"status": "success", "message": "Action taken, fuel alert closed.",
+                         "action_details": action_details, "alert": out}}
+
+    except Exception as e:
+        fuel_logger.exception(f"fuel_take_action FAILED: {e}")
+        return {"status": "error", "message": str(e)}
+
+######################################################################################3
+FUEL_LEVEL_LABELS = {
+    "FUEL_LEVEL_CRITICAL": "Critical",
+    "FUEL_LEVEL_LOW": "Low",
+    "FUEL_LEVEL_NORMAL": "Normal",
+}
+FUEL_ROLE_ORDER = ["dm", "zm", "om", "sh", "coo", "cbo"]
+
+
+def fuel_fmt_dt(v):
+    if not v:
+        return None
+    try:
+        return v.strftime("%d-%m-%Y %H:%M")
+    except Exception:
+        return str(v)
+
+
+def fuel_report_row(d):
+    """DB row -> report row (sirf kaam ki fields)."""
+    is_closed = bool(d.get("is_closed"))
+    a_type = d.get("alert_type") or ""
+    level = safe_int(d.get("level")) or 2
+
+    closed_role, closed_at = None, None
+    for p in FUEL_ROLE_ORDER:
+        act, act_at = d.get(f"{p}_action"), d.get(f"{p}_action_datetime")
+        if act is not None or act_at:
+            closed_role, closed_at = p.upper(), act_at
+    if is_closed and not closed_at:
+        closed_at = d.get("updated_at")
+
+    return {
+        "alert_id": d.get("alert_id"),
+        "alert_type": a_type,
+        "level_label": FUEL_LEVEL_LABELS.get(a_type, a_type),
+        "severity": d.get("severity"),
+        "ambulance_no": d.get("ambulance_no"),
+        "division": d.get("division"),
+        "district": d.get("district"),
+        "pilot_name": d.get("pilot_name"),
+        "pilot_mobile": str(d.get("pilot_mobile")) if d.get("pilot_mobile") is not None else None,
+        "fuel_percentage": to_float(d.get("fuel_percentage")),
+        "drain_liters": to_float(d.get("drain_liters")),
+        "event_time": fuel_fmt_dt(d.get("event_time")),
+        "location": d.get("location"),
+        "latitude": d.get("latitude"),
+        "longitude": d.get("longitude"),
+        "created_at": fuel_fmt_dt(d.get("created_at")),
+        "closed_at": fuel_fmt_dt(closed_at) if is_closed else None,
+        "current_level": "Closed (Action Taken)" if is_closed else ROLE_NAMES.get(level, "DM"),
+        "state": "Closed" if is_closed else "Open",
+        "closed_by": d.get("action_by") if is_closed else None,
+        "closed_by_role": closed_role if is_closed else None,
+        "action_remark": d.get("action_remark") if is_closed else None,
+    }
+
+
+def fuel_style_header(ws, row=1):
+    fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
+    font = Font(color="FFFFFF", bold=True)
+    for cell in ws[row]:
+        if cell.value is not None:
+            cell.fill = fill
+            cell.font = font
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+
+
+def fuel_autowidth(ws):
+    for col in ws.columns:
+        width = 0
+        for cell in col:
+            if cell.value is not None:
+                width = max(width, len(str(cell.value)))
+        ws.column_dimensions[col[0].column_letter].width = min(width + 3, 60)
+
+
+def fuel_build_report_excel(rows):
+    level_rows = [r for r in rows if r["alert_type"] != "FUEL_DRAIN"]
+    drain_rows = [r for r in rows if r["alert_type"] == "FUEL_DRAIN"]
+
+    # ---------------- Sheet 1: Fuel Alerts (Critical / Low / Normal) ----------------
+    level_cols = [
+        ("Sr No", None), ("Alert ID", "alert_id"), ("Alert Type", "level_label"),
+        ("Severity", "severity"), ("Ambulance Number", "ambulance_no"),
+        ("Division", "division"), ("District", "district"),
+        ("Pilot Name", "pilot_name"), ("Pilot Mobile", "pilot_mobile"),
+        ("Fuel %", "fuel_percentage"), ("Location", "location"),
+        ("Latitude", "latitude"), ("Longitude", "longitude"),
+        ("Alert Generated Date", "created_at"), ("Alert Closed Datetime", "closed_at"),
+        ("Current Escalation Level", "current_level"), ("Escalation Status", "state"),
+        ("Closed By", "closed_by"), ("Closed By Role", "closed_by_role"),
+        ("Action Remark", "action_remark"),
+    ]
+    # ---------------- Sheet 2: Fuel Drain ----------------
+    drain_cols = [
+        ("Sr No", None), ("Alert ID", "alert_id"), ("Severity", "severity"),
+        ("Ambulance Number", "ambulance_no"),
+        ("Division", "division"), ("District", "district"),
+        ("Pilot Name", "pilot_name"), ("Pilot Mobile", "pilot_mobile"),
+        ("Drain (Litres)", "drain_liters"), ("Drain Event Time", "event_time"),
+        ("Location", "location"), ("Latitude", "latitude"), ("Longitude", "longitude"),
+        ("Alert Generated Date", "created_at"), ("Alert Closed Datetime", "closed_at"),
+        ("Current Escalation Level", "current_level"), ("Escalation Status", "state"),
+        ("Closed By", "closed_by"), ("Closed By Role", "closed_by_role"),
+        ("Action Remark", "action_remark"),
+    ]
+
+    def to_df(data, cols, empty_msg):
+        if not data:
+            return pd.DataFrame([{"Message": empty_msg}])
+        out = []
+        for i, r in enumerate(data, 1):
+            out.append({name: (i if key is None else r.get(key)) for name, key in cols})
+        return pd.DataFrame(out)
+
+    df_level = to_df(level_rows, level_cols, "No Fuel Level Alert Data Found")
+    df_drain = to_df(drain_rows, drain_cols, "No Fuel Drain Alert Data Found")
+
+    # ---------------- Sheet 3: Summary ----------------
+    def cnt(lst, state=None):
+        return len([r for r in lst if state is None or r["state"] == state])
+
+    df_summary = pd.DataFrame([{
+        "Total Fuel Alerts (Level + Drain)": len(rows),
+        "Open Alerts": cnt(rows, "Open"),
+        "Closed Alerts": cnt(rows, "Closed"),
+        "Fuel Level Alerts": len(level_rows),
+        "Fuel Drain Alerts": len(drain_rows),
+    }])
+
+    dist = {}
+    for r in rows:
+        k = (r.get("district") or "Unknown").strip() or "Unknown"
+        d = dist.setdefault(k, {"total": 0, "open": 0, "closed": 0, "level": 0, "drain": 0})
+        d["total"] += 1
+        d["open" if r["state"] == "Open" else "closed"] += 1
+        d["drain" if r["alert_type"] == "FUEL_DRAIN" else "level"] += 1
+    dist_rows = [
+        {"District": k, "Total Alerts": v["total"], "Open": v["open"], "Closed": v["closed"],
+         "Fuel Level": v["level"], "Fuel Drain": v["drain"]}
+        for k, v in sorted(dist.items(), key=lambda x: (-x[1]["total"], x[0]))
+    ]
+    df_district = pd.DataFrame(
+        dist_rows or [{"District": "No Data", "Total Alerts": 0, "Open": 0,
+                       "Closed": 0, "Fuel Level": 0, "Fuel Drain": 0}]
+    )
+
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df_level.to_excel(writer, sheet_name="Fuel Alerts", index=False)
+        df_drain.to_excel(writer, sheet_name="Fuel Drain", index=False)
+        df_summary.to_excel(writer, sheet_name="Summary", index=False, startrow=0)
+        df_district.to_excel(writer, sheet_name="Summary", index=False, startrow=3)
+        wb = writer.book
+        format_worksheet(wb["Fuel Alerts"])
+        format_worksheet(wb["Fuel Drain"])
+        ws = wb["Summary"]
+        fuel_style_header(ws, 1)
+        fuel_style_header(ws, 4)
+        ws.cell(row=3, column=1, value="District Wise Summary").font = Font(bold=True)
+        fuel_autowidth(ws)
+    return output.getvalue()
+
+
+@app.get("/api/fuel/report/download")
+async def fuel_report_download(
+    range_type: str = Query("today", enum=["today", "month", "all", "last_1_hr"])
+):
+    now_ist = fuel_now()
+    day_start = now_ist.replace(hour=0, minute=0, second=0, microsecond=0)
+    params = {}
+    if range_type == "today":
+        where = "created_at >= :r_start AND created_at < :r_end"
+        params = {"r_start": day_start, "r_end": day_start + timedelta(days=1)}
+    elif range_type == "month":
+        where = "created_at >= :r_start"
+        params = {"r_start": day_start.replace(day=1)}
+    elif range_type == "last_1_hr":
+        where = "created_at >= :r_start"
+        params = {"r_start": now_ist - timedelta(hours=1)}
+    else:
+        where = "1=1"
+
+    db_rows = await database2.fetch_all(
+        f"SELECT * FROM fuel_alerts WHERE {where} ORDER BY created_at DESC, alert_id DESC",
+        params,
+    )
+    rows = [fuel_report_row(dict(r)) for r in db_rows]
+
+    excel_bytes = await asyncio.to_thread(fuel_build_report_excel, rows)
+    file_name = f"Fuel_Alerts_Report_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
+    return StreamingResponse(
+        io.BytesIO(excel_bytes),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename={file_name}"},
+    )
+######################################################################################
+
+######################################################################################
+
+# ============================================================
+@app.get("/api/fuel/history")
+async def fuel_history(
+    range_type: str = Query("today", enum=["today", "month", "all"]),
+    status: str = Query("all", enum=["all", "active", "closed"]),
+    alert_type: Optional[str] = Query(None),
+    district: Optional[str] = Query(None),
+    division: Optional[str] = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: Optional[int] = Query(None, ge=1, le=5000),
+):
+    try:
+        now_ist = fuel_now()
+        day_start = now_ist.replace(hour=0, minute=0, second=0, microsecond=0)
+        conds, params = [], {}
+
+        # ---- date range ----
+        if range_type == "today":
+            conds.append("created_at >= :r_start AND created_at < :r_end")
+            params["r_start"] = day_start
+            params["r_end"] = day_start + timedelta(days=1)
+        elif range_type == "month":
+            conds.append("created_at >= :r_start")
+            params["r_start"] = day_start.replace(day=1)
+
+        # ---- alert type ----
+        if alert_type:
+            types = []
+            for t in alert_type.split(","):
+                t = t.strip().upper()
+                if t == "FUEL_LEVEL":
+                    types += ["FUEL_LEVEL_CRITICAL", "FUEL_LEVEL_LOW", "FUEL_LEVEL_NORMAL"]
+                elif t:
+                    types.append(t)
+            if types:
+                ph = []
+                for i, t in enumerate(types):
+                    params[f"t{i}"] = t
+                    ph.append(f":t{i}")
+                conds.append(f"alert_type IN ({', '.join(ph)})")
+
+        # ---- district / division ----
+        for col, val, pfx in (("district", district, "d"), ("division", division, "v")):
+            items = [x.strip().lower() for x in (val or "").split(",") if x.strip()]
+            if items:
+                ph = []
+                for i, x in enumerate(items):
+                    params[f"{pfx}{i}"] = x
+                    ph.append(f":{pfx}{i}")
+                conds.append(f"LOWER(COALESCE({col}, '')) IN ({', '.join(ph)})")
+
+        base_where = " AND ".join(conds) if conds else "1=1"
+
+        # ---- summary (status filter se pehle, taaki active/closed dono ka count dikhe) ----
+        s = await database2.fetch_one(
+            f"""SELECT COUNT(*) AS total,
+                       COUNT(*) FILTER (WHERE is_closed = FALSE) AS active,
+                       COUNT(*) FILTER (WHERE is_closed = TRUE)  AS closed,
+                       COUNT(*) FILTER (WHERE alert_type = 'FUEL_DRAIN') AS fuel_drain,
+                       COUNT(*) FILTER (WHERE alert_type <> 'FUEL_DRAIN') AS fuel_level
+                FROM fuel_alerts WHERE {base_where}""",
+            params,
+        )
+        summary = {
+            "total": int(s["total"] or 0),
+            "active": int(s["active"] or 0),
+            "closed": int(s["closed"] or 0),
+            "fuel_level": int(s["fuel_level"] or 0),
+            "fuel_drain": int(s["fuel_drain"] or 0),
+        } if s else {"total": 0, "active": 0, "closed": 0, "fuel_level": 0, "fuel_drain": 0}
+
+        # ---- status filter ----
+        where = base_where
+        if status == "active":
+            where += " AND is_closed = FALSE"
+            total_rows = summary["active"]
+        elif status == "closed":
+            where += " AND is_closed = TRUE"
+            total_rows = summary["closed"]
+        else:
+            total_rows = summary["total"]
+
+        q = dict(params)
+        sql = f"""SELECT * FROM fuel_alerts WHERE {where}
+                ORDER BY created_at DESC, alert_id DESC"""
+        if page_size:                      # page_size diya ho tabhi pagination
+            sql += " LIMIT :limit OFFSET :offset"
+            q["limit"] = page_size
+            q["offset"] = (page - 1) * page_size
+        db_rows = await database2.fetch_all(sql, q)
+
+        data = []
+        for r in db_rows:
+            d = dict(r)
+            row = fuel_report_row(d)
+            row["updated_at"] = fuel_fmt_dt(d.get("updated_at"))
+            data.append(row)
+
+        return {
+            "status": "success",
+            "filters": {
+                "range_type": range_type, "status": status, "alert_type": alert_type,
+                "district": district, "division": division,
+            },
+            "summary": summary,
+            "pagination": {
+                "page": page if page_size else 1,
+                "page_size": page_size,          # None = sab ek saath
+                "total_rows": total_rows,
+                "total_pages": ((total_rows + page_size - 1) // page_size) if page_size else 1,
+            },
+            "data": data,
+        }
+
+    except Exception as e:
+        fuel_logger.exception(f"fuel_history FAILED: {e}")
+        return {"status": "error", "message": str(e)}
+######################################################################################
+
+######################################################################################
+# ============================================================
+# AMBULANCE LIVE FUEL STATUS (sirf live Fuel Level + Fuel Drain)
+#   GET /api/fuel/ambulance-status?ambulance_no=CG04NR5944&check=all|level|drain
+# ============================================================
+def fuel_level_label(p):
+    if p is None:
+        return "Unknown"
+    if p <= 10:
+        return "CRITICAL"
+    if p <= 25:
+        return "HIGH"
+    if p <= 50:
+        return "MEDIUM"
+    return "OK"
+
+
+def fuel_pick_vehicle(items, key):
+    """
+    GPS API ek plate ke liye kai device (IMEI) bhej sakti hai (purana + naya).
+    Sabse latest gps_actual_date_time wali entry chunte hain; barabar ho to jisme fuel parameter ho.
+    """
+    cands = [v for v in (items or []) if normalize_vehicle_number(v.get("plate_no")) == key]
+    if not cands:
+        return None
+
+    def rank(v):
+        t = str((v.get("gps") or {}).get("gps_actual_date_time") or "")   # YYYY-MM-DD HH:MM:SS, string compare chalega
+        has_fuel = fuel_extract_percent(v.get("can_or_obd_parameters")) is not None
+        return (t, has_fuel)
+
+    return max(cands, key=rank)
+
+
+@app.get("/api/fuel/ambulance-status")
+async def fuel_ambulance_status(
+    ambulance_no: str = Query(..., description="CG04NR5944 ya CG-04-NR-5944"),
+    check: str = Query("all", enum=["all", "level", "drain"]),
+):
+    key = normalize_vehicle_number(ambulance_no)
+    if not key:
+        return {"status": "error", "message": "ambulance_no sahi nahi hai"}
+
+    try:
+        now_ist = fuel_now()
+        result = {
+            "status": "success",
+            "ambulance_no": ambulance_no,
+            "checked_at": now_ist.strftime("%d-%m-%Y %H:%M:%S"),
+        }
+        not_registered = fuel_is_invalid(key)
+
+        # ================= FUEL LEVEL (live) =================
+        if check in ("all", "level"):
+            fl = {"source": "live", "fuel_percent": None, "fuel_status": None, "gps_time": None, "location": None}
+            if not_registered:
+                fl["message"] = "Vehicle is not registered in the GPS account"
+            else:
+                async with httpx.AsyncClient(timeout=60) as client:
+                    data, msg = await fuel_post(
+                        client, f"{FUEL_BASE}?token=getUserVehicleLiveData&ProjectId={FUEL_PROJECT_ID}",
+                        {"vehicle_nos": key},
+                    )
+                if data is None:
+                    fl["message"] = f"GPS data not available: {msg[:150]}"
+                else:
+                    vd = fuel_pick_vehicle(data.get("data"), key)
+                    if not vd:
+                        fl["message"] = "Vehicle not found in GPS response"
+                    else:
+                        gps = vd.get("gps") or {}
+                        pct = fuel_extract_percent(vd.get("can_or_obd_parameters"))
+                        fl.update({
+                            "fuel_percent": pct,
+                            "fuel_status": fuel_level_label(pct),
+                            "gps_time": gps.get("gps_actual_date_time"),
+                            "location": gps.get("location"),
+                        })
+                        if pct is None:
+                            fl["message"] = "Fuel level not reported by GPS"
+            result["fuel_level"] = fl
+
+        # ================= FUEL DRAIN (live) =================
+        if check in ("all", "drain"):
+            fd = {"source": None, "events": []}
+            use_db = False
+
+            if not_registered:
+                fd["message"] = "Vehicle is not registered in the GPS account"
+            else:
+                wait = await fuel_drain_wait_seconds()
+                if wait > 0:
+                    use_db = True
+                    fd["message"] = (f"Drain API allows 1 call per 15 min. Live data will be available in {int(wait)} sec. "
+                                     f"Showing today's drain events from the database.")
+                else:
+                    await redis_client.set(FUEL_DRAIN_TS_KEY, str(time.time()))
+                    async with httpx.AsyncClient(timeout=60) as client:
+                        data, msg = await fuel_post(
+                            client, f"{FUEL_BASE}?token=getFuelEvents",
+                            {"vehicle_no": key, "date": now_ist.strftime("%d-%m-%Y"),
+                             "event_type": "drain", "project_id": FUEL_PROJECT_ID},
+                        )
+                    if data is None:
+                        use_db = True
+                        fd["message"] = f"Drain data not available from GPS ({msg[:100]}). Showing today's drain events from the database."
+                    else:
+                        fd["source"] = "live"
+                        for vd in data.get("data") or []:
+                            if normalize_vehicle_number(vd.get("vehicle_no")) != key:
+                                continue
+                            for ev in vd.get("fuel_data") or []:
+                                if str(ev.get("event_type", "")).lower() != "drain":
+                                    continue
+                                st = fuel_parse_event_time(ev.get("event_start_time"))
+                                fd["events"].append({
+                                    "event_start": fuel_fmt_dt(st) if st else ev.get("event_start_time"),
+                                    "event_end": ev.get("event_end_time"),
+                                    "drain_liters": fuel_num(ev.get("value")),
+                                    "location": ev.get("location"),
+                                })
+                        if not fd["events"]:
+                            fd["message"] = "No fuel drain today for this vehicle"
+
+            if use_db:
+                fd["source"] = "db"
+                day_start = now_ist.replace(hour=0, minute=0, second=0, microsecond=0)
+                rows = await database2.fetch_all(
+                    """SELECT event_time, drain_liters, location FROM fuel_alerts
+                       WHERE alert_type = 'FUEL_DRAIN'
+                         AND UPPER(REPLACE(REPLACE(REPLACE(ambulance_no, '-', ''), ' ', ''), '.', '')) = :amb
+                         AND created_at >= :ds
+                       ORDER BY event_time DESC NULLS LAST""",
+                    {"amb": key, "ds": day_start},
+                )
+                for r in rows:
+                    fd["events"].append({
+                        "event_start": fuel_fmt_dt(r["event_time"]),
+                        "event_end": None,
+                        "drain_liters": to_float(r["drain_liters"]),
+                        "location": r["location"],
+                    })
+            result["fuel_drain"] = fd
+
+        return result
+
+    except Exception as e:
+        fuel_logger.exception(f"fuel_ambulance_status FAILED: {e}")
+        return {"status": "error", "message": str(e)}
+################################################################################################
