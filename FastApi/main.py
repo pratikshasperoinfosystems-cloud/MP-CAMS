@@ -6740,12 +6740,12 @@ def fuel_pick_vehicle(items, key):
 
 @app.get("/api/fuel/ambulance-status")
 async def fuel_ambulance_status(
-    ambulance_no: str = Query(..., description="CG04NR5944 ya CG-04-NR-5944"),
+    ambulance_no: str = Query(..., description="CG04NR5944 or CG-04-NR-5944"),
     check: str = Query("all", enum=["all", "level", "drain"]),
 ):
     key = normalize_vehicle_number(ambulance_no)
     if not key:
-        return {"status": "error", "message": "ambulance_no sahi nahi hai"}
+        return {"status": "error", "message": "Invalid ambulance_no."}
 
     try:
         now_ist = fuel_now()
