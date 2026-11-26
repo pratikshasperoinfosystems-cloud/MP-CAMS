@@ -2247,6 +2247,192 @@ async def dashboard_alerts_overview(
         "severity_timeline": severity_data
     }
 ####################################################################################################
+
+# CENTRAL + DENIAL CLIENT REPORT (Excel)   GET /api/dashboard/download-client-report
+
+##########################################################################################
+def _cr_clean_ids(raw_val):
+    """'"MPES-4250","MPES-4253"' / 'MPES-4250, MPES-4253' / '["A","B"]'  ->  ['MPES-4250', 'MPES-4253']"""
+    if raw_val is None:
+        return []
+    s = str(raw_val)
+    if s.strip().lower() in ("", "nan", "none", "nat"):
+        return []
+    out = []
+    for x in re.split(r"[,;]", s):
+        x = x.strip().strip("[]\"' ").strip()
+        if x:
+            out.append(x)
+    return out
+
+
+def _cr_names(raw_val, id_to_name):
+    """Comma-separated IDs -> comma-separated names (naam na mile to ID hi dikhega)."""
+    ids = _cr_clean_ids(raw_val)
+    if not ids:
+        return ""
+    return ", ".join(id_to_name.get(i, i) for i in ids)
+
+
+async def _cr_fetch_names(all_ids):
+    """ems_colleague (MySQL) se clg_ref_id -> full name."""
+    id_to_name = {}
+    ids = sorted({i for i in all_ids if i})
+    if not ids:
+        return id_to_name
+    try:
+        for i in range(0, len(ids), 400):
+            part = ids[i:i + 400]
+            ph = ", ".join(f":id{j}" for j in range(len(part)))
+            params = {f"id{j}": part[j] for j in range(len(part))}
+            mysql_rows = await database.fetch_all(
+                f"""
+                SELECT clg_ref_id,
+                       CONCAT_WS(' ', clg_first_name, clg_mid_name, clg_last_name) AS full_name
+                FROM ems_colleague
+                WHERE clg_ref_id IN ({ph})
+                """,
+                params,
+            )
+            for mr in mysql_rows:
+                name = " ".join(str(mr["full_name"] or "").split())     # double space hata do
+                if name:
+                    id_to_name[str(mr["clg_ref_id"]).strip()] = name
+    except Exception as e:
+        logger.error(f"Failed to fetch action_by names from MySQL: {e}")
+    return id_to_name
+
+
+def _cr_closed_info(raw):
+    """Redis esc_closed:<id> ka JSON (action_by, action_by_role, action_by_level, action_remark, action_taken_at)."""
+    if raw is None:
+        return None
+    try:
+        val = raw if isinstance(raw, str) else raw.decode()
+        d = json.loads(val)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _cr_action_role(info):
+    """Jisne action liya uska role: DM / ZM / OM / SH / COO / CBO."""
+    if not info:
+        return None
+    lvl = to_int(info.get("action_by_level"))
+    if lvl and lvl in ROLE_NAMES:
+        return ROLE_NAMES[lvl]
+    return info.get("action_by_role") or None
+
+
+def _cr_fmt_dt(v):
+    """datetime / string -> 'dd-mm-YYYY HH:MM' (khali ho to None)."""
+    if v is None:
+        return None
+    try:
+        if isinstance(v, str):
+            if not v.strip():
+                return None
+            v = datetime.fromisoformat(v.strip().replace("Z", ""))
+        return v.strftime("%d-%m-%Y %H:%M")
+    except Exception:
+        return str(v)
+
+
+def _cr_utc_iso_to_ist(s):
+    """Redis ka action_taken_at UTC me hota hai -> IST datetime."""
+    try:
+        return datetime.fromisoformat(str(s).replace("Z", "")) + timedelta(hours=5, minutes=30)
+    except Exception:
+        return None
+
+
+async def _cr_enrich(records, id_field, created_field, is_denial):
+    """
+    records (list of dict) me ye add karta hai:
+      _status ("Closed"/"In Progress"), _current_level,
+      escalated_by / escalated_date / escalated_deny_remark (khali ho to Redis ke action detail se)
+    """
+    ids = sorted({str(r[id_field]) for r in records if r.get(id_field) is not None})
+    levels_raw, closed_raw = {}, {}
+    if ids:
+        try:
+            CH = 5000      # ek saath lakhon keys ki jagah chhote chunks
+            chunks = [ids[i:i + CH] for i in range(0, len(ids), CH)]
+            lv_parts = await asyncio.gather(*[redis_client.mget([f"{ESC_LEVEL_REDIS_PREFIX}{i}" for i in c]) for c in chunks])
+            cl_parts = await asyncio.gather(*[redis_client.mget([f"{ESC_CLOSED_PREFIX}{i}" for i in c]) for c in chunks])
+            for c, lv, cl in zip(chunks, lv_parts, cl_parts):
+                levels_raw.update(zip(c, lv))
+                closed_raw.update(zip(c, cl))
+        except Exception as e:
+            logger.error(f"Redis fetch failed for {'Denial' if is_denial else 'Incident'} roles: {e}")
+
+    for r in records:
+        rid = str(r[id_field]) if r.get(id_field) is not None else None
+        info_raw = closed_raw.get(rid)
+        info = _cr_closed_info(info_raw)
+        esc_stat = str(r.get("escalate_status"))
+        closed = (info_raw is not None) or esc_stat in ("2", "3")
+
+        if closed:
+            r["_status"] = "Closed"
+            r["_current_level"] = _cr_action_role(info) or "N/A"
+        else:
+            r["_status"] = "In Progress"
+            level = to_int(levels_raw.get(rid))
+            if level is None:
+                elapsed = elapsed_minutes_since(r.get(created_field))
+                level = get_level_for_elapsed_minutes(elapsed)
+                if is_denial and level < 2:
+                    level = 2
+                level = min(level, 7)
+            default_role = "District Manager (DM)" if is_denial else "MDT Device"
+            role = LEVEL_INFO_CENTRAL.get(level, {}).get("role", default_role)
+            r["_current_level"] = "MDT Device" if role == "MDT" else role
+
+        # ---- Action By / Date / Remark (DB me na ho to Redis ke action detail se) ----
+        if is_denial and not r.get("escalated_deny_remark"):
+            r["escalated_deny_remark"] = r.get("remark")
+        if info:
+            if not r.get("escalated_by") and info.get("action_by"):
+                r["escalated_by"] = info.get("action_by")
+            if not r.get("escalated_date") and info.get("action_taken_at"):
+                r["escalated_date"] = _cr_utc_iso_to_ist(info.get("action_taken_at"))
+            if not r.get("escalated_deny_remark") and info.get("action_remark"):
+                r["escalated_deny_remark"] = info.get("action_remark")
+        r["escalated_date"] = _cr_fmt_dt(r.get("escalated_date"))
+
+
+def _cr_write_sheet(wb, title, df):
+    """openpyxl write_only mode: lakhon rows par bhi tez (header style, freeze, filter, width same)."""
+    from openpyxl.cell import WriteOnlyCell
+    from openpyxl.styles import PatternFill, Font, Alignment
+    from openpyxl.utils import get_column_letter
+    ws = wb.create_sheet(title)
+    cols = [str(c) for c in df.columns]
+    sample = df.head(3000)
+    for idx, c in enumerate(cols, 1):
+        mx = len(c)
+        for v in sample.iloc[:, idx - 1]:
+            if v is not None and v == v:
+                mx = max(mx, len(str(v)))
+        ws.column_dimensions[get_column_letter(idx)].width = min(mx + 3, 60)
+    ws.freeze_panes = "A2"
+    fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
+    font = Font(color="FFFFFF", bold=True)
+    hdr = []
+    for c in cols:
+        cell = WriteOnlyCell(ws, value=c)
+        cell.fill, cell.font = fill, font
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        hdr.append(cell)
+    ws.append(hdr)
+    obj = df.astype(object).where(df.notna(), None)
+    for row in obj.itertuples(index=False, name=None):
+        ws.append(row)
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(cols))}{len(df) + 1}"
+
+
 @app.get("/api/dashboard/download-client-report")
 async def download_client_report(
     range_type: str = Query("today", enum=["today", "month", "all", "last_1_hr"])
@@ -2266,10 +2452,10 @@ async def download_client_report(
         denial_date_filter = "added_date >= NOW() - INTERVAL '1 hour'"
     else:
         denial_date_filter = "1=1"
-        
+
     full_sql = f"""
     SELECT *,
-           CASE 
+           CASE
                WHEN alert_type = 'AT_SCENE_DELAY' THEN rd.at_scene
                WHEN alert_type = 'START_DELAY' THEN rd.start_from_base_loc
                WHEN alert_type = 'ACK_DELAY' THEN rd.acknowledge
@@ -2284,10 +2470,9 @@ async def download_client_report(
     """
     rows = await database2.fetch_all(full_sql)
 
+    # SELECT * : denial table me jo escalated_by / escalated_date wagairah columns hon wo mil jayein
     denial_sql = f"""
-    SELECT id, mysql_id, call_id, amb_no, amb_default_mobile, caller_no,
-           hp_name, challenge_val, meaning, denial_remark, remark, dst_name,
-           alert_type, added_by, added_date, escalate_status
+    SELECT *
     FROM public.denial_escalation_master
     WHERE (is_deleted = FALSE OR is_deleted IS NULL)
     AND {denial_date_filter}
@@ -2298,15 +2483,14 @@ async def download_client_report(
     summary_sql = f"""
     SELECT
         COUNT(*) as total_alerts,
-        COUNT(*) FILTER (WHERE escalate_status='2') as escalated_alerts,
-        COUNT(*) FILTER (WHERE system_type='108') as system_108
+        COUNT(*) FILTER (WHERE escalate_status='2') as escalated_alerts
     FROM public.central_alerts
     WHERE is_deleted = false
     AND {date_filter}
     """
     summary_row = await database2.fetch_one(summary_sql)
-    summary_data = dict(summary_row) if summary_row else {"total_alerts": 0, "escalated_alerts": 0, "system_108": 0}
-    
+    summary_data = dict(summary_row) if summary_row else {"total_alerts": 0, "escalated_alerts": 0}
+
     denial_summary_sql = f"""
     SELECT
         COUNT(DISTINCT call_id) as denial_total,
@@ -2317,14 +2501,13 @@ async def download_client_report(
     """
     denial_summary_row = await database2.fetch_one(denial_summary_sql)
     denial_summary_data = dict(denial_summary_row) if denial_summary_row else {"denial_total": 0, "denial_escalated": 0}
-    
+
     final_summary = {
         "Total Incident Alerts": summary_data.get("total_alerts", 0),
         "Total Call Denial Alerts (Distinct Call ID)": denial_summary_data.get("denial_total", 0),
         "Grand Total (Incident + Denial)": summary_data.get("total_alerts", 0) + denial_summary_data.get("denial_total", 0),
         "Escalated Incident Alerts": summary_data.get("escalated_alerts", 0),
         "Escalated Call Denial Alerts": denial_summary_data.get("denial_escalated", 0),
-        "Total System 108 (Incident + Denial)": summary_data.get("system_108", 0) + denial_summary_data.get("denial_total", 0)
     }
     df_summary = pd.DataFrame([final_summary])
 
@@ -2332,115 +2515,54 @@ async def download_client_report(
     await init_redis()
 
     # ==========================================
-    # 🚀 FETCH CURRENT ESCALATION LEVELS (FIXED r.keys() BUG)
+    # Status + Current level + Action details (Incident + Denial)
     # ==========================================
-    # 1. For Incident Alerts
-    inc_ids = [str(r["alert_id"]) for r in rows if "alert_id" in r.keys() and r["alert_id"] is not None]
-    inc_current_roles = {}
-    if inc_ids:
-        try:
-            inc_level_keys = [f"{ESC_LEVEL_REDIS_PREFIX}{id}" for id in inc_ids]
-            inc_closed_keys = [f"{ESC_CLOSED_PREFIX}{id}" for id in inc_ids]
-            
-            inc_levels_raw, inc_closed_raw = await asyncio.gather(
-                redis_client.mget(inc_level_keys),
-                redis_client.mget(inc_closed_keys)
-            )
-            
-            for i, inc_id in enumerate(inc_ids):
-                row_dict = dict(rows[i])
-                esc_stat = str(row_dict.get("escalate_status"))
-                is_closed = (inc_closed_raw[i] is not None) or (esc_stat == '2')
-                
-                if is_closed:
-                    inc_current_roles[inc_id] = "Closed (Action Taken)"
-                else:
-                    level = to_int(inc_levels_raw[i])
-                    if level is None:
-                        elapsed = elapsed_minutes_since(row_dict.get("created_date"))
-                        level = min(get_level_for_elapsed_minutes(elapsed), 7)
-                    
-                    role = LEVEL_INFO_CENTRAL.get(level, {}).get("role", "MDT Device")
-                    if role == "MDT":
-                        role = "MDT Device"
-                    inc_current_roles[inc_id] = role
-        except Exception as e:
-            logger.error(f"Redis fetch failed for Incident roles: {e}")
+    rows_d = [dict(r) for r in rows]
+    denial_d = [dict(r) for r in denial_rows]
 
-    # 2. For Denial Alerts
-    den_ids = [str(r["call_id"]) for r in denial_rows if "call_id" in r.keys() and r["call_id"] is not None]
-    den_current_roles = {}
-    if den_ids:
-        try:
-            den_level_keys = [f"{ESC_LEVEL_REDIS_PREFIX}{id}" for id in den_ids]
-            den_closed_keys = [f"{ESC_CLOSED_PREFIX}{id}" for id in den_ids]
-            
-            den_levels_raw, den_closed_raw = await asyncio.gather(
-                redis_client.mget(den_level_keys),
-                redis_client.mget(den_closed_keys)
-            )
-            
-            for i, den_id in enumerate(den_ids):
-                row_dict = dict(denial_rows[i])
-                esc_stat = str(row_dict.get("escalate_status"))
-                is_closed = (den_closed_raw[i] is not None) or (esc_stat == '2')
-                
-                if is_closed:
-                    den_current_roles[den_id] = "Closed (Action Taken)"
-                else:
-                    level = to_int(den_levels_raw[i])
-                    if level is None:
-                        elapsed = elapsed_minutes_since(row_dict.get("added_date"))
-                        level = get_level_for_elapsed_minutes(elapsed)
-                        if level < 2: level = 2
-                        level = min(level, 7)
-                    
-                    role = LEVEL_INFO_CENTRAL.get(level, {}).get("role", "District Manager (DM)")
-                    if role == "MDT":
-                        role = "MDT Device"
-                    den_current_roles[den_id] = role
-        except Exception as e:
-            logger.error(f"Redis fetch failed for Denial roles: {e}")
+    await _cr_enrich(rows_d, "alert_id", "created_date", is_denial=False)
+    await _cr_enrich(denial_d, "call_id", "added_date", is_denial=True)
 
+    # ---- Action By: ID -> naam (ems_colleague) ----
+    all_ids = set()
+    for rec in rows_d + denial_d:
+        all_ids.update(_cr_clean_ids(rec.get("escalated_by")))
+    id_to_name = await _cr_fetch_names(all_ids)
+    for rec in rows_d + denial_d:
+        rec["escalated_by"] = _cr_names(rec.get("escalated_by"), id_to_name) or None
 
     def generate_excel_sync():
-        df = pd.DataFrame([dict(r) for r in rows]) if rows else pd.DataFrame()
+        df = pd.DataFrame(rows_d) if rows_d else pd.DataFrame()
         if not df.empty:
             df.insert(0, "Sr No", list(range(1, len(df) + 1)))
-            
-            # Map the fetched roles directly into the DataFrame
-            df["Current Escalation Level"] = df["alert_id"].astype(str).map(inc_current_roles).fillna("Pending")
-            
-            # 📌 Purana wala Escalation Status add kiya (Open, In Progress, Escalated, Closed)
-            escalation_map = {
-                "0": "Open",
-                "1": "In Progress",
-                "2": "Escalated",
-                "3": "Closed"
-            }
+
+            df["Current Escalation Level"] = df["_current_level"]
+            df["Escalation Status"] = df["_status"]          # Closed / In Progress
+            df.drop(columns=["_current_level", "_status"], inplace=True)
+
             if "escalate_status" in df.columns:
-                df["Escalation Status"] = df["escalate_status"].astype(str).map(escalation_map)
                 df.drop(columns=["escalate_status"], inplace=True)
-                
+
             if "is_deleted" in df.columns:
                 df.drop(columns=["is_deleted"], inplace=True)
-                
+
             if "alert_closed_datetime" in df.columns:
                 df["alert_closed_datetime"] = pd.to_datetime(df["alert_closed_datetime"], errors="coerce").dt.strftime("%d-%m-%Y %H:%M")
- 
-            date_cols = ["created_date", "updated_date", "cancel_date", "escalated_date"]
+
+            # escalated_date pehle hi format ho chuka hai (_cr_fmt_dt)
+            date_cols = ["created_date", "updated_date", "cancel_date"]
             for col in date_cols:
                 if col in df.columns:
                     df[col] = pd.to_datetime(df[col], errors="coerce").dt.strftime("%d-%m-%Y %H:%M")
-                    
+
             rtm_time_cols = ["acknowledge", "start_from_base_loc", "at_scene", "patient_handover", "back_to_base_loc"]
             for col in rtm_time_cols:
                 if col in df.columns:
                     df[col] = pd.to_datetime(df[col], errors="coerce").dt.strftime("%d-%m-%Y %H:%M")
- 
+
             rename_map = {
                 "severity": "Severity",
-                "created_date": "Alert Generated Date",          
+                "created_date": "Alert Generated Date",
                 "updated_date": "Updated Date & Time",
                 "division": "Division",
                 "district": "District",
@@ -2455,17 +2577,17 @@ async def download_client_report(
                 "incident_id": "Incident Id",
                 "ambulance_no": "Ambulance Number",
                 "remark": "Remark",
-                "escalated_deny_remark": "Escalated/Deny Remark",
+                "escalated_deny_remark": "Action/Deny Remark",
                 "pilot_name": "Pilot Name",
                 "pilot_mobile": "Pilot Mobile",
-                "escalated_date": "Escalated Date",
+                "escalated_date": "Action Date",
                 "cancel_date": "Cancel Date",
-                "escalated_by": "Escalated By",
+                "escalated_by": "Action By",
                 "cancel_by": "Cancel By",
                 "system_type": "System Type",
                 "alert_id": "Alert ID",
                 "Sr No": "Sr No",
-                "alert_closed_datetime": "Alert Closed Datetime", 
+                "alert_closed_datetime": "Alert Closed Datetime",
                 "acknowledge": "Acknowledge Time",
                 "start_from_base_loc": "Start From Base Time",
                 "at_scene": "At Scene Time",
@@ -2473,56 +2595,49 @@ async def download_client_report(
                 "back_to_base_loc": "Back To Base Time",
             }
             df.rename(columns=rename_map, inplace=True)
-            
+
             column_order = [
                 "Sr No", "Alert ID", "Alert Type", "System Type", "Severity",
                 "Incident Id", "Incidence Datetime", "Division", "District",
                 "Incidence Latitude", "Incidence Longitude", "Ambulance Number",
                 "Ambulance Lattitude", "Ambulance Longitude", "Pilot Name",
                 "Pilot Mobile", "EMT Name", "EMT Mobile",
-                "Alert Generated Date",          
-                "Alert Closed Datetime", 
-                "Acknowledge Time", 
-                "Start From Base Time", 
-                "At Scene Time", 
-                "Patient Handover Time", 
+                "Alert Generated Date",
+                "Alert Closed Datetime",
+                "Acknowledge Time",
+                "Start From Base Time",
+                "At Scene Time",
+                "Patient Handover Time",
                 "Back To Base Time",
                 "Updated Date & Time",
-                "Current Escalation Level", 
-                "Escalation Status",  # 👈 Yahan add kiya Incident sheet me
-                "Escalated Date", "Escalated By",
-                "Escalated/Deny Remark", "Cancel Date", "Cancel By", "Remark",
+                "Current Escalation Level",
+                "Escalation Status",
+                "Action Date", "Action By",
+                "Action/Deny Remark", "Cancel Date", "Cancel By", "Remark",
             ]
-            
+
             existing_ordered_cols = [c for c in column_order if c in df.columns]
             df = df[existing_ordered_cols]
         else:
             df = pd.DataFrame([{"Message": "No Incident Alert Data Found"}])
-            
-        df_denial = pd.DataFrame([dict(r) for r in denial_rows]) if denial_rows else pd.DataFrame()
+
+        df_denial = pd.DataFrame(denial_d) if denial_d else pd.DataFrame()
         if not df_denial.empty:
             df_denial.insert(0, "Sr No", list(range(1, len(df_denial) + 1)))
-            
-            # Map the fetched roles directly into the DataFrame
-            df_denial["Current Escalation Level"] = df_denial["call_id"].astype(str).map(den_current_roles).fillna("Pending")
-            
-            # 📌 Purana wala Escalation Status add kiya Denial sheet me
-            denial_escalation_map = {
-                "0": "Open",
-                "1": "In Progress",
-                "2": "Escalated",
-                "3": "Closed"
-            }
+
+            df_denial["Current Escalation Level"] = df_denial["_current_level"]
+            df_denial["Escalation Status"] = df_denial["_status"]      # Closed / In Progress
+            df_denial.drop(columns=["_current_level", "_status"], inplace=True)
+
             if "escalate_status" in df_denial.columns:
-                df_denial["Escalation Status"] = df_denial["escalate_status"].astype(str).map(denial_escalation_map)
                 df_denial.drop(columns=["escalate_status"], inplace=True)
-                
+
             if "added_date" in df_denial.columns:
                 df_denial["Added Date & Time"] = pd.to_datetime(df_denial["added_date"], errors="coerce").dt.strftime("%d-%m-%Y %H:%M")
                 df_denial.drop(columns=["added_date"], inplace=True)
             if "mysql_id" in df_denial.columns:
                 df_denial.drop(columns=["mysql_id"], inplace=True)
-                
+
             denial_rename_map = {
                 "Sr No": "Sr No",
                 "id": "Denial ID",
@@ -2534,46 +2649,376 @@ async def download_client_report(
                 "challenge_val": "Challenge",
                 "meaning": "Denial Reason",
                 "denial_remark": "Denial Remark",
-                "remark": "Action Remark",                        
                 "dst_name": "District",
                 "alert_type": "Alert Type",
                 "added_by": "Added By",
                 "Added Date & Time": "Added Date & Time",
+                "escalated_date": "Action Date",
+                "escalated_by": "Action By",
+                "escalated_deny_remark": "Action/Deny Remark",
             }
             df_denial.rename(columns=denial_rename_map, inplace=True)
-            
+
             denial_column_order = [
                 "Sr No", "Denial ID", "Call ID", "Ambulance Number", "Ambulance Mobile",
                 "Caller No", "Hospital Name", "Challenge", "Denial Reason",
                 "Denial Remark", "District", "Alert Type", "Added By",
-                "Added Date & Time", 
-                "Current Escalation Level", 
-                "Escalation Status",  # 👈 Yahan add kiya Denial sheet me
-                "Action Remark",
+                "Added Date & Time",
+                "Current Escalation Level",
+                "Escalation Status",
+                "Action Date", "Action By",
+                "Action/Deny Remark",
             ]
             denial_ordered_cols = [c for c in denial_column_order if c in df_denial.columns]
             df_denial = df_denial[denial_ordered_cols]
         else:
             df_denial = pd.DataFrame([{"Message": "No Call Denial Data Found"}])
-            
+
+        from openpyxl import Workbook
+        wb = Workbook(write_only=True)
+        _cr_write_sheet(wb, "Incident Alerts", df)
+        _cr_write_sheet(wb, "Call Denial Alerts", df_denial)
+        _cr_write_sheet(wb, "Summary", df_summary)
         output = io.BytesIO()
-        with pd.ExcelWriter(output, engine="openpyxl") as writer:
-            df.to_excel(writer, sheet_name="Incident Alerts", index=False)
-            df_denial.to_excel(writer, sheet_name="Call Denial Alerts", index=False)
-            df_summary.to_excel(writer, sheet_name="Summary", index=False)
-            workbook = writer.book
-            format_worksheet(workbook["Incident Alerts"])
-            format_worksheet(workbook["Call Denial Alerts"])
-            format_worksheet(workbook["Summary"])
+        wb.save(output)
         return output.getvalue()
- 
+
     excel_bytes = await asyncio.to_thread(generate_excel_sync)
-    file_name = f"Central_Alerts_Client_Report_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
+    range_label = {"today": "Today", "month": "This_Month", "all": "Till_Date", "last_1_hr": "Last_1_Hr"}.get(range_type, range_type)
+    file_name = f"Client_Report_{range_label}_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
     return StreamingResponse(
         io.BytesIO(excel_bytes),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f"attachment; filename={file_name}"}
     )
+
+# @app.get("/api/dashboard/download-client-report")
+# async def download_client_report(
+#     range_type: str = Query("today", enum=["today", "month", "all", "last_1_hr"])
+# ):
+#     # 1. Central Alerts ke liye date filter
+#     if range_type == "last_1_hr":
+#         date_filter = "created_date >= NOW() - INTERVAL '1 hour'"
+#     else:
+#         date_filter = get_date_filter(range_type)
+
+#     # 2. Denial Alerts ke liye alag date filter
+#     if range_type == "today":
+#         denial_date_filter = "DATE(added_date) = CURRENT_DATE"
+#     elif range_type == "month":
+#         denial_date_filter = "DATE_TRUNC('month', added_date) = DATE_TRUNC('month', CURRENT_DATE)"
+#     elif range_type == "last_1_hr":
+#         denial_date_filter = "added_date >= NOW() - INTERVAL '1 hour'"
+#     else:
+#         denial_date_filter = "1=1"
+        
+#     full_sql = f"""
+#     SELECT *,
+#            CASE 
+#                WHEN alert_type = 'AT_SCENE_DELAY' THEN rd.at_scene
+#                WHEN alert_type = 'START_DELAY' THEN rd.start_from_base_loc
+#                WHEN alert_type = 'ACK_DELAY' THEN rd.acknowledge
+#                WHEN alert_type = 'BACK_TO_BASE_DELAY' THEN rd.back_to_base_loc
+#                ELSE NULL
+#            END AS alert_closed_datetime
+#     FROM public.central_alerts
+#     LEFT JOIN public.rtm_dashboard rd ON central_alerts.incident_id = rd.inc_ref_id
+#     WHERE is_deleted = false
+#     AND {date_filter}
+#     ORDER BY created_date DESC
+#     """
+#     rows = await database2.fetch_all(full_sql)
+
+#     denial_sql = f"""
+#     SELECT id, mysql_id, call_id, amb_no, amb_default_mobile, caller_no,
+#            hp_name, challenge_val, meaning, denial_remark, remark, dst_name,
+#            alert_type, added_by, added_date, escalate_status
+#     FROM public.denial_escalation_master
+#     WHERE (is_deleted = FALSE OR is_deleted IS NULL)
+#     AND {denial_date_filter}
+#     ORDER BY added_date DESC
+#     """
+#     denial_rows = await database2.fetch_all(denial_sql)
+
+#     summary_sql = f"""
+#     SELECT
+#         COUNT(*) as total_alerts,
+#         COUNT(*) FILTER (WHERE escalate_status='2') as escalated_alerts,
+#         COUNT(*) FILTER (WHERE system_type='108') as system_108
+#     FROM public.central_alerts
+#     WHERE is_deleted = false
+#     AND {date_filter}
+#     """
+#     summary_row = await database2.fetch_one(summary_sql)
+#     summary_data = dict(summary_row) if summary_row else {"total_alerts": 0, "escalated_alerts": 0, "system_108": 0}
+    
+#     denial_summary_sql = f"""
+#     SELECT
+#         COUNT(DISTINCT call_id) as denial_total,
+#         COUNT(DISTINCT call_id) FILTER (WHERE escalate_status='2') as denial_escalated
+#     FROM public.denial_escalation_master
+#     WHERE (is_deleted = FALSE OR is_deleted IS NULL)
+#     AND {denial_date_filter}
+#     """
+#     denial_summary_row = await database2.fetch_one(denial_summary_sql)
+#     denial_summary_data = dict(denial_summary_row) if denial_summary_row else {"denial_total": 0, "denial_escalated": 0}
+    
+#     final_summary = {
+#         "Total Incident Alerts": summary_data.get("total_alerts", 0),
+#         "Total Call Denial Alerts (Distinct Call ID)": denial_summary_data.get("denial_total", 0),
+#         "Grand Total (Incident + Denial)": summary_data.get("total_alerts", 0) + denial_summary_data.get("denial_total", 0),
+#         "Escalated Incident Alerts": summary_data.get("escalated_alerts", 0),
+#         "Escalated Call Denial Alerts": denial_summary_data.get("denial_escalated", 0),
+#         "Total System 108 (Incident + Denial)": summary_data.get("system_108", 0) + denial_summary_data.get("denial_total", 0)
+#     }
+#     df_summary = pd.DataFrame([final_summary])
+
+#     # Ensure Redis is initialized
+#     await init_redis()
+
+#     # ==========================================
+#     # 🚀 FETCH CURRENT ESCALATION LEVELS (FIXED r.keys() BUG)
+#     # ==========================================
+#     # 1. For Incident Alerts
+#     inc_ids = [str(r["alert_id"]) for r in rows if "alert_id" in r.keys() and r["alert_id"] is not None]
+#     inc_current_roles = {}
+#     if inc_ids:
+#         try:
+#             inc_level_keys = [f"{ESC_LEVEL_REDIS_PREFIX}{id}" for id in inc_ids]
+#             inc_closed_keys = [f"{ESC_CLOSED_PREFIX}{id}" for id in inc_ids]
+            
+#             inc_levels_raw, inc_closed_raw = await asyncio.gather(
+#                 redis_client.mget(inc_level_keys),
+#                 redis_client.mget(inc_closed_keys)
+#             )
+            
+#             for i, inc_id in enumerate(inc_ids):
+#                 row_dict = dict(rows[i])
+#                 esc_stat = str(row_dict.get("escalate_status"))
+#                 is_closed = (inc_closed_raw[i] is not None) or (esc_stat == '2')
+                
+#                 if is_closed:
+#                     inc_current_roles[inc_id] = "Closed (Action Taken)"
+#                 else:
+#                     level = to_int(inc_levels_raw[i])
+#                     if level is None:
+#                         elapsed = elapsed_minutes_since(row_dict.get("created_date"))
+#                         level = min(get_level_for_elapsed_minutes(elapsed), 7)
+                    
+#                     role = LEVEL_INFO_CENTRAL.get(level, {}).get("role", "MDT Device")
+#                     if role == "MDT":
+#                         role = "MDT Device"
+#                     inc_current_roles[inc_id] = role
+#         except Exception as e:
+#             logger.error(f"Redis fetch failed for Incident roles: {e}")
+
+#     # 2. For Denial Alerts
+#     den_ids = [str(r["call_id"]) for r in denial_rows if "call_id" in r.keys() and r["call_id"] is not None]
+#     den_current_roles = {}
+#     if den_ids:
+#         try:
+#             den_level_keys = [f"{ESC_LEVEL_REDIS_PREFIX}{id}" for id in den_ids]
+#             den_closed_keys = [f"{ESC_CLOSED_PREFIX}{id}" for id in den_ids]
+            
+#             den_levels_raw, den_closed_raw = await asyncio.gather(
+#                 redis_client.mget(den_level_keys),
+#                 redis_client.mget(den_closed_keys)
+#             )
+            
+#             for i, den_id in enumerate(den_ids):
+#                 row_dict = dict(denial_rows[i])
+#                 esc_stat = str(row_dict.get("escalate_status"))
+#                 is_closed = (den_closed_raw[i] is not None) or (esc_stat == '2')
+                
+#                 if is_closed:
+#                     den_current_roles[den_id] = "Closed (Action Taken)"
+#                 else:
+#                     level = to_int(den_levels_raw[i])
+#                     if level is None:
+#                         elapsed = elapsed_minutes_since(row_dict.get("added_date"))
+#                         level = get_level_for_elapsed_minutes(elapsed)
+#                         if level < 2: level = 2
+#                         level = min(level, 7)
+                    
+#                     role = LEVEL_INFO_CENTRAL.get(level, {}).get("role", "District Manager (DM)")
+#                     if role == "MDT":
+#                         role = "MDT Device"
+#                     den_current_roles[den_id] = role
+#         except Exception as e:
+#             logger.error(f"Redis fetch failed for Denial roles: {e}")
+
+
+#     def generate_excel_sync():
+#         df = pd.DataFrame([dict(r) for r in rows]) if rows else pd.DataFrame()
+#         if not df.empty:
+#             df.insert(0, "Sr No", list(range(1, len(df) + 1)))
+            
+#             # Map the fetched roles directly into the DataFrame
+#             df["Current Escalation Level"] = df["alert_id"].astype(str).map(inc_current_roles).fillna("Pending")
+            
+#             # 📌 Purana wala Escalation Status add kiya (Open, In Progress, Escalated, Closed)
+#             escalation_map = {
+#                 "0": "Open",
+#                 "1": "In Progress",
+#                 "2": "Escalated",
+#                 "3": "Closed"
+#             }
+#             if "escalate_status" in df.columns:
+#                 df["Escalation Status"] = df["escalate_status"].astype(str).map(escalation_map)
+#                 df.drop(columns=["escalate_status"], inplace=True)
+                
+#             if "is_deleted" in df.columns:
+#                 df.drop(columns=["is_deleted"], inplace=True)
+                
+#             if "alert_closed_datetime" in df.columns:
+#                 df["alert_closed_datetime"] = pd.to_datetime(df["alert_closed_datetime"], errors="coerce").dt.strftime("%d-%m-%Y %H:%M")
+ 
+#             date_cols = ["created_date", "updated_date", "cancel_date", "escalated_date"]
+#             for col in date_cols:
+#                 if col in df.columns:
+#                     df[col] = pd.to_datetime(df[col], errors="coerce").dt.strftime("%d-%m-%Y %H:%M")
+                    
+#             rtm_time_cols = ["acknowledge", "start_from_base_loc", "at_scene", "patient_handover", "back_to_base_loc"]
+#             for col in rtm_time_cols:
+#                 if col in df.columns:
+#                     df[col] = pd.to_datetime(df[col], errors="coerce").dt.strftime("%d-%m-%Y %H:%M")
+ 
+#             rename_map = {
+#                 "severity": "Severity",
+#                 "created_date": "Alert Generated Date",          
+#                 "updated_date": "Updated Date & Time",
+#                 "division": "Division",
+#                 "district": "District",
+#                 "inc_latitude": "Incidence Latitude",
+#                 "inc_longitude": "Incidence Longitude",
+#                 "amb_lat": "Ambulance Lattitude",
+#                 "amb_long": "Ambulance Longitude",
+#                 "paramedic_name": "EMT Name",
+#                 "paramedic_mobile": "EMT Mobile",
+#                 "inc_datetime": "Incidence Datetime",
+#                 "alert_type": "Alert Type",
+#                 "incident_id": "Incident Id",
+#                 "ambulance_no": "Ambulance Number",
+#                 "remark": "Remark",
+#                 "escalated_deny_remark": "Escalated/Deny Remark",
+#                 "pilot_name": "Pilot Name",
+#                 "pilot_mobile": "Pilot Mobile",
+#                 "escalated_date": "Escalated Date",
+#                 "cancel_date": "Cancel Date",
+#                 "escalated_by": "Escalated By",
+#                 "cancel_by": "Cancel By",
+#                 "system_type": "System Type",
+#                 "alert_id": "Alert ID",
+#                 "Sr No": "Sr No",
+#                 "alert_closed_datetime": "Alert Closed Datetime", 
+#                 "acknowledge": "Acknowledge Time",
+#                 "start_from_base_loc": "Start From Base Time",
+#                 "at_scene": "At Scene Time",
+#                 "patient_handover": "Patient Handover Time",
+#                 "back_to_base_loc": "Back To Base Time",
+#             }
+#             df.rename(columns=rename_map, inplace=True)
+            
+#             column_order = [
+#                 "Sr No", "Alert ID", "Alert Type", "System Type", "Severity",
+#                 "Incident Id", "Incidence Datetime", "Division", "District",
+#                 "Incidence Latitude", "Incidence Longitude", "Ambulance Number",
+#                 "Ambulance Lattitude", "Ambulance Longitude", "Pilot Name",
+#                 "Pilot Mobile", "EMT Name", "EMT Mobile",
+#                 "Alert Generated Date",          
+#                 "Alert Closed Datetime", 
+#                 "Acknowledge Time", 
+#                 "Start From Base Time", 
+#                 "At Scene Time", 
+#                 "Patient Handover Time", 
+#                 "Back To Base Time",
+#                 "Updated Date & Time",
+#                 "Current Escalation Level", 
+#                 "Escalation Status",  # 👈 Yahan add kiya Incident sheet me
+#                 "Escalated Date", "Escalated By",
+#                 "Escalated/Deny Remark", "Cancel Date", "Cancel By", "Remark",
+#             ]
+            
+#             existing_ordered_cols = [c for c in column_order if c in df.columns]
+#             df = df[existing_ordered_cols]
+#         else:
+#             df = pd.DataFrame([{"Message": "No Incident Alert Data Found"}])
+            
+#         df_denial = pd.DataFrame([dict(r) for r in denial_rows]) if denial_rows else pd.DataFrame()
+#         if not df_denial.empty:
+#             df_denial.insert(0, "Sr No", list(range(1, len(df_denial) + 1)))
+            
+#             # Map the fetched roles directly into the DataFrame
+#             df_denial["Current Escalation Level"] = df_denial["call_id"].astype(str).map(den_current_roles).fillna("Pending")
+            
+#             # 📌 Purana wala Escalation Status add kiya Denial sheet me
+#             denial_escalation_map = {
+#                 "0": "Open",
+#                 "1": "In Progress",
+#                 "2": "Escalated",
+#                 "3": "Closed"
+#             }
+#             if "escalate_status" in df_denial.columns:
+#                 df_denial["Escalation Status"] = df_denial["escalate_status"].astype(str).map(denial_escalation_map)
+#                 df_denial.drop(columns=["escalate_status"], inplace=True)
+                
+#             if "added_date" in df_denial.columns:
+#                 df_denial["Added Date & Time"] = pd.to_datetime(df_denial["added_date"], errors="coerce").dt.strftime("%d-%m-%Y %H:%M")
+#                 df_denial.drop(columns=["added_date"], inplace=True)
+#             if "mysql_id" in df_denial.columns:
+#                 df_denial.drop(columns=["mysql_id"], inplace=True)
+                
+#             denial_rename_map = {
+#                 "Sr No": "Sr No",
+#                 "id": "Denial ID",
+#                 "call_id": "Call ID",
+#                 "amb_no": "Ambulance Number",
+#                 "amb_default_mobile": "Ambulance Mobile",
+#                 "caller_no": "Caller No",
+#                 "hp_name": "Hospital Name",
+#                 "challenge_val": "Challenge",
+#                 "meaning": "Denial Reason",
+#                 "denial_remark": "Denial Remark",
+#                 "remark": "Action Remark",                        
+#                 "dst_name": "District",
+#                 "alert_type": "Alert Type",
+#                 "added_by": "Added By",
+#                 "Added Date & Time": "Added Date & Time",
+#             }
+#             df_denial.rename(columns=denial_rename_map, inplace=True)
+            
+#             denial_column_order = [
+#                 "Sr No", "Denial ID", "Call ID", "Ambulance Number", "Ambulance Mobile",
+#                 "Caller No", "Hospital Name", "Challenge", "Denial Reason",
+#                 "Denial Remark", "District", "Alert Type", "Added By",
+#                 "Added Date & Time", 
+#                 "Current Escalation Level", 
+#                 "Escalation Status",  # 👈 Yahan add kiya Denial sheet me
+#                 "Action Remark",
+#             ]
+#             denial_ordered_cols = [c for c in denial_column_order if c in df_denial.columns]
+#             df_denial = df_denial[denial_ordered_cols]
+#         else:
+#             df_denial = pd.DataFrame([{"Message": "No Call Denial Data Found"}])
+            
+#         output = io.BytesIO()
+#         with pd.ExcelWriter(output, engine="openpyxl") as writer:
+#             df.to_excel(writer, sheet_name="Incident Alerts", index=False)
+#             df_denial.to_excel(writer, sheet_name="Call Denial Alerts", index=False)
+#             df_summary.to_excel(writer, sheet_name="Summary", index=False)
+#             workbook = writer.book
+#             format_worksheet(workbook["Incident Alerts"])
+#             format_worksheet(workbook["Call Denial Alerts"])
+#             format_worksheet(workbook["Summary"])
+#         return output.getvalue()
+ 
+#     excel_bytes = await asyncio.to_thread(generate_excel_sync)
+#     file_name = f"Central_Alerts_Client_Report_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
+#     return StreamingResponse(
+#         io.BytesIO(excel_bytes),
+#         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+#         headers={"Content-Disposition": f"attachment; filename={file_name}"}
+#     )
 ##################################################################################################
 @app.put("/api/severity")
 async def update_severity(data: SeverityUpdate):
@@ -6854,3 +7299,135 @@ async def fuel_ambulance_status(
         fuel_logger.exception(f"fuel_ambulance_status FAILED: {e}")
         return {"status": "error", "message": str(e)}
 ################################################################################################
+
+################################################################################################
+# /api/dashboard_new  (today | month | all)
+#   - Incident (central_alerts), Denied (denial_escalation_master), Fuel (fuel_alerts)
+#   - Teeno ke date filter ek jaise (DB ka CURRENT_DATE), system_type ka filter hata diya
+# Purana dashboard_new function hata ke ye paste karo.
+################################################################################################
+@app.get("/api/dashboard_new")
+async def dashboard_alerts_overview_new(
+    range: Optional[str] = Query("today", enum=["today", "month", "all"])
+):
+    # ---------- date filters (teeno table par same tareeka) ----------
+    date_filter = get_date_filter(range)          # central_alerts (created_date)
+    if range == "today":
+        denial_date_filter = "DATE(added_date) = CURRENT_DATE"
+        fuel_date_filter = "DATE(created_at) = CURRENT_DATE"
+    elif range == "month":
+        denial_date_filter = "DATE_TRUNC('month', added_date) = DATE_TRUNC('month', CURRENT_DATE)"
+        fuel_date_filter = "DATE_TRUNC('month', created_at) = DATE_TRUNC('month', CURRENT_DATE)"
+    else:
+        denial_date_filter = "1=1"
+        fuel_date_filter = "1=1"
+
+    # ---------- Incident alerts (central_alerts) ----------
+    incident_total_row = await database2.fetch_one(f"""
+        SELECT COUNT(*) AS total
+        FROM public.central_alerts
+        WHERE is_deleted = false
+        AND {date_filter}
+    """)
+    incident_total = int(incident_total_row["total"] or 0) if incident_total_row else 0
+
+    incident_escalated_row = await database2.fetch_one(f"""
+        SELECT COUNT(*) AS total
+        FROM public.central_alerts
+        WHERE is_deleted = false
+        AND escalate_status = '2'
+        AND {date_filter}
+    """)
+    incident_escalated = int(incident_escalated_row["total"] or 0) if incident_escalated_row else 0
+
+    incident_sev_rows = await database2.fetch_all(f"""
+        SELECT severity, COUNT(*) AS total
+        FROM public.central_alerts
+        WHERE is_deleted = false
+        AND {date_filter}
+        GROUP BY severity
+    """)
+
+    # ---------- Denied alerts (denial_escalation_master) ----------
+    denial_total_row = await database2.fetch_one(f"""
+        SELECT COUNT(DISTINCT call_id) AS total
+        FROM public.denial_escalation_master
+        WHERE (is_deleted = FALSE OR is_deleted IS NULL)
+        AND {denial_date_filter}
+    """)
+    denied_total = int(denial_total_row["total"] or 0) if denial_total_row else 0
+
+    denial_escalated_row = await database2.fetch_one(f"""
+        SELECT COUNT(DISTINCT call_id) AS total
+        FROM public.denial_escalation_master
+        WHERE (is_deleted = FALSE OR is_deleted IS NULL)
+        AND escalate_status = '2'
+        AND {denial_date_filter}
+    """)
+    denied_escalated = int(denial_escalated_row["total"] or 0) if denial_escalated_row else 0
+
+    denial_sev_rows = await database2.fetch_all(f"""
+        SELECT severity, COUNT(*) AS total
+        FROM (
+            SELECT DISTINCT ON (call_id) call_id, severity
+            FROM public.denial_escalation_master
+            WHERE (is_deleted = FALSE OR is_deleted IS NULL)
+            AND {denial_date_filter}
+            ORDER BY call_id, added_date DESC
+        ) t
+        GROUP BY severity
+    """)
+
+    # ---------- Fuel alerts (fuel_alerts: level + drain) ----------
+    fuel_row = await database2.fetch_one(f"""
+        SELECT COUNT(*) AS total,
+               COUNT(*) FILTER (WHERE escalate_status = '2') AS escalated
+        FROM public.fuel_alerts
+        WHERE {fuel_date_filter}
+    """)
+    fuel_total = int(fuel_row["total"] or 0) if fuel_row else 0
+    fuel_escalated = int(fuel_row["escalated"] or 0) if fuel_row else 0
+
+    fuel_sev_rows = await database2.fetch_all(f"""
+        SELECT severity, COUNT(*) AS total
+        FROM public.fuel_alerts
+        WHERE {fuel_date_filter}
+        GROUP BY severity
+    """)
+
+    # ---------- severity timeline (teeno ko severity ke hisaab se jod ke) ----------
+    sev_map = {}
+
+    def _add(rows, field):
+        for r in rows:
+            sev = (r["severity"] or "UNKNOWN").upper()
+            entry = sev_map.setdefault(
+                sev, {"severity": sev, "total": 0, "incident_alerts": 0, "denied_alerts": 0, "fuel_alerts": 0}
+            )
+            entry[field] += int(r["total"] or 0)
+
+    _add(incident_sev_rows, "incident_alerts")
+    _add(denial_sev_rows, "denied_alerts")
+    _add(fuel_sev_rows, "fuel_alerts")
+
+    for e in sev_map.values():
+        e["total"] = e["incident_alerts"] + e["denied_alerts"] + e["fuel_alerts"]
+
+    order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+    severity_data = sorted(sev_map.values(), key=lambda x: (order.get(x["severity"], 99), x["severity"]))
+
+    return {
+        "total_alerts": {
+            "total": incident_total + denied_total + fuel_total,
+            "incident_alerts": incident_total,
+            "denied_alerts": denied_total,
+            "fuel_alerts": fuel_total,
+        },
+        "escalated_alerts": {
+            "total": incident_escalated + denied_escalated + fuel_escalated,
+            "incident_alerts": incident_escalated,
+            "denied_alerts": denied_escalated,
+            "fuel_alerts": fuel_escalated,
+        },
+        "severity_timeline": severity_data,
+    }
